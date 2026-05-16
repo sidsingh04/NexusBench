@@ -1,0 +1,22 @@
+# sandbox/Dockerfile.base
+# Minimal shared base — no toolchains, just the runner user and entrypoint.
+# All language images inherit FROM this.
+
+FROM ubuntu:24.04 AS base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar gzip unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN (userdel -r ubuntu || true) && \
+    groupadd -g 1000 runner && \
+    useradd -u 1000 -g runner -m -s /bin/bash runner
+
+RUN mkdir -p /app /submission /nexus && chown runner:runner /app /nexus
+
+COPY entrypoint.sh /nexus/entrypoint.sh
+RUN chmod +x /nexus/entrypoint.sh
+
+EXPOSE 7878
+WORKDIR /app
+ENTRYPOINT ["/nexus/entrypoint.sh"]

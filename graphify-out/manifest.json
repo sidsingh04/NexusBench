@@ -1,0 +1,62 @@
+{
+  "C:\\Projects\\NexusBench\\main.go": {
+    "mtime": 1778932956.3803976,
+    "hash": "8164cf56a278d031b48d9782863039a1"
+  },
+  "C:\\Projects\\NexusBench\\cmd\\server\\main.go": {
+    "mtime": 1778930733.799856,
+    "hash": "46108b50d56caf1809faaeb779352187"
+  },
+  "C:\\Projects\\NexusBench\\docker\\sandbox\\Dockerfile.cpp": {
+    "mtime": 1778844484.9685464,
+    "hash": "59d0d99f9cfcb087944ac8368323d5de"
+  },
+  "C:\\Projects\\NexusBench\\docker\\sandbox\\Dockerfile.go": {
+    "mtime": 1778932273.1238966,
+    "hash": "4829e9851f2342bcc04e7d60d608b859"
+  },
+  "C:\\Projects\\NexusBench\\internal\\api\\router.go": {
+    "mtime": 1778842215.4192388,
+    "hash": "633a0c41fe7117eb34f60cd673ae378b"
+  },
+  "C:\\Projects\\NexusBench\\internal\\config\\config.go": {
+    "mtime": 1778930703.7569242,
+    "hash": "4aa3b04c6a489d3457294b5b34889f84"
+  },
+  "C:\\Projects\\NexusBench\\internal\\config\\dir_unix.go": {
+    "mtime": 1778930719.891053,
+    "hash": "21ba559f3959a57c7d65f71bd20173b3"
+  },
+  "C:\\Projects\\NexusBench\\internal\\config\\dir_windows.go": {
+    "mtime": 1778930717.1352735,
+    "hash": "693797fa8de7d64bcffcc45b00d30bb2"
+  },
+  "C:\\Projects\\NexusBench\\internal\\models\\models.go": {
+    "mtime": 1778758138.973437,
+    "hash": "50f272e518fa08a2e511de5a2603f63d"
+  },
+  "C:\\Projects\\NexusBench\\internal\\sandbox\\docker.go": {
+    "mtime": 1778932942.3835602,
+    "hash": "54ce183a3eefe58cb4fd234ea711972b"
+  },
+  "C:\\Projects\\NexusBench\\internal\\submission\\service.go": {
+    "mtime": 1778930629.6900065,
+    "hash": "f04a2f40749aab85b61661ff8fc967aa"
+  },
+  "C:\\Projects\\NexusBench\\internal\\submission\\service_test.go": {
+    "mtime": 1778758406.0618296,
+    "hash": "ece09ced8e31f8be4c35efa475efaec5"
+  },
+  "C:\\Projects\\NexusBench\\CLAUDE.md": {
+    "mtime": 1778674371.2617843,
+    "hash": "9698e6faabd1e9da337423c1355ec42b"
+  },
+  "C:\\Projects\\NexusBench\\docker-compose.yml": {
+    "mtime": 1778842176.2129917,
+    "hash": "d9e1fb765ded77cbfa9f6bc26d735aa1"
+  },
+  "C:\\Projects\\NexusBench\\README.md": {
+    "mtime": 1778758480.9132257,
+    "hash": "29ae35e65d9d85f972326ee42be64a61"
+  }
+}

@@ -1,0 +1,20 @@
+# sandbox/Dockerfile.python
+# ~180 MB — Python 3.12 slim, pip available.
+
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar gzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 1000 runner && \
+    useradd -u 1000 -g runner -m -s /bin/bash runner && \
+    mkdir -p /app /submission /nexus && \
+    chown runner:runner /app /nexus /home/runner
+
+COPY entrypoint.sh /nexus/entrypoint.sh
+RUN chmod +x /nexus/entrypoint.sh
+
+EXPOSE 7878
+WORKDIR /app
+ENTRYPOINT ["/nexus/entrypoint.sh"]

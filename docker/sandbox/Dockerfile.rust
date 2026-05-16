@@ -1,0 +1,31 @@
+# sandbox/Dockerfile.rust
+# ~400 MB — Rust toolchain is large but unavoidable.
+# Uses cargo's release profile; debug builds are ~2x slower to compile.
+
+FROM rust:1.78-slim AS toolchain
+
+FROM ubuntu:24.04 AS runtime
+
+COPY --from=toolchain /usr/local/cargo  /usr/local/cargo
+COPY --from=toolchain /usr/local/rustup /usr/local/rustup
+
+ENV PATH="/usr/local/cargo/bin:${PATH}"
+ENV RUSTUP_HOME="/usr/local/rustup"
+ENV CARGO_HOME="/usr/local/cargo"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar gzip build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN (userdel -r ubuntu || true) && \
+    groupadd -g 1000 runner && \
+    useradd -u 1000 -g runner -m -s /bin/bash runner && \
+    mkdir -p /app /submission /nexus && \
+    chown runner:runner /app /nexus /home/runner
+
+COPY entrypoint.sh /nexus/entrypoint.sh
+RUN chmod +x /nexus/entrypoint.sh
+
+EXPOSE 7878
+WORKDIR /app
+ENTRYPOINT ["/nexus/entrypoint.sh"]

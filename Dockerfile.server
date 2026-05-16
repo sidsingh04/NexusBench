@@ -1,0 +1,30 @@
+# Dockerfile.server — builds the NexusBench control-plane binary
+
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+
+# Cache dependencies first
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X main.version=$(date +%Y%m%d)" \
+    -o /out/nexusbench-server \
+    ./cmd/server
+
+# ── Runtime image ──────────────────────────────────────────────────────────
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl
+
+COPY --from=builder /out/nexusbench-server /usr/local/bin/nexusbench-server
+
+RUN addgroup -g 1001 nexus && adduser -D -u 1001 -G nexus nexus
+USER nexus
+
+EXPOSE 8080
+
+ENTRYPOINT ["nexusbench-server"]

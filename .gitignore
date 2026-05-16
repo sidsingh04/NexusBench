@@ -1,0 +1,22 @@
+# Binaries
+nexusbench-server
+nexusbench
+*.exe
+
+# Go build artifacts
+/vendor/
+
+# Submission data (local dev)
+/tmp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker build cache
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

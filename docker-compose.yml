@@ -1,0 +1,104 @@
+version: "3.9"
+
+# NexusBench — Local Development Stack
+#
+# Architecture: pre-built language images are spun on demand per submission.
+# Build them first:  make images
+# Then start:        docker compose up --build
+
+services:
+
+  # ── Control Plane ───────────────────────────────────────────────────────────
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      SUBMISSION_DIR: "/data/submissions"
+
+      # Per-language pre-built sandbox images.
+      # These must exist on the Docker host before starting.
+      # Build with: make images
+      SANDBOX_IMAGE_GO:     "nexusbench-sandbox-go:latest"
+      SANDBOX_IMAGE_RUST:   "nexusbench-sandbox-rust:latest"
+      SANDBOX_IMAGE_CPP:    "nexusbench-sandbox-cpp:latest"
+      SANDBOX_IMAGE_PYTHON: "nexusbench-sandbox-python:latest"
+      SANDBOX_IMAGE_BINARY: "nexusbench-sandbox-binary:latest"
+
+      # Resource limits per sandbox container
+      SANDBOX_CPU_QUOTA:    "100000"       # 1 CPU core (µs/100ms)
+      SANDBOX_MEMORY_BYTES: "536870912"    # 512 MiB
+      SANDBOX_TIMEOUT:      "30m"
+      SANDBOX_NETWORK_MODE: "bridge"
+      SANDBOX_PORT_MIN:     "20000"
+      SANDBOX_PORT_MAX:     "21000"
+      MAX_UPLOAD_BYTES:     "268435456"    # 256 MiB
+
+    volumes:
+      - submissions_data:/data/submissions
+      # Docker socket — lets control-plane spawn sibling containers.
+      # In production, replace with a socket proxy (e.g. Tecnativa/docker-socket-proxy).
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # PHASE 2+ SERVICES (uncomment as you progress)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_DB: nexusbench
+  #     POSTGRES_USER: nexus
+  #     POSTGRES_PASSWORD: nexus_dev
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+
+  # redpanda:
+  #   image: redpandadata/redpanda:latest
+  #   command:
+  #     - redpanda start
+  #     - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+  #     - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+  #     - --mode dev-container
+  #     - --smp 1
+  #     - --default-log-level=warn
+  #   ports:
+  #     - "19092:19092"
+  #   volumes:
+  #     - redpanda_data:/var/lib/redpanda/data
+
+  # clickhouse:
+  #   image: clickhouse/clickhouse-server:24-alpine
+  #   ports:
+  #     - "8123:8123"
+  #     - "9000:9000"
+  #   volumes:
+  #     - clickhouse_data:/var/lib/clickhouse
+
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     GF_AUTH_ANONYMOUS_ENABLED: "true"
+  #     GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+
+volumes:
+  submissions_data:
+  # postgres_data:
+  # redpanda_data:
+  # clickhouse_data:
+  # grafana_data:
