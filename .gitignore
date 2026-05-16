@@ -20,3 +20,19 @@ nexusbench
 # OS
 .DS_Store
 Thumbs.db
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Generated Output
+graphify-out/
+
+# Local Assistant/Editor config
+.claude/
+
+# Environment variables
+.env
+.env.*
+!.env.example
