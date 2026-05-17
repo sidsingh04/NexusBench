@@ -13,7 +13,11 @@ SANDBOX_DIR = docker/sandbox
 # All language images and their Dockerfiles
 LANGUAGES  = go rust cpp python binary
 
-.PHONY: images $(addprefix image-,$(LANGUAGES)) run up down test smoke clean
+# GO_PKGS excludes docker/sandbox/ from `go test` because Dockerfile.go
+# is a Docker file, not a Go source file, and ./... would try to compile it.
+GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
+
+.PHONY: images $(addprefix image-,$(LANGUAGES)) run up down test test-telemetry smoke clean
 
 # ── Image targets ─────────────────────────────────────────────────────────────
 
@@ -75,9 +79,14 @@ down:
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 
-## Run Go unit tests
+## Run ALL Go unit tests (race detector on), excluding non-Go docker/ files
 test:
-	go test ./... -v -race -timeout 60s
+	go test $(GO_PKGS) -v -race -timeout 60s
+
+## Run ONLY the telemetry package tests — fast feedback during Step 1 development
+## This is the command to run after every change to internal/telemetry/*.go
+test-telemetry:
+	go test ./internal/telemetry/... -v -race -timeout 30s -count=1
 
 ## Run end-to-end smoke tests against localhost:8080
 smoke:
