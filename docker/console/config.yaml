@@ -1,0 +1,13 @@
+# Redpanda Console configuration for NexusBench local dev stack.
+# Mounted read-only into the console container at /etc/console/config.yaml.
+# Docs: https://docs.redpanda.com/current/reference/console/config/
+
+kafka:
+  brokers:
+    - redpanda:9092   # internal compose network address
+
+redpanda:
+  adminApi:
+    enabled: true
+    urls:
+      - http://redpanda:9644

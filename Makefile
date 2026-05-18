@@ -1,27 +1,30 @@
 # NexusBench Makefile
 # ─────────────────────────────────────────────────────────────────────────────
-# Pre-built language images:  make images
-# Start control plane (local): make run
-# Run tests:                   make test
-# Smoke test:                  make smoke
-# Full local stack:            make up
+# Pre-built language images:        make images
+# Start control plane (local):      make run
+# Start Redpanda only:              make up-infra
+# Run all tests (unit):             make test
+# Run telemetry unit tests:         make test-telemetry
+# Run telemetry integration tests:  make test-integration
+# Full local stack:                 make up
 
 REGISTRY   ?= nexusbench
 TAG        ?= latest
 SANDBOX_DIR = docker/sandbox
 
-# All language images and their Dockerfiles
 LANGUAGES  = go rust cpp python binary
 
 # GO_PKGS excludes docker/sandbox/ from `go test` because Dockerfile.go
-# is a Docker file, not a Go source file, and ./... would try to compile it.
+# has a .go extension but is not a Go source file.
 GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
 
-.PHONY: images $(addprefix image-,$(LANGUAGES)) run up down test test-telemetry smoke clean
+.PHONY: images $(addprefix image-,$(LANGUAGES)) \
+        run up up-infra down \
+        test test-telemetry test-integration \
+        smoke deps clean-images sizes
 
 # ── Image targets ─────────────────────────────────────────────────────────────
 
-## Build ALL pre-built sandbox images (run once before `make run`)
 images: $(addprefix image-,$(LANGUAGES))
 	@echo ""
 	@echo "✓ All sandbox images built:"
@@ -29,64 +32,63 @@ images: $(addprefix image-,$(LANGUAGES))
 	    --format "  {{.Repository}}:{{.Tag}}  ({{.Size}})"
 
 image-go:
-	@echo "▶ Building $(REGISTRY)-sandbox-go:$(TAG) ..."
-	docker build \
-	    -t $(REGISTRY)-sandbox-go:$(TAG) \
-	    -f $(SANDBOX_DIR)/Dockerfile.go \
-	    $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-go:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.go $(SANDBOX_DIR)
 
 image-rust:
-	@echo "▶ Building $(REGISTRY)-sandbox-rust:$(TAG) ..."
-	docker build \
-	    -t $(REGISTRY)-sandbox-rust:$(TAG) \
-	    -f $(SANDBOX_DIR)/Dockerfile.rust \
-	    $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-rust:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.rust $(SANDBOX_DIR)
 
 image-cpp:
-	@echo "▶ Building $(REGISTRY)-sandbox-cpp:$(TAG) ..."
-	docker build \
-	    -t $(REGISTRY)-sandbox-cpp:$(TAG) \
-	    -f $(SANDBOX_DIR)/Dockerfile.cpp \
-	    $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-cpp:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.cpp $(SANDBOX_DIR)
 
 image-python:
-	@echo "▶ Building $(REGISTRY)-sandbox-python:$(TAG) ..."
-	docker build \
-	    -t $(REGISTRY)-sandbox-python:$(TAG) \
-	    -f $(SANDBOX_DIR)/Dockerfile.python \
-	    $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-python:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.python $(SANDBOX_DIR)
 
 image-binary:
-	@echo "▶ Building $(REGISTRY)-sandbox-binary:$(TAG) ..."
-	docker build \
-	    -t $(REGISTRY)-sandbox-binary:$(TAG) \
-	    -f $(SANDBOX_DIR)/Dockerfile.binary \
-	    $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-binary:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.binary $(SANDBOX_DIR)
 
 # ── Development ───────────────────────────────────────────────────────────────
 
-## Run the control plane locally (hot path for development)
+## Run the control plane locally (no Docker, hot path for development)
 run:
 	go run ./cmd/server
 
-## Start the full docker-compose stack
+## Start the full docker-compose stack (control plane + Redpanda + Console)
 up:
 	docker compose up --build
 
-## Stop the stack
+## Start only the infrastructure services (Redpanda + Console).
+## Use this when running the control plane with `make run` and you only
+## want the backing services in Docker.
+up-infra:
+	docker compose up redpanda console -d
+	@echo ""
+	@echo "✓ Redpanda listening on localhost:19092"
+	@echo "✓ Console UI at http://localhost:8088"
+	@echo ""
+	@echo "Wait ~10s for Redpanda to be healthy, then run:"
+	@echo "  rpk cluster info --brokers 127.0.0.1:19092"
+
+## Stop all compose services and remove volumes
 down:
 	docker compose down -v
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 
-## Run ALL Go unit tests (race detector on), excluding non-Go docker/ files
+## Run all unit tests (race detector on). Does NOT require Redpanda.
 test:
 	go test $(GO_PKGS) -v -race -timeout 60s
 
-## Run ONLY the telemetry package tests — fast feedback during Step 1 development
-## This is the command to run after every change to internal/telemetry/*.go
+## Run only the telemetry package unit tests.
+## Fast feedback loop — no broker needed, runs in ~1s.
 test-telemetry:
 	go test ./internal/telemetry/... -v -race -timeout 30s -count=1
+
+## Run telemetry integration tests against a live Redpanda broker.
+## Requires Redpanda running at 127.0.0.1:19092.
+## Start it first with:  make up-infra
+test-integration:
+	@echo "Running integration tests (requires Redpanda at 127.0.0.1:19092)..."
+	go test ./internal/telemetry/... -tags=integration -v -race -timeout 120s -count=1
 
 ## Run end-to-end smoke tests against localhost:8080
 smoke:
@@ -94,16 +96,15 @@ smoke:
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
+## Download and tidy Go dependencies
+deps:
+	go mod tidy
+
 ## Remove all NexusBench sandbox images
 clean-images:
-	@echo "Removing sandbox images..."
 	docker rmi $(shell docker images --filter "reference=$(REGISTRY)-sandbox-*" -q) 2>/dev/null || true
 
-## Show image sizes
+## Show sandbox image sizes
 sizes:
 	@docker images --filter "reference=$(REGISTRY)-sandbox-*" \
 	    --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
-
-## Download Go dependencies
-deps:
-	go mod tidy

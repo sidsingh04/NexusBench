@@ -2,9 +2,9 @@ version: "3.9"
 
 # NexusBench — Local Development Stack
 #
-# Architecture: pre-built language images are spun on demand per submission.
-# Build them first:  make images
-# Then start:        docker compose up --build
+# Start everything:      docker compose up --build
+# Start just Redpanda:   docker compose up redpanda -d
+# Stop everything:       docker compose down -v
 
 services:
 
@@ -19,29 +19,30 @@ services:
       LISTEN_ADDR: ":8080"
       SUBMISSION_DIR: "/data/submissions"
 
-      # Per-language pre-built sandbox images.
-      # These must exist on the Docker host before starting.
-      # Build with: make images
       SANDBOX_IMAGE_GO:     "nexusbench-sandbox-go:latest"
       SANDBOX_IMAGE_RUST:   "nexusbench-sandbox-rust:latest"
       SANDBOX_IMAGE_CPP:    "nexusbench-sandbox-cpp:latest"
       SANDBOX_IMAGE_PYTHON: "nexusbench-sandbox-python:latest"
       SANDBOX_IMAGE_BINARY: "nexusbench-sandbox-binary:latest"
 
-      # Resource limits per sandbox container
-      SANDBOX_CPU_QUOTA:    "100000"       # 1 CPU core (µs/100ms)
-      SANDBOX_MEMORY_BYTES: "536870912"    # 512 MiB
+      SANDBOX_CPU_QUOTA:    "100000"
+      SANDBOX_MEMORY_BYTES: "536870912"
       SANDBOX_TIMEOUT:      "30m"
       SANDBOX_NETWORK_MODE: "bridge"
       SANDBOX_PORT_MIN:     "20000"
       SANDBOX_PORT_MAX:     "21000"
-      MAX_UPLOAD_BYTES:     "268435456"    # 256 MiB
+      MAX_UPLOAD_BYTES:     "268435456"
+
+      # Step 2: tell the control plane where Redpanda lives.
+      # Inside the compose network the service name resolves as the hostname.
+      REDPANDA_BROKERS: "redpanda:9092"
 
     volumes:
       - submissions_data:/data/submissions
-      # Docker socket — lets control-plane spawn sibling containers.
-      # In production, replace with a socket proxy (e.g. Tecnativa/docker-socket-proxy).
       - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      redpanda:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -49,12 +50,75 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Redpanda (Kafka-compatible streaming backbone) ───────────────────────────
+  #
+  # Two listener addresses:
+  #   internal://redpanda:9092   — used by services inside the compose network
+  #   external://localhost:19092 — used by rpk and Go tests running on the host
+  #
+  # Why a fixed version tag?  Reproducibility. Never use :latest in dev stacks.
+  redpanda:
+    image: redpandadata/redpanda:v24.1.13
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"   # Kafka API — host access for rpk and integration tests
+      - "18082:18082"   # HTTP Proxy — optional REST access
+      - "18081:18081"   # Schema Registry — optional, used in Phase 3+
+      - "9644:9644"     # Admin API — used by rpk cluster info
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      # rpk cluster info exits 0 only when the broker is fully ready.
+      test: ["CMD", "rpk", "cluster", "info", "--brokers", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  # ── Redpanda Console (web UI for topic/message inspection) ──────────────────
+  #
+  # Open http://localhost:8088 to browse topics, view messages, and inspect
+  # consumer group lag. Much faster than running rpk commands by hand.
+  console:
+    image: redpandadata/console:v2.6.0
+    environment:
+      CONFIG_FILEPATH: /etc/console/config.yaml
+    volumes:
+      - ./docker/console/config.yaml:/etc/console/config.yaml:ro
+    ports:
+      - "8088:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ──────────────────────────────────────────────────────────────────────────
-  # PHASE 2+ SERVICES (uncomment as you progress)
+  # PHASE 2 STEP 3+ SERVICES (uncomment as you progress)
   # ──────────────────────────────────────────────────────────────────────────
 
-  # postgres:
-  #   image: postgres:16-alpine
+  # timescaledb:
+  #   image: timescale/timescaledb:latest-pg16
   #   environment:
   #     POSTGRES_DB: nexusbench
   #     POSTGRES_USER: nexus
@@ -62,21 +126,7 @@ services:
   #   ports:
   #     - "5432:5432"
   #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-
-  # redpanda:
-  #   image: redpandadata/redpanda:latest
-  #   command:
-  #     - redpanda start
-  #     - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
-  #     - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
-  #     - --mode dev-container
-  #     - --smp 1
-  #     - --default-log-level=warn
-  #   ports:
-  #     - "19092:19092"
-  #   volumes:
-  #     - redpanda_data:/var/lib/redpanda/data
+  #     - timescale_data:/var/lib/postgresql/data
 
   # clickhouse:
   #   image: clickhouse/clickhouse-server:24-alpine
@@ -87,7 +137,7 @@ services:
   #     - clickhouse_data:/var/lib/clickhouse
 
   # grafana:
-  #   image: grafana/grafana:latest
+  #   image: grafana/grafana:11.0.0
   #   ports:
   #     - "3000:3000"
   #   environment:
@@ -98,7 +148,7 @@ services:
 
 volumes:
   submissions_data:
-  # postgres_data:
-  # redpanda_data:
+  redpanda_data:
+  # timescale_data:
   # clickhouse_data:
   # grafana_data:
