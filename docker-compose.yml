@@ -152,27 +152,61 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # clickhouse:
-  #   image: clickhouse/clickhouse-server:24-alpine
-  #   ports:
-  #     - "8123:8123"
-  #     - "9000:9000"
-  #   volumes:
-  #     - clickhouse_data:/var/lib/clickhouse
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle          # allows POST /-/reload to hot-reload config
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - cadvisor
+    restart: unless-stopped
 
-  # grafana:
-  #   image: grafana/grafana:11.0.0
-  #   ports:
-  #     - "3000:3000"
-  #   environment:
-  #     GF_AUTH_ANONYMOUS_ENABLED: "true"
-  #     GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
-  #   volumes:
-  #     - grafana_data:/var/lib/grafana
+  # ── cAdvisor — per-container resource metrics ─────────────────────────────
+  # Reads Docker stats and exposes them as Prometheus metrics.
+  # The nexusbench.submission_id label on each sandbox container is relabelled
+  # into a submission_id Prometheus label by prometheus.yml.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    ports:
+      - "8081:8080"   # host:8081 avoids collision with control-plane:8080
+    restart: unless-stopped
+
+  # ── Node exporter — host machine metrics ──────────────────────────────────
+  # network_mode:host is Linux-only and breaks on Windows Docker Desktop.
+  # Instead we bind port 9100 and use host.docker.internal in prometheus.yml
+  # to reach it. The /host volume gives node-exporter read access to the
+  # real host filesystem (passed through the WSL2 layer on Windows).
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    command:
+      - --path.rootfs=/host
+    ports:
+      - "9100:9100"
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
 
 volumes:
   submissions_data:
   redpanda_data:
   timescale_data:
+  prometheus_data:
   # clickhouse_data:
   # grafana_data:

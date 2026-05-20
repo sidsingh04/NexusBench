@@ -1,30 +1,47 @@
-# Dockerfile.server — builds the NexusBench control-plane binary
+# Dockerfile.server — builds both the control-plane and consumer binaries.
+#
+# Two binaries are produced from one image to keep the layer cache efficient:
+#   /app/server   — NexusBench control plane  (cmd/server)
+#   /app/consumer — Metrics consumer          (cmd/consumer)
+#
+# The docker-compose metrics-consumer service overrides the entrypoint with
+# ["/app/consumer"] to run the consumer from this same image.
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 
-# Cache dependencies first
+# Cache the dependency download layer separately from the build layer.
+# This layer is only invalidated when go.mod or go.sum change.
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.version=$(date +%Y%m%d)" \
-    -o /out/nexusbench-server \
-    ./cmd/server
 
-# ── Runtime image ──────────────────────────────────────────────────────────
+# Build both binaries in one RUN to share the module cache across both.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -ldflags="-s -w" \
+        -o /app/server \
+        ./cmd/server \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -ldflags="-s -w" \
+        -o /app/consumer \
+        ./cmd/consumer
+
+# ── Runtime image ──────────────────────────────────────────────────────────────
 FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates curl
 
-COPY --from=builder /out/nexusbench-server /usr/local/bin/nexusbench-server
+# Copy both binaries into the runtime image.
+COPY --from=builder /app/server   /app/server
+COPY --from=builder /app/consumer /app/consumer
 
 RUN addgroup -g 1001 nexus && adduser -D -u 1001 -G nexus nexus
 USER nexus
 
 EXPOSE 8080
 
-ENTRYPOINT ["nexusbench-server"]
+# Default entrypoint runs the control plane.
+# Override with ["/app/consumer"] for the metrics-consumer service.
+ENTRYPOINT ["/app/server"]

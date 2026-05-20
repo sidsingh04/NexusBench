@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexusbench/nexusbench/internal/api"
 	"github.com/nexusbench/nexusbench/internal/config"
+	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/nexusbench/nexusbench/internal/sandbox"
 	"github.com/nexusbench/nexusbench/internal/submission"
 )
@@ -56,11 +57,12 @@ func main() {
 	}
 
 	// ── Services ──────────────────────────────────────────────────────────────
+	reg := metrics.New()
 	store := submission.NewDiskStore(cfg.SubmissionDir)
 	submissionSvc := submission.NewService(store, dockerMgr, cfg)
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
-	router := api.NewRouter(submissionSvc, cfg)
+	router := api.NewRouter(submissionSvc, cfg, reg)
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      router,

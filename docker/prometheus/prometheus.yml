@@ -1,0 +1,79 @@
+# NexusBench — Prometheus scrape configuration
+# Mounted read-only into the Prometheus container at /etc/prometheus/prometheus.yml
+#
+# Scrape targets:
+#   nexusbench-server  — control plane /metrics (HTTP request counts, sandbox gauges)
+#   cadvisor           — per-container CPU, memory, network stats
+#   node-exporter      — host machine CPU, disk, memory
+#   redpanda           — broker metrics (consumer lag, topic throughput)
+#
+# Dev topology note:
+#   The control plane runs on the HOST via `go run ./cmd/server` during
+#   development, not inside the compose network. Prometheus reaches it via
+#   the Docker-to-host gateway (host.docker.internal on Windows/Mac, or the
+#   gateway IP on Linux). Node-exporter also uses network_mode:host so it
+#   is reachable the same way.
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+  external_labels:
+    cluster: "nexusbench-local"
+
+# ── Alert rules ───────────────────────────────────────────────────────────────
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
+# ── Scrape configs ────────────────────────────────────────────────────────────
+scrape_configs:
+
+  # NexusBench control plane
+  # When running locally with `go run ./cmd/server`, the server is on the HOST
+  # at port 8080. Prometheus reaches the host via host.docker.internal (Windows
+  # and Mac Docker Desktop resolve this automatically).
+  # When running fully in compose, change this back to "control-plane:8080".
+  - job_name: "nexusbench-server"
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: "control-plane"
+
+  # cAdvisor — per-container resource metrics
+  # Runs inside the compose network — hostname resolves normally.
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          service: "cadvisor"
+    metric_relabel_configs:
+      - source_labels: [container_label_nexusbench_submission_id]
+        target_label: submission_id
+      - source_labels: [container_label_nexusbench_team]
+        target_label: team
+      - source_labels: [container_label_nexusbench_language]
+        target_label: language
+      # Drop pause/infrastructure containers that have no submission label.
+      - source_labels: [container_label_nexusbench_submission_id]
+        regex: "^$"
+        action: drop
+
+  # Node exporter — host machine metrics
+  # node-exporter uses network_mode:host so it is NOT inside the compose
+  # network. Prometheus reaches it the same way as the control plane —
+  # via host.docker.internal on the node-exporter's listening port 9100.
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          service: "host"
+
+  # Redpanda — broker metrics
+  # Runs inside the compose network — hostname resolves normally.
+  - job_name: "redpanda"
+    static_configs:
+      - targets: ["redpanda:9644"]
+        labels:
+          service: "redpanda"
+    metrics_path: "/public_metrics"

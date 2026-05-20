@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/nexusbench/nexusbench/internal/config"
+	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/nexusbench/nexusbench/internal/models"
 	"github.com/nexusbench/nexusbench/internal/submission"
 )
@@ -17,16 +19,21 @@ import (
 type handler struct {
 	svc *submission.Service
 	cfg *config.Config
+	reg *metrics.Registry
 }
 
 // NewRouter wires up all routes and returns the root http.Handler.
-func NewRouter(svc *submission.Service, cfg *config.Config) http.Handler {
-	h := &handler{svc: svc, cfg: cfg}
+func NewRouter(svc *submission.Service, cfg *config.Config, reg *metrics.Registry) http.Handler {
+	h := &handler{svc: svc, cfg: cfg, reg: reg}
 
 	r := mux.NewRouter()
 	r.Use(requestLogger)
 	r.Use(corsMiddleware)
+	r.Use(h.prometheusMiddleware)
 
+	// /metrics is served directly by the Prometheus handler — no auth,
+	// no JSON wrapper, no logging middleware (it would pollute access logs).
+	r.Handle("/metrics", reg.Handler()).Methods(http.MethodGet)
 	r.HandleFunc("/health", h.health).Methods(http.MethodGet)
 
 	v1 := r.PathPrefix("/api/v1").Subrouter()
@@ -212,6 +219,51 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// prometheusMiddleware records HTTP request counts and durations.
+// It uses a normalised path (stripping dynamic IDs) to keep cardinality low.
+func (h *handler) prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip /metrics itself — no need to instrument the instrumentation.
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(wrapped, r)
+		h.reg.RecordHTTPRequest(
+			r.Method,
+			normalisePath(r.URL.Path),
+			strconv.Itoa(wrapped.status),
+			time.Since(start).Seconds(),
+		)
+	})
+}
+
+// normalisePath replaces UUIDs and numeric IDs with placeholders to keep
+// Prometheus label cardinality bounded.
+// e.g. /api/v1/submissions/abc-123 → /api/v1/submissions/{id}
+func normalisePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		// Heuristic: segments longer than 8 chars that contain a hyphen or digit
+		// are likely IDs (UUIDs, submission IDs).
+		if len(p) > 8 && (strings.Contains(p, "-") || containsDigit(p)) {
+			parts[i] = "{id}"
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func containsDigit(s string) bool {
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			return true
+		}
+	}
+	return false
 }
 
 type responseWriter struct {

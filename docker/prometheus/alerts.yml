@@ -1,0 +1,87 @@
+# NexusBench — Prometheus alert rules
+# Mounted read-only into Prometheus at /etc/prometheus/alerts.yml
+#
+# Three rules covering the failure modes that matter most in Phase 2:
+#   1. Container OOM kill
+#   2. CPU saturation on a sandbox
+#   3. Dead telemetry pipeline (no events for 60s)
+
+groups:
+  - name: nexusbench.sandbox
+    rules:
+
+      # ── Rule 1: Container OOM kill ─────────────────────────────────────────
+      # cAdvisor exposes container_oom_events_total — fires every time the
+      # kernel OOM killer terminates a container.
+      # Threshold: any OOM event in the last 5 minutes.
+      - alert: SandboxOOMKilled
+        expr: |
+          increase(container_oom_events_total{
+            container_label_nexusbench_submission_id != ""
+          }[5m]) > 0
+        for: 0m   # fire immediately — OOM is always an actionable event
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sandbox OOM killed (submission={{ $labels.submission_id }})"
+          description: >
+            Container for submission {{ $labels.submission_id }}
+            (team={{ $labels.team }}, language={{ $labels.language }})
+            was killed by the OOM killer.
+            Consider increasing SANDBOX_MEMORY_BYTES or optimising the submission.
+
+      # ── Rule 2: CPU saturation ─────────────────────────────────────────────
+      # container_cpu_usage_seconds_total is a cumulative counter.
+      # rate() over 1m gives CPU cores used per second.
+      # Dividing by container_spec_cpu_quota/container_spec_cpu_period gives
+      # utilisation as a fraction of the allocated CPU quota.
+      # Threshold: > 90% of the allocated quota for 2 consecutive minutes.
+      - alert: SandboxCPUSaturated
+        expr: |
+          (
+            rate(container_cpu_usage_seconds_total{
+              container_label_nexusbench_submission_id != ""
+            }[1m])
+            /
+            (
+              container_spec_cpu_quota{
+                container_label_nexusbench_submission_id != ""
+              }
+              /
+              container_spec_cpu_period{
+                container_label_nexusbench_submission_id != ""
+              }
+            )
+          ) > 0.90
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sandbox CPU saturated (submission={{ $labels.submission_id }})"
+          description: >
+            Container for submission {{ $labels.submission_id }}
+            has been using > 90% of its CPU quota for 2 minutes.
+            The benchmark results may be CPU-throttled rather than
+            reflecting true algorithmic performance.
+
+  - name: nexusbench.telemetry
+    rules:
+
+      # ── Rule 3: Dead telemetry pipeline ────────────────────────────────────
+      # nexusbench_telemetry_events_total is incremented by the control plane
+      # every time an event is emitted to Redpanda.
+      # If the rate drops to zero for 60 seconds during a benchmark run,
+      # the telemetry pipeline has stalled.
+      - alert: TelemetryPipelineDead
+        expr: |
+          rate(nexusbench_telemetry_events_total[60s]) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Telemetry pipeline has stalled"
+          description: >
+            No telemetry events have been emitted to Redpanda in the last
+            60 seconds. Check that the submission engine is running and
+            that the Redpanda broker is reachable.
+            Broker: check `rpk cluster info --brokers 127.0.0.1:19092`.

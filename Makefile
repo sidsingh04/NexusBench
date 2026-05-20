@@ -14,7 +14,7 @@ SANDBOX_DIR = docker/sandbox
 
 LANGUAGES  = go rust cpp python binary
 
-# GO_PKGS excludes docker/sandbox/ from `go test` because Dockerfile.go
+# GO_PKGS excludes docker/sandbox/ from `go test` because Dockerfile.golang
 # has a .go extension but is not a Go source file.
 GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
 
@@ -32,7 +32,7 @@ images: $(addprefix image-,$(LANGUAGES))
 	    --format "  {{.Repository}}:{{.Tag}}  ({{.Size}})"
 
 image-go:
-	docker build -t $(REGISTRY)-sandbox-go:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.go $(SANDBOX_DIR)
+	docker build -t $(REGISTRY)-sandbox-go:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.golang $(SANDBOX_DIR)
 
 image-rust:
 	docker build -t $(REGISTRY)-sandbox-rust:$(TAG) -f $(SANDBOX_DIR)/Dockerfile.rust $(SANDBOX_DIR)

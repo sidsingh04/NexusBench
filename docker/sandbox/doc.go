@@ -1,11 +1,16 @@
-// Package sandbox contains Dockerfiles for NexusBench sandbox images.
-// These are NOT Go source files — this doc.go exists only to give the
-// directory a valid package declaration so `go list ./...` does not error
-// on Dockerfile.go (which has a .go extension for editor syntax highlighting
-// but is a Docker build file, not Go source).
+//go:build ignore
+
+// This file intentionally uses the "ignore" build tag to prevent the Go
+// toolchain from treating docker/sandbox/ as a Go package.
 //
-// To build the images, run:
+// The files Dockerfile.golang, Dockerfile.rust, etc. in this directory use the
+// .go extension purely for editor syntax highlighting. They are Docker build
+// files, not Go source. Without this sentinel, `go build ./...` fails with
+// "expected 'package', found FROM".
 //
-//	make images          # all languages
-//	make image-go        # single language
+// To build the sandbox images run:
+//
+//	make images        (all languages)
+//	make image-go      (Go only)
+//	make image-rust    (Rust only)
 package sandbox
