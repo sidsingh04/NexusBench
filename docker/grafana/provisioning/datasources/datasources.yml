@@ -1,0 +1,76 @@
+# Grafana datasource provisioning for NexusBench.
+# Mounted read-only at /etc/grafana/provisioning/datasources/datasources.yml
+#
+# Three datasources:
+#   1. Prometheus  — infra metrics (HTTP, sandbox gauges, host CPU/mem)
+#   2. TimescaleDB — latency windows (p50/p90/p99, TPS) via PostgreSQL plugin
+#   3. Loki        — structured logs (queryable by submission_id, level, service)
+#
+# All datasources are marked editable:false so they can't be accidentally
+# deleted via the UI — they are always re-provisioned on Grafana restart.
+
+apiVersion: 1
+
+datasources:
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    uid: nexusbench-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: false
+    jsonData:
+      timeInterval: "15s"
+      httpMethod: POST
+
+  # ── TimescaleDB (PostgreSQL) ───────────────────────────────────────────────
+  # Grafana ships a built-in PostgreSQL datasource that works with TimescaleDB.
+  # We use it to query latency_windows directly with SQL.
+  #
+  # Example query for p99 over time:
+  #   SELECT
+  #     time AS "time",
+  #     p99_ns / 1e6 AS "p99_ms",
+  #     submission_id
+  #   FROM latency_windows
+  #   WHERE $__timeFilter(time)
+  #   AND submission_id = '$submission_id'
+  #   ORDER BY time
+  - name: TimescaleDB
+    type: postgres
+    uid: nexusbench-timescaledb
+    access: proxy
+    url: timescaledb:5432
+    isDefault: true
+    editable: false
+    user: nexus
+    secureJsonData:
+      password: nexus_dev
+    jsonData:
+      database: nexusbench
+      sslmode: disable
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1600     # PostgreSQL 16
+      timescaledb: true         # enables TimescaleDB-aware query hints
+
+  # ── Loki ───────────────────────────────────────────────────────────────────
+  - name: Loki
+    type: loki
+    uid: nexusbench-loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+    editable: false
+    jsonData:
+      maxLines: 1000
+      # Derived fields: turn submission_id log values into links to the
+      # TimescaleDB dashboard for that submission.
+      derivedFields:
+        - name: submission_id
+          matcherRegex: '"submission_id":"([^"]+)"'
+          url: '/d/nexusbench-trading-algo?var-submission_id=${__value.raw}'
+          datasourceUid: nexusbench-timescaledb

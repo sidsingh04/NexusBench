@@ -2,13 +2,13 @@ version: "3.9"
 
 # NexusBench — Local Development Stack
 #
-# Start everything:      docker compose up --build
-# Start just Redpanda:   docker compose up redpanda -d
-# Stop everything:       docker compose down -v
+# Start everything:           docker compose up --build
+# Start infra only:           docker compose up redpanda timescaledb loki prometheus cadvisor -d
+# Stop everything:            docker compose down -v
 
 services:
 
-  # ── Control Plane ───────────────────────────────────────────────────────────
+  # ── Control Plane ────────────────────────────────────────────────────────────
   control-plane:
     build:
       context: .
@@ -18,13 +18,11 @@ services:
     environment:
       LISTEN_ADDR: ":8080"
       SUBMISSION_DIR: "/data/submissions"
-
       SANDBOX_IMAGE_GO:     "nexusbench-sandbox-go:latest"
       SANDBOX_IMAGE_RUST:   "nexusbench-sandbox-rust:latest"
       SANDBOX_IMAGE_CPP:    "nexusbench-sandbox-cpp:latest"
       SANDBOX_IMAGE_PYTHON: "nexusbench-sandbox-python:latest"
       SANDBOX_IMAGE_BINARY: "nexusbench-sandbox-binary:latest"
-
       SANDBOX_CPU_QUOTA:    "100000"
       SANDBOX_MEMORY_BYTES: "536870912"
       SANDBOX_TIMEOUT:      "30m"
@@ -32,14 +30,10 @@ services:
       SANDBOX_PORT_MIN:     "20000"
       SANDBOX_PORT_MAX:     "21000"
       MAX_UPLOAD_BYTES:     "268435456"
-
-      # Step 2: tell the control plane where Redpanda lives.
-      # Inside the compose network the service name resolves as the hostname.
-      REDPANDA_BROKERS: "redpanda:9092"
-
+      REDPANDA_BROKERS:     "redpanda:9092"
     volumes:
       - submissions_data:/data/submissions
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:rw
     depends_on:
       redpanda:
         condition: service_healthy
@@ -50,13 +44,7 @@ services:
       timeout: 5s
       retries: 3
 
-  # ── Redpanda (Kafka-compatible streaming backbone) ───────────────────────────
-  #
-  # Two listener addresses:
-  #   internal://redpanda:9092   — used by services inside the compose network
-  #   external://localhost:19092 — used by rpk and Go tests running on the host
-  #
-  # Why a fixed version tag?  Reproducibility. Never use :latest in dev stacks.
+  # ── Redpanda ─────────────────────────────────────────────────────────────────
   redpanda:
     image: redpandadata/redpanda:v24.1.13
     command:
@@ -82,24 +70,20 @@ services:
       - "1"
       - --default-log-level=warn
     ports:
-      - "19092:19092"   # Kafka API — host access for rpk and integration tests
-      - "18082:18082"   # HTTP Proxy — optional REST access
-      - "18081:18081"   # Schema Registry — optional, used in Phase 3+
-      - "9644:9644"     # Admin API — used by rpk cluster info
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+      - "9644:9644"
     volumes:
       - redpanda_data:/var/lib/redpanda/data
     healthcheck:
-      # rpk cluster info exits 0 only when the broker is fully ready.
       test: ["CMD", "rpk", "cluster", "info", "--brokers", "localhost:9092"]
       interval: 5s
       timeout: 10s
       retries: 10
       start_period: 15s
 
-  # ── Redpanda Console (web UI for topic/message inspection) ──────────────────
-  #
-  # Open http://localhost:8088 to browse topics, view messages, and inspect
-  # consumer group lag. Much faster than running rpk commands by hand.
+  # ── Redpanda Console ──────────────────────────────────────────────────────────
   console:
     image: redpandadata/console:v2.6.0
     environment:
@@ -113,11 +97,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # PHASE 2 STEP 3+ SERVICES (uncomment as you progress)
-  # ──────────────────────────────────────────────────────────────────────────
-
-  # ── TimescaleDB (time-series storage for latency windows) ─────────────────
+  # ── TimescaleDB ───────────────────────────────────────────────────────────────
   timescaledb:
     image: timescale/timescaledb:2.15.2-pg16
     environment:
@@ -135,16 +115,16 @@ services:
       retries: 10
       start_period: 10s
 
-  # ── Metrics Consumer (Redpanda → TimescaleDB) ───────────────────────────────
+  # ── Metrics Consumer (Redpanda → TimescaleDB) ─────────────────────────────────
   metrics-consumer:
     build:
       context: .
       dockerfile: Dockerfile.server
-    command: ["/app/consumer"]
+    entrypoint: ["/app/consumer"]
     environment:
-      REDPANDA_BROKERS: "redpanda:9092"
+      REDPANDA_BROKERS:  "redpanda:9092"
       CONSUMER_GROUP_ID: "nexusbench-consumer"
-      TIMESCALE_DSN: "postgres://nexus:nexus_dev@timescaledb:5432/nexusbench"
+      TIMESCALE_DSN:     "postgres://nexus:nexus_dev@timescaledb:5432/nexusbench"
     depends_on:
       redpanda:
         condition: service_healthy
@@ -152,14 +132,14 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Prometheus ────────────────────────────────────────────────────────────
+  # ── Prometheus ────────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.52.0
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
-      - --web.enable-lifecycle          # allows POST /-/reload to hot-reload config
+      - --web.enable-lifecycle
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -170,10 +150,7 @@ services:
       - cadvisor
     restart: unless-stopped
 
-  # ── cAdvisor — per-container resource metrics ─────────────────────────────
-  # Reads Docker stats and exposes them as Prometheus metrics.
-  # The nexusbench.submission_id label on each sandbox container is relabelled
-  # into a submission_id Prometheus label by prometheus.yml.
+  # ── cAdvisor ──────────────────────────────────────────────────────────────────
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     privileged: true
@@ -185,14 +162,12 @@ services:
       - /sys:/sys:ro
       - /var/lib/docker:/var/lib/docker:ro
     ports:
-      - "8081:8080"   # host:8081 avoids collision with control-plane:8080
+      - "8081:8080"
     restart: unless-stopped
 
-  # ── Node exporter — host machine metrics ──────────────────────────────────
-  # network_mode:host is Linux-only and breaks on Windows Docker Desktop.
-  # Instead we bind port 9100 and use host.docker.internal in prometheus.yml
-  # to reach it. The /host volume gives node-exporter read access to the
-  # real host filesystem (passed through the WSL2 layer on Windows).
+  # ── Node exporter ─────────────────────────────────────────────────────────────
+  # network_mode:host is Linux-only. On Windows Docker Desktop we bind the port
+  # and address it via host.docker.internal in prometheus.yml.
   node-exporter:
     image: prom/node-exporter:v1.8.0
     command:
@@ -203,10 +178,66 @@ services:
       - /:/host:ro,rslave
     restart: unless-stopped
 
+  # ── Loki ──────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.0.0
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - ./docker/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Promtail ──────────────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: -config.file=/etc/promtail/promtail.yml
+    volumes:
+      - ./docker/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED:  "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE:  "publicDashboards"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - timescaledb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
 volumes:
   submissions_data:
   redpanda_data:
   timescale_data:
   prometheus_data:
-  # clickhouse_data:
-  # grafana_data:
+  loki_data:
+  grafana_data:

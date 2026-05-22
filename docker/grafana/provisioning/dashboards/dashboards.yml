@@ -1,0 +1,19 @@
+# Grafana dashboard provisioning config for NexusBench.
+# Mounted read-only at /etc/grafana/provisioning/dashboards/dashboards.yml
+#
+# Grafana scans the path below and imports every .json file it finds.
+# Dashboards are version-controlled — changes are committed to git, not
+# saved via the UI (which would be lost on container restart).
+
+apiVersion: 1
+
+providers:
+  - name: NexusBench
+    orgId: 1
+    type: file
+    disableDeletion: true       # prevent UI deletion — source of truth is git
+    updateIntervalSeconds: 30   # re-scan for new/updated JSON files every 30s
+    allowUiUpdates: false       # changes must go through git, not the UI
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

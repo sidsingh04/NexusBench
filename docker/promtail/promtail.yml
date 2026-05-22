@@ -1,0 +1,97 @@
+# Promtail configuration for NexusBench — Windows Docker Desktop compatible.
+#
+# Root cause of no-logs on Windows: docker_sd_configs uses a Unix socket
+# (unix:///var/run/docker.sock) which is a named pipe on Windows and is not
+# reliably accessible from inside a Linux container running in WSL2.
+#
+# Fix: switch to static_configs pointing at the Docker JSON log files directly.
+# Docker Desktop on Windows stores container logs under a path that maps to
+# /var/lib/docker/containers inside the WSL2 VM, which we mount into Promtail.
+# We use a wildcard glob to pick up all containers automatically.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info   # info so we can see scrape activity in promtail logs
+
+positions:
+  filename: /tmp/positions.yaml
+  sync_period: 10s
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchwait:  1s
+    batchsize:  1048576
+    backoff_config:
+      min_period:  500ms
+      max_period:  5m
+      max_retries: 10
+
+scrape_configs:
+
+  # Scrape all Docker container JSON log files via filesystem glob.
+  # Each container writes logs to:
+  #   /var/lib/docker/containers/<container-id>/<container-id>-json.log
+  # We mount /var/lib/docker/containers read-only into Promtail.
+  - job_name: docker-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: docker
+          # __path__ is the Promtail magic label — it's the glob of files to tail.
+          __path__: /var/lib/docker/containers/*/*-json.log
+
+    pipeline_stages:
+      # Stage 1: each line written by Docker's json-file log driver is:
+      # {"log":"<actual log line>\n","stream":"stdout","time":"<RFC3339Nano>"}
+      # Parse it to extract the inner log string and timestamp.
+      - json:
+          expressions:
+            output:    log
+            stream:    stream
+            docker_ts: time
+
+      # Stage 2: extract the container ID from the file path so we can
+      # use it to set a meaningful label.
+      # Path pattern: /var/lib/docker/containers/<id>/<id>-json.log
+      - regex:
+          expression: '/var/lib/docker/containers/(?P<container_id>[^/]+)/[^/]+-json\.log'
+          source: filename
+
+      # Stage 3: set the container_id as a label.
+      - labels:
+          stream:
+          container_id:
+
+      # Stage 4: the actual log line (output) is JSON from our slog handler.
+      # Parse it to extract structured fields for labelling.
+      # Use 'expression' with drop_malformed so non-JSON lines (e.g. from
+      # third-party images like Redpanda) don't cause pipeline errors.
+      - json:
+          source: output
+          expressions:
+            level:  level
+            msg:    msg
+            sub_id: submission_id
+
+      # Stage 5: promote level to a Loki stream label.
+      # Allows LogQL: {job="docker", level="ERROR"}
+      - labels:
+          level:
+
+      # Stage 6: promote submission_id from the log body if present.
+      # Our services (consumer, control-plane) log it on every line.
+      - labels:
+          submission_id: sub_id
+
+      # Stage 7: use the Docker timestamp so Loki stores events at the
+      # time they were written, not the time Promtail scraped them.
+      - timestamp:
+          source: docker_ts
+          format: RFC3339Nano
+          action_on_failure: skip
+
+      # Stage 8: set the final log entry to the unwrapped log string.
+      - output:
+          source: output

@@ -1,0 +1,391 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "description": "NexusBench Admin — full visibility: all containers, host machine, all logs. No filters.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Contestant View",
+      "url": "/d/nexusbench-contestant",
+      "type": "link",
+      "icon": "external link",
+      "tooltip": "Switch to contestant dashboard"
+    }
+  ],
+  "panels": [
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "🖥️ Host Machine — System Health",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "CPU usage of the WSL2 Linux VM backing Docker Desktop. 100% means Docker is CPU-constrained.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green",  "value": null },
+            { "color": "orange", "value": 0.7 },
+            { "color": "red",    "value": 0.9 }
+          ]}
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\", job=\"node-exporter\"}[1m]))",
+        "legendFormat": "CPU % — {{instance}}",
+        "refId": "A"
+      }],
+      "title": "Host CPU Usage",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "WSL2 VM memory: used vs total. Docker Desktop shares this pool across all containers.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes", "min": 0,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 1 },
+      "id": 3,
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+          "expr": "node_memory_MemTotal_bytes{job=\"node-exporter\"} - node_memory_MemAvailable_bytes{job=\"node-exporter\"}",
+          "legendFormat": "Used",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+          "expr": "node_memory_MemTotal_bytes{job=\"node-exporter\"}",
+          "legendFormat": "Total",
+          "refId": "B"
+        }
+      ],
+      "title": "Host Memory",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Disk read/write throughput on the host.",
+      "fieldConfig": {
+        "defaults": { "unit": "Bps", "min": 0, "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 1 } }
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 1 },
+      "id": 4,
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+          "expr": "sum(rate(node_disk_read_bytes_total{job=\"node-exporter\"}[1m]))",
+          "legendFormat": "Disk Read",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+          "expr": "sum(rate(node_disk_written_bytes_total{job=\"node-exporter\"}[1m]))",
+          "legendFormat": "Disk Write",
+          "refId": "B"
+        }
+      ],
+      "title": "Host Disk I/O",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Current host CPU utilisation — single stat for quick glance.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green",  "value": null },
+            { "color": "orange", "value": 0.7 },
+            { "color": "red",    "value": 0.9 }
+          ]}
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 8 },
+      "id": 5,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[1m]))",
+        "refId": "A"
+      }],
+      "title": "CPU Now",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Current memory used percentage.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green",  "value": null },
+            { "color": "orange", "value": 0.7 },
+            { "color": "red",    "value": 0.9 }
+          ]}
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 8 },
+      "id": 6,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "1 - (node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"})",
+        "refId": "A"
+      }],
+      "title": "Memory Now",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Redpanda consumer group lag. Growing = consumer falling behind.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short", "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green",  "value": null },
+            { "color": "orange", "value": 1000 },
+            { "color": "red",    "value": 10000 }
+          ]}
+        }
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 8 },
+      "id": 7,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "sum(redpanda_kafka_consumer_group_lag) or vector(0)",
+        "refId": "A"
+      }],
+      "title": "Consumer Lag (msgs)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Total telemetry events received by the control plane across all submissions.",
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 8 },
+      "id": 8,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "sum(nexusbench_telemetry_events_total) or vector(0)",
+        "refId": "A"
+      }],
+      "title": "Total Telemetry Events",
+      "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "id": 10,
+      "title": "🐳 All Container Health",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "CPU cores consumed per second by every running container. Lets you spot which container is hogging CPU.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short", "min": 0,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "id": 11,
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "sum by (name) (\n  rate(container_cpu_usage_seconds_total{name!=\"\", name!~\".*cadvisor.*\"}[1m])\n)",
+        "legendFormat": "{{name}}",
+        "refId": "A"
+      }],
+      "title": "CPU Usage — All Containers",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "RSS memory per container.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes", "min": 0,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "id": 12,
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "container_memory_rss{name!=\"\", name!~\".*cadvisor.*\"}",
+        "legendFormat": "{{name}}",
+        "refId": "A"
+      }],
+      "title": "Memory RSS — All Containers",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Network receive throughput per container.",
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0, "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 1 } } },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 21 },
+      "id": 13,
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "sum by (name) (rate(container_network_receive_bytes_total{name!=\"\"}[1m]))",
+        "legendFormat": "{{name}}",
+        "refId": "A"
+      }],
+      "title": "Network RX — All Containers",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Network transmit throughput per container.",
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0, "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 1 } } },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 21 },
+      "id": 14,
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name!=\"\"}[1m]))",
+        "legendFormat": "{{name}}",
+        "refId": "A"
+      }],
+      "title": "Network TX — All Containers",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+      "description": "Number of OOM kills per container in the last 5 minutes. Any value > 0 needs investigation.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red",   "value": 1 }
+          ]},
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 27 },
+      "id": 15,
+      "options": {
+        "reduceOptions": { "calcs": ["sum"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "horizontal"
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "nexusbench-prometheus" },
+        "expr": "increase(container_oom_events_total{name!=\"\"}[5m])",
+        "legendFormat": "{{name}}",
+        "refId": "A"
+      }],
+      "title": "OOM Events (last 5 min) — All Containers",
+      "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 20,
+      "title": "📋 All Service Logs",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "loki", "uid": "nexusbench-loki" },
+      "description": "Every log line from every container in the compose project. Filter by level using the dropdown above.",
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 33 },
+      "id": 21,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [{
+        "datasource": { "type": "loki", "uid": "nexusbench-loki" },
+        "expr": "{job=\"docker\"}",
+        "refId": "A"
+      }],
+      "title": "All Container Logs",
+      "type": "logs"
+    },
+
+    {
+      "datasource": { "type": "loki", "uid": "nexusbench-loki" },
+      "description": "Only ERROR-level log lines across all services. The first place to look when something is broken.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 47 },
+      "id": 22,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [{
+        "datasource": { "type": "loki", "uid": "nexusbench-loki" },
+        "expr": "{job=\"docker\", level=\"ERROR\"}",
+        "refId": "A"
+      }],
+      "title": "Error Logs Only",
+      "type": "logs"
+    }
+
+  ],
+
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["nexusbench", "admin", "phase2"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "NexusBench — Admin",
+  "uid": "nexusbench-admin",
+  "version": 1
+}

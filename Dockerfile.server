@@ -38,9 +38,15 @@ COPY --from=builder /app/server   /app/server
 COPY --from=builder /app/consumer /app/consumer
 
 RUN addgroup -g 1001 nexus && adduser -D -u 1001 -G nexus nexus
-USER nexus
 
 EXPOSE 8080
+
+# Run as root so the control-plane can access /var/run/docker.sock
+# to manage sandbox containers. The socket is owned by root on the host
+# and Docker Desktop does not expose a docker group inside containers.
+# metrics-consumer does not need Docker access and could run as nexus,
+# but sharing one image means we accept root for both here.
+USER root
 
 # Default entrypoint runs the control plane.
 # Override with ["/app/consumer"] for the metrics-consumer service.
