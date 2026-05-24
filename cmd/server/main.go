@@ -12,26 +12,23 @@ import (
 	"github.com/nexusbench/nexusbench/internal/api"
 	"github.com/nexusbench/nexusbench/internal/config"
 	"github.com/nexusbench/nexusbench/internal/metrics"
+	"github.com/nexusbench/nexusbench/internal/orchestrator"
 	"github.com/nexusbench/nexusbench/internal/queue"
 	"github.com/nexusbench/nexusbench/internal/sandbox"
 	"github.com/nexusbench/nexusbench/internal/submission"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
+	})))
 
 	cfg := config.Load()
 
-	// ── Submission directory ─────────────────────────────────────────────────
+	// ── Submission directory ──────────────────────────────────────────────────
 	if err := os.MkdirAll(cfg.SubmissionDir, 0o755); err != nil {
 		slog.Error("cannot create submission directory",
-			"path", cfg.SubmissionDir,
-			"err", err,
-			"hint", "On Windows, ensure SUBMISSION_DIR is under C:\\ or another Docker-shared drive",
-		)
+			"path", cfg.SubmissionDir, "err", err)
 		os.Exit(1)
 	}
 	slog.Info("submission directory ready", "path", cfg.SubmissionDir)
@@ -52,72 +49,69 @@ func main() {
 
 	if err := dockerMgr.VerifyImages(startCtx); err != nil {
 		if cfg.DistributedMode {
-			// In distributed mode the control plane never runs sandboxes itself —
-			// workers do. Missing images are a warning, not a fatal error here.
-			slog.Warn("image verification failed (non-fatal in distributed mode)", "err", err)
+			// Workers handle sandbox deployment — missing images are non-fatal
+			// on the control plane itself.
+			slog.Warn("image verification (non-fatal in distributed mode)", "err", err)
 		} else {
 			slog.Error("image verification failed", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	// ── Services ──────────────────────────────────────────────────────────────
+	// ── Core services ─────────────────────────────────────────────────────────
 	reg := metrics.New()
 	store := submission.NewDiskStore(cfg.SubmissionDir)
 	submissionSvc := submission.NewService(store, dockerMgr, cfg)
 
-	// ── Job queue (Phase 3 distributed mode) ──────────────────────────────────
-	// When DISTRIBUTED_MODE=true the control plane enqueues incoming submissions
-	// to jobs.benchmark instead of deploying sandboxes inline. A separate worker
-	// process (cmd/worker) consumes the queue and runs the full benchmark.
-	//
-	// When DISTRIBUTED_MODE=false (default) the original Phase 1/2 behaviour is
-	// preserved: deployAsync runs in-process. No queue dependency at all.
+	// ── Orchestrator (always created; only wired into the router when needed) ─
+	// The WorkerRegistry is cheap — creating it in local mode costs nothing.
+	// The HTTP routes are only mounted when orchHandler is passed to NewRouter.
+	registry := orchestrator.NewWorkerRegistry()
+	var orchHandler *orchestrator.Handler // nil = local mode, routes not mounted
+
+	// ── Distributed mode ──────────────────────────────────────────────────────
 	if cfg.DistributedMode {
-		slog.Info("server: distributed mode enabled — wiring job queue",
+		slog.Info("server: distributed mode — wiring job queue + orchestrator",
 			"brokers", cfg.RedpandaBrokers,
 		)
 
-		queueCfg := queue.RedpandaConfig{
+		jobQueue, err := queue.NewRedpandaQueue(queue.RedpandaConfig{
 			Brokers:           cfg.RedpandaBrokers,
 			Partitions:        4,
 			ReplicationFactor: 1,
-		}
-		jobQueue, err := queue.NewRedpandaQueue(queueCfg)
+		})
 		if err != nil {
-			slog.Error("server: failed to create job queue", "err", err)
+			slog.Error("server: create job queue", "err", err)
 			os.Exit(1)
 		}
-
-		// Bootstrap creates the jobs.benchmark topic if it doesn't exist.
-		// Idempotent — safe to call on every startup.
-		if err := jobQueue.Bootstrap(startCtx); err != nil {
-			slog.Error("server: failed to bootstrap job queue topic", "err", err)
-			os.Exit(1)
-		}
-
-		// Wire the queue into the submission service.
-		// WithQueue returns a new *Service; the original is not mutated.
-		submissionSvc = submissionSvc.WithQueue(jobQueue)
-
-		slog.Info("server: job queue ready",
-			"topic", queue.TopicJobs,
-			"brokers", cfg.RedpandaBrokers,
-		)
-
-		// Close the queue producer cleanly on shutdown.
-		// We register a deferred close via the quit channel below.
 		defer func() {
 			if err := jobQueue.Close(); err != nil {
 				slog.Warn("server: job queue close error", "err", err)
 			}
 		}()
+
+		if err := jobQueue.Bootstrap(startCtx); err != nil {
+			slog.Error("server: bootstrap job queue topic", "err", err)
+			os.Exit(1)
+		}
+
+		submissionSvc = submissionSvc.WithQueue(jobQueue)
+		orchHandler = orchestrator.NewHandler(registry)
+
+		slog.Info("server: job queue ready", "topic", queue.TopicJobs)
+		slog.Info("server: orchestrator ready — worker fleet routes mounted",
+			"register_path", "/internal/workers/register",
+			"heartbeat_path", "/internal/workers/{id}/heartbeat",
+			"list_path", "/internal/workers",
+		)
 	} else {
 		slog.Info("server: local mode (Phase 1/2) — sandboxes deployed in-process")
 	}
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
-	router := api.NewRouter(submissionSvc, cfg, reg)
+	// orchHandler is nil in local mode → orchestrator routes not mounted.
+	router := api.NewRouter(submissionSvc, cfg, reg, orchHandler)
+
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      router,

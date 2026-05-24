@@ -1,27 +1,20 @@
 // cmd/worker is the entrypoint for a NexusBench distributed benchmark worker.
 //
-// A worker process:
-//  1. Connects to Redpanda and bootstraps the jobs.benchmark topic.
-//  2. Connects to the Docker daemon (for sandbox management).
-//  3. Polls the job queue and executes benchmark jobs sequentially.
-//  4. Writes results back to the shared submission store (disk).
+// Startup sequence:
+//  1. Load config from environment variables.
+//  2. Connect to Docker daemon and verify sandbox images.
+//  3. Connect to Redpanda and bootstrap jobs.benchmark topic.
+//  4. Start Heartbeater goroutine → registers with orchestrator, then pings every 5s.
+//  5. Start Worker poll loop → blocks until SIGTERM/SIGINT.
 //
-// One worker handles one job at a time. Run multiple worker replicas
-// (containers / pods) to process jobs in parallel.
+// Configuration (all env vars, all parsed by config.Load()):
 //
-// Configuration — all via environment variables, all parsed by config.Load():
-//
-//	WORKER_ID          unique name for this instance    (default: hostname)
-//	REDPANDA_BROKERS   comma-separated broker list      (default: 127.0.0.1:19092)
-//	SUBMISSION_DIR     path to shared submissions dir   (default: platform default)
-//	JOB_TIMEOUT        max duration per job             (default: 35m)
-//	SANDBOX_*          sandbox image names, CPU/mem limits, port range, timeout
-//
-// Example (local dev against docker-compose stack):
-//
-//	REDPANDA_BROKERS=localhost:19092 \
-//	SUBMISSION_DIR=/data/submissions \
-//	  go run ./cmd/worker
+//	WORKER_ID          unique name            (default: hostname)
+//	ORCHESTRATOR_URL   control plane base URL (default: http://localhost:8080)
+//	REDPANDA_BROKERS   broker list            (default: 127.0.0.1:19092)
+//	SUBMISSION_DIR     shared submissions dir (default: platform default)
+//	JOB_TIMEOUT        max per-job duration   (default: 35m)
+//	SANDBOX_*          image names, limits, port range
 package main
 
 import (
@@ -29,6 +22,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,12 +39,11 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	// config.Load() reads all env vars — REDPANDA_BROKERS, SUBMISSION_DIR,
-	// SANDBOX_*, JOB_TIMEOUT, WORKER_ID — in one place, with no duplication.
 	cfg := config.Load()
 
 	slog.Info("worker: starting",
 		"worker_id", cfg.WorkerID,
+		"orchestrator", cfg.OrchestratorURL,
 		"brokers", cfg.RedpandaBrokers,
 		"job_timeout", cfg.JobTimeout,
 		"submission_dir", cfg.SubmissionDir,
@@ -77,8 +71,6 @@ func main() {
 	defer startCancel()
 
 	if err := dockerMgr.VerifyImages(startCtx); err != nil {
-		// Non-fatal: jobs for missing images will fail at execute time with
-		// a clear error. Do not block startup.
 		slog.Warn("worker: some sandbox images are missing", "err", err)
 	}
 
@@ -103,9 +95,62 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Executor + Worker ─────────────────────────────────────────────────────
-	executor := worker.NewSandboxExecutor(dockerMgr, store)
+	// ── Status tracking for heartbeater ──────────────────────────────────────
+	// workerStatus and currentJobID are written by the Worker poll loop and
+	// read by the Heartbeater. Both use atomics/sync so no mutex is needed
+	// across the two goroutines.
+	//
+	// workerBusy: 0 = idle, 1 = busy
+	// currentJobID: the submission ID being processed, or "" when idle
+	var workerBusy atomic.Int32
+	var currentJobMu sync.RWMutex
+	var currentJobID string
+	var jobsCompleted atomic.Int32
 
+	// statusFn is called by the Heartbeater on every tick.
+	statusFn := func() worker.HeartbeatStatus {
+		currentJobMu.RLock()
+		jobID := currentJobID
+		currentJobMu.RUnlock()
+
+		if workerBusy.Load() == 1 {
+			return worker.HeartbeatStatus{
+				Busy:          true,
+				CurrentJobID:  jobID,
+				JobsCompleted: int(jobsCompleted.Load()),
+			}
+		}
+		return worker.HeartbeatStatus{
+			Busy:          false,
+			JobsCompleted: int(jobsCompleted.Load()),
+		}
+	}
+
+	// ── Heartbeater ───────────────────────────────────────────────────────────
+	hb := worker.NewHeartbeater(cfg.WorkerID, cfg.OrchestratorURL, statusFn)
+	go hb.Run(ctx)
+
+	// ── Executor ─────────────────────────────────────────────────────────────
+	// jobStarted / jobFinished are callbacks that keep workerBusy and
+	// currentJobID in sync so the heartbeater always reports the correct state.
+	jobStarted := func(submissionID string) {
+		workerBusy.Store(1)
+		currentJobMu.Lock()
+		currentJobID = submissionID
+		currentJobMu.Unlock()
+	}
+	jobFinished := func() {
+		workerBusy.Store(0)
+		currentJobMu.Lock()
+		currentJobID = ""
+		currentJobMu.Unlock()
+		jobsCompleted.Add(1)
+	}
+
+	executor := worker.NewSandboxExecutor(dockerMgr, store,
+		worker.WithJobCallbacks(jobStarted, jobFinished))
+
+	// ── Worker ────────────────────────────────────────────────────────────────
 	w, err := worker.NewWorker(jobQueue, store, executor, worker.Config{
 		WorkerID:   cfg.WorkerID,
 		JobTimeout: cfg.JobTimeout,

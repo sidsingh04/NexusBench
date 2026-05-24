@@ -88,10 +88,7 @@ func (f *fakeSandboxDeployer) ContainerHealthy(_ context.Context, _ string) (boo
 // executorWithFastHealth returns a SandboxExecutor whose health poller ticks
 // every millisecond, so tests don't wait 2 seconds between polls.
 func executorWithFastHealth(docker *fakeSandboxDeployer, store worker.Store) *worker.SandboxExecutor {
-	e := worker.NewSandboxExecutor(docker, store)
-	// Use the exported setter so tests can configure the poll interval.
-	// See WithHealthPollInterval below.
-	return e.WithHealthPollInterval(time.Millisecond)
+	return worker.NewSandboxExecutor(docker, store, worker.WithHealthPollInterval(time.Millisecond))
 }
 
 func fakeJob() queue.Job {
@@ -124,8 +121,8 @@ func TestSandboxExecutor_ReturnsStubResults(t *testing.T) {
 	if results == nil {
 		t.Fatal("Execute returned nil results")
 	}
-	if results.BenchmarkDuration != "stage-3.1-stub" {
-		t.Errorf("BenchmarkDuration = %q, want %q", results.BenchmarkDuration, "stage-3.1-stub")
+	if results.BenchmarkDuration != "stage-3.2-stub" {
+		t.Errorf("BenchmarkDuration = %q, want %q", results.BenchmarkDuration, "stage-3.2-stub")
 	}
 }
 

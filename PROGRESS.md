@@ -1,0 +1,225 @@
+# NexusBench — Development Progress
+
+> **Hackathon:** IICPC Summer Hackathon 2026 (May 9 – June 10)
+> **Platform:** Distributed Benchmarking and Hosting Platform for trading algorithms
+> **Module:** `github.com/nexusbench/nexusbench`
+
+---
+
+## What NexusBench Does
+
+Contestants upload a trading engine (matching engine / orderbook) written in C++, Rust, Go, or Python. NexusBench:
+
+1. Sandboxes and deploys the engine in an isolated container with strict CPU and memory limits
+2. Bombards it with a distributed fleet of trading bots simulating extreme market conditions
+3. Captures p50/p90/p99 latency, max TPS, and correctness (price-time priority) in real time
+4. Streams results to a live leaderboard ranked by composite score
+
+---
+
+## Phases Completed
+
+### Phase 1 — Core MVP ✅
+
+**Goal:** upload algo → run in container → replay data → show metrics
+
+**What was built:**
+
+- `internal/models` — core domain types: `Submission`, `BenchmarkResults`, `LeaderboardEntry`, all lifecycle statuses (`pending` → `deploying` → `running` → `benchmarking` → `completed` / `failed`)
+- `internal/config` — single `Config` struct loaded from environment variables; `ImageForLanguage`, `AllImages` helpers
+- `internal/sandbox` — `DockerManager`: deploys contestant code into isolated containers with cgroup CPU pinning, memory limits, capability dropping, bind-mount of the submission archive, and port allocation from a configurable pool
+- `internal/submission` — `Service` + `DiskStore`: validates uploads, stores archives on disk, orchestrates container lifecycle; `Store` interface for testability
+- `internal/api` — HTTP router (gorilla/mux): `POST /api/v1/submissions`, `GET /api/v1/submissions/{id}`, `GET /api/v1/leaderboard`, `GET /health`, `GET /metrics`
+- `cmd/server` — control plane binary
+- `docker/sandbox/` — five Dockerfile variants: `go`, `rust`, `cpp`, `python`, `binary`; each extracts the archive and runs the engine on port 7878
+
+### Phase 2 — Telemetry ✅
+
+**Goal:** live metrics → dashboard → logs
+
+**What was built:**
+
+- `internal/telemetry` — `Event` type (kind, submission ID, timestamp, latency ns, meta), `Emitter` interface, `StdoutEmitter`, `RedpandaEmitter` (franz-go, AllISRAcks, idempotent production), `RecordingEmitter` (tests), `NoopEmitter`; topic layout: `metrics.latency`, `metrics.heartbeat`, `metrics.dlq`
+- `internal/consumer` — `Consumer` polls `metrics.latency` from Redpanda, writes rows to TimescaleDB via `pgxpool`; `PercentileStore` computes p50/p90/p99 from the time-series table
+- `internal/metrics` — Prometheus `Registry`: HTTP request counter + duration histogram; `RecordHTTPRequest` on every route
+- `docker-compose.yml` — full observability stack: Redpanda + Console, TimescaleDB, Prometheus, Grafana, Loki, Promtail, cAdvisor, Node Exporter
+- `cmd/consumer` — metrics consumer binary
+- Grafana dashboards provisioned automatically on startup
+
+### Phase 3 — Distributed Workers (in progress)
+
+**Goal:** multiple benchmark nodes + scheduler
+
+---
+
+## Phase 3 Detail
+
+### Stage 3.1 — Worker Abstraction + Job Queue ✅
+
+**Core insight:** extract "run a benchmark" from a monolithic in-process call into a self-contained `Job` that travels over a durable queue to whichever worker is free.
+
+**Files created:**
+
+| File | Purpose |
+|---|---|
+| `internal/queue/job.go` | `Job` type (self-contained snapshot of Submission) + `Queue` interface (Enqueue / Dequeue / CommitJob / Close) |
+| `internal/queue/memory.go` | `MemoryQueue` — in-process fake; used by all unit tests |
+| `internal/queue/redpanda.go` | `RedpandaQueue` — durable production transport on `jobs.benchmark` topic; separate producer/consumer clients; manual offset commit for at-least-once delivery |
+| `internal/worker/worker.go` | `Worker` poll loop; `Store` + `Executor` interfaces; idempotent guard (checks submission status before executing); at-least-once commit discipline |
+| `internal/worker/executor.go` | `SandboxExecutor` — deploys sandbox via `sandboxDeployer` interface (satisfied by `*sandbox.DockerManager`), waits for health; Stage 3.1 returns stub results |
+| `internal/worker/worker_test.go` | 8 unit tests: happy path, idempotent skip, executor failure, offset commit on success/failure, context cancel, store error does not commit, nil dep validation |
+| `internal/worker/executor_test.go` | 5 unit tests: stub results, deploy error, store load error, container always stopped on error, ctx cancel during health poll |
+| `cmd/worker/main.go` | Worker binary entrypoint |
+| `cmd/smokecheck/main.go` | CLI tool using `kadm.ListEndOffsets` to verify topic watermark; used by smoke tests |
+
+**Files modified (backward-compatible):**
+
+| File | Change |
+|---|---|
+| `internal/config/config.go` | Added `DistributedMode`, `RedpandaBrokers`, `WorkerID`, `JobTimeout`, `OrchestratorURL`; added `getEnvBool`, `getEnvStringSlice`, `hostname()` |
+| `internal/submission/service.go` | Added `jobQueue queue.Queue` field + `WithQueue()` method; `Ingest` dispatches to queue when non-nil, preserving Phase 1/2 path when nil |
+| `Dockerfile.server` | Builds three binaries: `server`, `consumer`, `worker` |
+| `docker-compose.yml` | Added `DISTRIBUTED_MODE=true` to control-plane; added `worker` service |
+| `Makefile` | Added `run-worker`, `test-queue`, `test-worker` targets |
+
+**Key design decisions:**
+
+- **Redpanda as job queue** (not Redis): no new dependency, same broker already used for telemetry, gives at-least-once delivery via consumer groups, partition-keyed by submission ID
+- **`Queue` interface is deep**: 4 methods hide all transport complexity; `MemoryQueue` lets all worker tests run in milliseconds with zero infrastructure
+- **No circular imports**: `worker.Store` is defined in the `worker` package (mirrors `submission.Store`) so `worker` never imports `submission`
+- **`sandboxDeployer` interface**: `SandboxExecutor` accepts an interface, not `*sandbox.DockerManager`; satisfied at the `cmd/worker` call site — tests inject a fake with no Docker
+
+**Smoke test:** `scripts/smoke_test_phase3_stage1.sh`
+- Steps 1–4 offline: compile, unit tests, binary builds, full test suite
+- Steps 5–6 online: Redpanda reachable, topic exists, watermark increases after submission
+
+---
+
+### Stage 3.2 — Orchestrator + Worker Heartbeat ✅
+
+**Core insight:** the queue handles job delivery; the orchestrator handles *fleet visibility*. These are separate concerns. Workers register with the orchestrator on startup and send heartbeats every 5 seconds. The orchestrator marks workers dead after 15 seconds with no heartbeat, surfacing fleet health via the API without requiring any changes to the Redpanda at-least-once delivery mechanism.
+
+**Files created:**
+
+| File | Purpose |
+|---|---|
+| `internal/orchestrator/registry.go` | `WorkerRegistry` — goroutine-safe in-memory map of `workerID → WorkerRecord`; `Register`, `Heartbeat`, `List`, `Get`, `Stats`; TTL-based dead detection in `List` |
+| `internal/orchestrator/handler.go` | HTTP handlers for worker fleet routes; exported `HTTPRegister`, `HTTPHeartbeat`, `HTTPList`, `HTTPStats` methods for gorilla/mux integration |
+| `internal/orchestrator/registry_test.go` | 10 unit tests: register, re-register resets state, empty ID error, heartbeat updates, heartbeat unknown worker, list marks dead, list alive, stats counts, get returns copy, concurrent heartbeats (race detector) |
+| `internal/worker/heartbeat.go` | `Heartbeater` — background goroutine; registers on startup, pings every 5s, auto-re-registers on 404; exported `HeartbeatStatus` type decouples worker from orchestrator package |
+| `scripts/smoke_test_phase3_stage2.sh` | 6-step smoke test: offline compile/test + online route check + worker registers + stays alive after 2 intervals |
+
+**Files modified:**
+
+| File | Change |
+|---|---|
+| `internal/api/router.go` | `NewRouter` accepts `*orchestrator.Handler` (nil-safe); mounts `/internal/workers/*` routes only in distributed mode |
+| `internal/worker/executor.go` | Replaced `WithHealthPollInterval` method with functional options pattern (`ExecutorOption`); added `WithJobCallbacks(onStart, onFinish)` so heartbeater tracks busy/idle state |
+| `cmd/server/main.go` | Constructs `WorkerRegistry` + `orchestrator.Handler`; passes handler to `NewRouter` |
+| `cmd/worker/main.go` | Wires `Heartbeater` + status callbacks via atomics; starts heartbeater goroutine alongside worker poll loop |
+| `internal/config/config.go` | Added `OrchestratorURL` field + env var parsing |
+| `docker-compose.yml` | Added `ORCHESTRATOR_URL` to worker service; added `control-plane` health dependency for worker |
+| `Makefile` | Added `test-orchestrator` target |
+
+**Key design decisions:**
+
+- **Orchestrator does not dispatch jobs** — that is the queue's responsibility. It only tracks liveness, decoupling fleet visibility from delivery semantics
+- **No cycle between `worker` and `orchestrator`**: `heartbeat.go` defines its own `heartbeatPayload` struct (matching `orchestrator.HeartbeatUpdate` JSON tags) rather than importing the orchestrator package
+- **Nil-safe router**: `orchHandler == nil` in local mode → zero overhead, zero routes mounted, Phase 1/2 completely unchanged
+- **Status via atomics**: `workerBusy` is `atomic.Int32`, `currentJobID` guarded by `sync.RWMutex` — no lock contention between the poll loop and the heartbeat ticker
+
+---
+
+## Architecture Diagram
+
+```
+  Contestant Browser / curl
+         │
+         ▼
+  ┌─────────────────────────────┐
+  │  Control Plane (:8080)      │
+  │  cmd/server                 │
+  │  ├─ POST /api/v1/submissions│──► Enqueue ──► jobs.benchmark (Redpanda)
+  │  ├─ GET  /api/v1/leaderboard│◄── store reads
+  │  └─ GET  /internal/workers  │◄── WorkerRegistry (in-memory)
+  └─────────────────────────────┘
+         ▲ heartbeat (5s)
+         │ register
+  ┌──────┴──────────────────────┐
+  │  Worker (cmd/worker)        │
+  │  ├─ Heartbeater goroutine   │
+  │  └─ Worker poll loop        │◄── Dequeue ◄── jobs.benchmark
+  │       └─ SandboxExecutor    │
+  │            ├─ Deploy        │──► Docker sandbox container
+  │            ├─ WaitHealthy   │
+  │            └─ [Stage 3.3]   │ Bot fleet (stub for now)
+  └─────────────────────────────┘
+         │ writes results
+         ▼
+  ┌─────────────────────────────┐
+  │  DiskStore (shared volume)  │
+  │  /data/submissions/{id}/    │
+  │  meta.json                  │
+  └─────────────────────────────┘
+```
+
+---
+
+## Running the Stack
+
+```bash
+# Build sandbox images (one-time)
+make images
+
+# Start full stack with distributed mode
+docker compose up --build -d
+
+# Run Stage 3.1 smoke test
+STACK_RUNNING=1 bash scripts/smoke_test_phase3_stage1.sh
+
+# Run Stage 3.2 smoke test
+STACK_RUNNING=1 bash scripts/smoke_test_phase3_stage2.sh
+
+# Run all unit tests (offline, no infrastructure)
+make test
+
+# Scale to 3 workers
+docker compose up --scale worker=3 -d
+```
+
+---
+
+## Test Coverage
+
+| Package | Tests | Infrastructure required |
+|---|---|---|
+| `internal/queue` | 9 | None |
+| `internal/worker` | 13 (8 worker + 5 executor) | None |
+| `internal/orchestrator` | 10 | None |
+| `internal/submission` | existing | None |
+| `internal/telemetry` | existing | None (unit) / Redpanda (integration) |
+
+All unit tests run in < 2 seconds total. The race detector is enabled on every `make test` run.
+
+---
+
+## What's Next
+
+### Stage 3.3 — Parallel Job Dispatch
+
+Replace the `SandboxExecutor` stub with the real distributed bot fleet:
+- Wire `internal/botfleet` package: spawns N goroutines each sending Limit/Market/Cancel orders to the sandbox endpoint
+- Collect per-order latency, compute p50/p90/p99, calculate correctness against golden orderbook
+- Write real `BenchmarkResults` to the store
+- Validate: 3 concurrent submissions → 3 workers execute concurrently → metrics all stream correctly
+
+### Stage 3.4 — Terraform
+
+- Provision cloud node pool with Terraform
+- Kubernetes manifests for control-plane, worker (HPA on queue depth), Redpanda
+
+### Stage 3.5 — Advanced Benchmarking
+
+- Stress benchmark (volatile-only replay)
+- Latency injection / chaos engineering
+- Pause / Resume / Kill controls on running benchmarks

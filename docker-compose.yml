@@ -246,6 +246,7 @@ services:
     entrypoint: ["/app/worker"]
     environment:
       WORKER_ID: "worker-1"
+      ORCHESTRATOR_URL:     "http://control-plane:8080"
       REDPANDA_BROKERS:     "redpanda:9092"
       SUBMISSION_DIR:       "/data/submissions"
       JOB_TIMEOUT:          "35m"
@@ -265,6 +266,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:rw
     depends_on:
       redpanda:
+        condition: service_healthy
+      control-plane:
         condition: service_healthy
     restart: unless-stopped
 

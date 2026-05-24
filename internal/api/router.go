@@ -13,6 +13,7 @@ import (
 	"github.com/nexusbench/nexusbench/internal/config"
 	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/nexusbench/nexusbench/internal/models"
+	"github.com/nexusbench/nexusbench/internal/orchestrator"
 	"github.com/nexusbench/nexusbench/internal/submission"
 )
 
@@ -23,7 +24,9 @@ type handler struct {
 }
 
 // NewRouter wires up all routes and returns the root http.Handler.
-func NewRouter(svc *submission.Service, cfg *config.Config, reg *metrics.Registry) http.Handler {
+// orchHandler may be nil — if so, /internal/workers/* routes are not mounted
+// (Phase 1/2 local mode where no worker fleet exists).
+func NewRouter(svc *submission.Service, cfg *config.Config, reg *metrics.Registry, orchHandler *orchestrator.Handler) http.Handler {
 	h := &handler{svc: svc, cfg: cfg, reg: reg}
 
 	r := mux.NewRouter()
@@ -50,6 +53,17 @@ func NewRouter(svc *submission.Service, cfg *config.Config, reg *metrics.Registr
 
 	// Leaderboard
 	v1.HandleFunc("/leaderboard", h.leaderboard).Methods(http.MethodGet)
+
+	// ── Orchestrator (Phase 3+ distributed mode only) ─────────────────────────
+	// These internal routes let workers register themselves and send heartbeats.
+	// Only mounted when orchHandler is non-nil (DISTRIBUTED_MODE=true).
+	if orchHandler != nil {
+		internal := r.PathPrefix("/internal").Subrouter()
+		internal.HandleFunc("/workers/register", orchHandler.HTTPRegister).Methods(http.MethodPost)
+		internal.HandleFunc("/workers/{id}/heartbeat", orchHandler.HTTPHeartbeat).Methods(http.MethodPost)
+		internal.HandleFunc("/workers", orchHandler.HTTPList).Methods(http.MethodGet)
+		internal.HandleFunc("/workers/stats", orchHandler.HTTPStats).Methods(http.MethodGet)
+	}
 
 	return r
 }

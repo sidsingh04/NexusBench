@@ -95,6 +95,10 @@ test-telemetry:
 test-queue:
 	go test ./internal/queue/... -v -race -timeout 30s -count=1
 
+## Run only the orchestrator package unit tests.
+test-orchestrator:
+	go test ./internal/orchestrator/... -v -race -timeout 30s -count=1
+
 ## Run only the worker package unit tests (no Docker, no Redpanda required).
 test-worker:
 	go test ./internal/worker/... -v -race -timeout 30s -count=1

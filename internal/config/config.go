@@ -69,6 +69,12 @@ type Config struct {
 	// job (sandbox deploy + health wait + bot fleet + result write).
 	// Set via environment variable: JOB_TIMEOUT
 	JobTimeout time.Duration
+
+	// OrchestratorURL is the base URL of the control plane that the worker
+	// sends heartbeats to. Must be reachable from the worker container.
+	// Example: "http://control-plane:8080"
+	// Set via environment variable: ORCHESTRATOR_URL
+	OrchestratorURL string
 }
 
 // Load reads configuration from environment variables with sane defaults.
@@ -98,8 +104,9 @@ func Load() *Config {
 		DistributedMode: getEnvBool("DISTRIBUTED_MODE", false),
 		RedpandaBrokers: getEnvStringSlice("REDPANDA_BROKERS", []string{"127.0.0.1:19092"}),
 
-		WorkerID:   getEnv("WORKER_ID", hostname()),
-		JobTimeout: getEnvDuration("JOB_TIMEOUT", 35*time.Minute),
+		WorkerID:        getEnv("WORKER_ID", hostname()),
+		JobTimeout:      getEnvDuration("JOB_TIMEOUT", 35*time.Minute),
+		OrchestratorURL: getEnv("ORCHESTRATOR_URL", "http://localhost:8080"),
 	}
 }
 
