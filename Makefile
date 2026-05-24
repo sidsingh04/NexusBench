@@ -2,9 +2,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-built language images:        make images
 # Start control plane (local):      make run
+# Start worker (local):             make run-worker
 # Start Redpanda only:              make up-infra
 # Run all tests (unit):             make test
 # Run telemetry unit tests:         make test-telemetry
+# Run queue unit tests:             make test-queue
+# Run worker unit tests:            make test-worker
 # Run telemetry integration tests:  make test-integration
 # Full local stack:                 make up
 
@@ -19,8 +22,8 @@ LANGUAGES  = go rust cpp python binary
 GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
 
 .PHONY: images $(addprefix image-,$(LANGUAGES)) \
-        run up up-infra down \
-        test test-telemetry test-integration \
+        run run-worker up up-infra down \
+        test test-telemetry test-queue test-worker test-integration \
         smoke deps clean-images sizes
 
 # ── Image targets ─────────────────────────────────────────────────────────────
@@ -52,7 +55,12 @@ image-binary:
 run:
 	go run ./cmd/server
 
-## Start the full docker-compose stack (control plane + Redpanda + Console)
+## Run a single worker process locally.
+## Requires Redpanda running (make up-infra) and SUBMISSION_DIR set.
+run-worker:
+	go run ./cmd/worker
+
+## Start the full docker-compose stack (control plane + worker + Redpanda + Console)
 up:
 	docker compose up --build
 
@@ -74,7 +82,7 @@ down:
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 
-## Run all unit tests (race detector on). Does NOT require Redpanda.
+## Run all unit tests (race detector on). Does NOT require Redpanda or Docker.
 test:
 	go test $(GO_PKGS) -v -race -timeout 60s
 
@@ -82,6 +90,14 @@ test:
 ## Fast feedback loop — no broker needed, runs in ~1s.
 test-telemetry:
 	go test ./internal/telemetry/... -v -race -timeout 30s -count=1
+
+## Run only the queue package unit tests (no Redpanda required).
+test-queue:
+	go test ./internal/queue/... -v -race -timeout 30s -count=1
+
+## Run only the worker package unit tests (no Docker, no Redpanda required).
+test-worker:
+	go test ./internal/worker/... -v -race -timeout 30s -count=1
 
 ## Run telemetry integration tests against a live Redpanda broker.
 ## Requires Redpanda running at 127.0.0.1:19092.

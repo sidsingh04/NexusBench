@@ -1,11 +1,14 @@
-# Dockerfile.server — builds both the control-plane and consumer binaries.
+# Dockerfile.server — builds the control-plane, consumer, and worker binaries.
 #
-# Two binaries are produced from one image to keep the layer cache efficient:
+# Three binaries are produced from one image to keep the layer cache efficient:
 #   /app/server   — NexusBench control plane  (cmd/server)
 #   /app/consumer — Metrics consumer          (cmd/consumer)
+#   /app/worker   — Benchmark worker          (cmd/worker)   ← Phase 3
 #
-# The docker-compose metrics-consumer service overrides the entrypoint with
-# ["/app/consumer"] to run the consumer from this same image.
+# docker-compose service entrypoints:
+#   control-plane:    ["/app/server"]   (default)
+#   metrics-consumer: ["/app/consumer"]
+#   worker:           ["/app/worker"]
 
 FROM golang:1.25-alpine AS builder
 
@@ -18,7 +21,7 @@ RUN go mod download
 
 COPY . .
 
-# Build both binaries in one RUN to share the module cache across both.
+# Build all three binaries in one RUN to share the module cache across all.
 RUN CGO_ENABLED=0 GOOS=linux go build \
         -ldflags="-s -w" \
         -o /app/server \
@@ -26,28 +29,31 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     && CGO_ENABLED=0 GOOS=linux go build \
         -ldflags="-s -w" \
         -o /app/consumer \
-        ./cmd/consumer
+        ./cmd/consumer \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -ldflags="-s -w" \
+        -o /app/worker \
+        ./cmd/worker
 
 # ── Runtime image ──────────────────────────────────────────────────────────────
 FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates curl
 
-# Copy both binaries into the runtime image.
+# Copy all three binaries into the runtime image.
 COPY --from=builder /app/server   /app/server
 COPY --from=builder /app/consumer /app/consumer
+COPY --from=builder /app/worker   /app/worker
 
 RUN addgroup -g 1001 nexus && adduser -D -u 1001 -G nexus nexus
 
 EXPOSE 8080
 
-# Run as root so the control-plane can access /var/run/docker.sock
+# Run as root so the control-plane and worker can access /var/run/docker.sock
 # to manage sandbox containers. The socket is owned by root on the host
 # and Docker Desktop does not expose a docker group inside containers.
-# metrics-consumer does not need Docker access and could run as nexus,
-# but sharing one image means we accept root for both here.
 USER root
 
 # Default entrypoint runs the control plane.
-# Override with ["/app/consumer"] for the metrics-consumer service.
+# Override with ["/app/consumer"] or ["/app/worker"] for other services.
 ENTRYPOINT ["/app/server"]

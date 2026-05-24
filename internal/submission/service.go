@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nexusbench/nexusbench/internal/config"
 	"github.com/nexusbench/nexusbench/internal/models"
+	"github.com/nexusbench/nexusbench/internal/queue"
 	"github.com/nexusbench/nexusbench/internal/sandbox"
 )
 
@@ -102,18 +103,51 @@ func (s *DiskStore) List() ([]*models.Submission, error) {
 // ── Service ───────────────────────────────────────────────────────────────────
 
 // Service orchestrates ingestion and on-demand container deployment.
+//
+// Phase 3 dispatch modes (controlled by the jobQueue field):
+//
+//   - jobQueue == nil (Phase 1/2 mode):
+//     Ingest calls deployAsync directly — runs the full sandbox lifecycle
+//     in-process. Identical to the original behaviour; no existing tests break.
+//
+//   - jobQueue != nil (Phase 3 distributed mode):
+//     Ingest enqueues a Job to the queue. A separate worker process picks it
+//     up, runs the sandbox, and writes results back via the shared Store.
+//     The control plane stays stateless between submission and completion.
 type Service struct {
-	store  Store
-	docker *sandbox.DockerManager
-	cfg    *config.Config
+	store    Store
+	docker   *sandbox.DockerManager
+	cfg      *config.Config
+	jobQueue queue.Queue // nil = local mode (Phase 1/2), non-nil = distributed mode (Phase 3+)
 }
 
+// NewService creates a Service in local (Phase 1/2) mode.
+// No queue is wired — Ingest deploys sandboxes directly via docker.
 func NewService(store Store, docker *sandbox.DockerManager, cfg *config.Config) *Service {
 	return &Service{store: store, docker: docker, cfg: cfg}
 }
 
+// WithQueue returns a copy of s with a job queue wired in, enabling
+// distributed (Phase 3+) mode. The original Service is not modified.
+//
+// Usage in cmd/server/main.go:
+//
+//	svc := submission.NewService(store, docker, cfg).WithQueue(jobQueue)
+func (s *Service) WithQueue(q queue.Queue) *Service {
+	return &Service{
+		store:    s.store,
+		docker:   s.docker,
+		cfg:      s.cfg,
+		jobQueue: q,
+	}
+}
+
 // Ingest validates the upload, persists the archive, records the submission,
-// then fires off async deployment of the language-specific container.
+// then either enqueues a job (distributed mode) or deploys the sandbox
+// directly (local mode).
+//
+// The returned Submission is always in StatusPending — callers poll
+// GET /submissions/{id} to observe status transitions.
 func (s *Service) Ingest(
 	ctx context.Context,
 	req models.SubmitRequest,
@@ -167,13 +201,28 @@ func (s *Service) Ingest(
 		"size_bytes", fileHeader.Size,
 	)
 
-	go s.deployAsync(sub)
+	// ── dispatch ──────────────────────────────────────────────────────────────
+	if s.jobQueue != nil {
+		// Distributed mode: hand the job to the worker fleet via the queue.
+		// We enqueue synchronously so any broker failure surfaces immediately
+		// to the caller as a 500 rather than silently losing the job.
+		j := queue.NewJob(sub)
+		if err := s.jobQueue.Enqueue(ctx, j); err != nil {
+			// Roll back the submission to failed so the client knows to retry.
+			s.setStatus(sub, models.StatusFailed, fmt.Sprintf("enqueue error: %v", err))
+			return nil, fmt.Errorf("enqueue job: %w", err)
+		}
+		slog.Info("submission dispatched to worker queue", "id", id, "job_id", j.ID)
+	} else {
+		// Local mode (Phase 1/2): deploy in this process. Unchanged behaviour.
+		go s.deployAsync(sub)
+	}
 
 	return sub, nil
 }
 
 // deployAsync picks the pre-built image for this submission's language
-// and spins it up as a container.
+// and spins it up as a container. Only called in local (Phase 1/2) mode.
 func (s *Service) deployAsync(sub *models.Submission) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.SandboxTimeout)
 	defer cancel()
@@ -235,8 +284,9 @@ func (s *Service) StopContainer(ctx context.Context, id string) error {
 // storeArchive persists the uploaded file to <submissionDir>/<id>/archive.<ext>
 //
 // Bug fix 1 — extension detection:
-//   filepath.Ext("file.tar.gz") returns ".gz", not ".tar.gz".
-//   We check the full filename suffix manually to preserve compound extensions.
+//
+//	filepath.Ext("file.tar.gz") returns ".gz", not ".tar.gz".
+//	We check the full filename suffix manually to preserve compound extensions.
 func (s *Service) storeArchive(id string, fh *multipart.FileHeader) (string, error) {
 	dir := filepath.Join(s.cfg.SubmissionDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -274,7 +324,6 @@ func archiveExt(filename string) string {
 			return ext
 		}
 	}
-	// Single extension (.zip, .gz, .bz2, etc.)
 	if ext := filepath.Ext(filename); ext != "" {
 		return ext
 	}

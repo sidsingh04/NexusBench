@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,39 @@ type Config struct {
 
 	// Maximum upload size (bytes)
 	MaxUploadBytes int64
+
+	// ── Phase 3: Distributed mode ─────────────────────────────────────────────
+
+	// DistributedMode switches the control plane from local (Phase 1/2) mode
+	// to distributed (Phase 3+) mode.
+	//
+	//   false (default) — Ingest deploys sandboxes directly in-process.
+	//                     RedpandaBrokers is ignored. No queue dependency.
+	//
+	//   true            — Ingest enqueues a Job to jobs.benchmark.
+	//                     A separate worker process picks it up and runs the
+	//                     sandbox. RedpandaBrokers must be set.
+	//
+	// Set via environment variable: DISTRIBUTED_MODE=true
+	DistributedMode bool
+
+	// RedpandaBrokers is the comma-separated list of Redpanda broker addresses
+	// used for the job queue in distributed mode.
+	// Example: "redpanda:9092" or "localhost:19092,localhost:29092"
+	// Set via environment variable: REDPANDA_BROKERS
+	RedpandaBrokers []string
+
+	// ── Worker-specific ───────────────────────────────────────────────────────
+
+	// WorkerID uniquely identifies a worker instance in logs and metrics.
+	// Defaults to the system hostname so each pod/container is distinct.
+	// Set via environment variable: WORKER_ID
+	WorkerID string
+
+	// JobTimeout is the maximum wall-clock time a worker spends on a single
+	// job (sandbox deploy + health wait + bot fleet + result write).
+	// Set via environment variable: JOB_TIMEOUT
+	JobTimeout time.Duration
 }
 
 // Load reads configuration from environment variables with sane defaults.
@@ -60,6 +94,12 @@ func Load() *Config {
 		SandboxPortMin:     getEnvInt("SANDBOX_PORT_MIN", 20000),
 		SandboxPortMax:     getEnvInt("SANDBOX_PORT_MAX", 21000),
 		MaxUploadBytes:     getEnvInt64("MAX_UPLOAD_BYTES", 256*1024*1024),
+
+		DistributedMode: getEnvBool("DISTRIBUTED_MODE", false),
+		RedpandaBrokers: getEnvStringSlice("REDPANDA_BROKERS", []string{"127.0.0.1:19092"}),
+
+		WorkerID:   getEnv("WORKER_ID", hostname()),
+		JobTimeout: getEnvDuration("JOB_TIMEOUT", 35*time.Minute),
 	}
 }
 
@@ -126,4 +166,51 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 		}
 	}
 	return defaultVal
+}
+
+// getEnvBool parses a boolean environment variable.
+// Accepts "true", "1", "yes" (case-insensitive) as true; everything else
+// (including unset) returns the defaultVal.
+func getEnvBool(key string, defaultVal bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
+	default:
+		return defaultVal
+	}
+}
+
+// getEnvStringSlice parses a comma-separated environment variable into a
+// slice of trimmed, non-empty strings.
+// Returns defaultVal if the variable is unset or empty.
+func getEnvStringSlice(key string, defaultVal []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return defaultVal
+	}
+	return out
+}
+
+// hostname returns the system hostname, falling back to "worker-unknown" if
+// os.Hostname fails. Used as the default WorkerID so each pod is distinct
+// without explicit configuration.
+func hostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return "worker-unknown"
+	}
+	return h
 }

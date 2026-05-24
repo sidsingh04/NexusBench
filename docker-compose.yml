@@ -31,6 +31,7 @@ services:
       SANDBOX_PORT_MAX:     "21000"
       MAX_UPLOAD_BYTES:     "268435456"
       REDPANDA_BROKERS:     "redpanda:9092"
+      DISTRIBUTED_MODE:     "true"
     volumes:
       - submissions_data:/data/submissions
       - /var/run/docker.sock:/var/run/docker.sock:rw
@@ -233,6 +234,39 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+
+  # ── Benchmark Worker (Phase 3) ───────────────────────────────────────────────
+  # Scale this service horizontally to add more worker capacity:
+  #   docker compose up --scale worker=3
+  # Each replica picks up a different job partition from jobs.benchmark.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    entrypoint: ["/app/worker"]
+    environment:
+      WORKER_ID: "worker-1"
+      REDPANDA_BROKERS:     "redpanda:9092"
+      SUBMISSION_DIR:       "/data/submissions"
+      JOB_TIMEOUT:          "35m"
+      SANDBOX_IMAGE_GO:     "nexusbench-sandbox-go:latest"
+      SANDBOX_IMAGE_RUST:   "nexusbench-sandbox-rust:latest"
+      SANDBOX_IMAGE_CPP:    "nexusbench-sandbox-cpp:latest"
+      SANDBOX_IMAGE_PYTHON: "nexusbench-sandbox-python:latest"
+      SANDBOX_IMAGE_BINARY: "nexusbench-sandbox-binary:latest"
+      SANDBOX_CPU_QUOTA:    "100000"
+      SANDBOX_MEMORY_BYTES: "536870912"
+      SANDBOX_TIMEOUT:      "30m"
+      SANDBOX_NETWORK_MODE: "bridge"
+      SANDBOX_PORT_MIN:     "21000"
+      SANDBOX_PORT_MAX:     "22000"
+    volumes:
+      - submissions_data:/data/submissions
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   submissions_data:
