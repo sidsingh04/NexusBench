@@ -327,7 +327,7 @@ func archiveExt(filename string) string {
 	if ext := filepath.Ext(filename); ext != "" {
 		return ext
 	}
-	return ".tar.gz" // safe default
+	return "" // Return empty string if no extension is provided
 }
 
 // ── Validators ────────────────────────────────────────────────────────────────

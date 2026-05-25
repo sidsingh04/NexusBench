@@ -148,7 +148,8 @@ func main() {
 	}
 
 	executor := worker.NewSandboxExecutor(dockerMgr, store,
-		worker.WithJobCallbacks(jobStarted, jobFinished))
+		worker.WithJobCallbacks(jobStarted, jobFinished),
+		worker.WithSandboxHost(cfg.SandboxHost))
 
 	// ── Worker ────────────────────────────────────────────────────────────────
 	w, err := worker.NewWorker(jobQueue, store, executor, worker.Config{

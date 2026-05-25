@@ -9,100 +9,109 @@ import (
 )
 
 // Emitter is the single abstraction every event producer depends on.
-// Keeping this interface minimal (two methods) means:
-//
-//  1. StdoutEmitter, RedpandaEmitter, and test fakes all implement it trivially.
-//  2. The matching engine has zero dependency on any transport library.
-//  3. Swapping transports in Step 2 requires zero changes to engine code.
 //
 // Contract:
 //   - Emit validates the event before sending; it returns an error if the
 //     event is malformed or if the underlying transport fails.
-//   - Emit MUST NOT block the caller for more than a few milliseconds.
-//     Implementations that need buffering (e.g. Redpanda batch producer)
-//     must do so internally without holding up the hot path.
+//   - BatchEmit is the preferred path for high-throughput producers (e.g.
+//     the bot fleet). Implementations must buffer internally and not block
+//     the caller longer than a single round-trip to the transport.
+//   - Emit and BatchEmit MUST be safe to call concurrently.
 //   - Close flushes any buffered events and releases resources.
 //     It is safe to call Close more than once; subsequent calls are no-ops.
 type Emitter interface {
 	Emit(ctx context.Context, e Event) error
+
+	// BatchEmit sends a slice of events in one logical operation.
+	// Callers should batch events in slices of ~100 before calling — this
+	// avoids per-event lock/unlock overhead and (for Redpanda) amortises
+	// network round-trips across multiple records.
+	//
+	// BatchEmit validates every event before sending. If any event is invalid
+	// it is skipped (not sent) and a combined error is returned after all
+	// valid events have been sent. Partial sends are therefore possible; the
+	// caller should log the error but need not treat it as fatal.
+	BatchEmit(ctx context.Context, events []Event) error
+
 	Close() error
 }
 
 // ── StdoutEmitter ─────────────────────────────────────────────────────────────
 
-// StdoutEmitter serialises every Event as a JSON object followed by a newline
-// (NDJSON / JSON Lines format) and writes it to an io.Writer.
-//
-// Why NDJSON?
-//   - One event per line → trivially parseable with `jq` or any log shipper.
-//   - No framing overhead.
-//   - `cat output.ndjson | jq .` gives pretty-printed inspection for free.
-//
+// StdoutEmitter serialises every Event as NDJSON (one JSON object per line).
 // The zero value is NOT valid. Use NewStdoutEmitter.
 type StdoutEmitter struct {
-	mu  sync.Mutex // protects enc; json.Encoder is not concurrent-safe
+	mu  sync.Mutex
 	enc *json.Encoder
 	w   io.Writer
 }
 
-// NewStdoutEmitter returns a StdoutEmitter that writes to w.
-// Pass os.Stdout for production use; pass a *bytes.Buffer in tests.
 func NewStdoutEmitter(w io.Writer) *StdoutEmitter {
 	enc := json.NewEncoder(w)
-	// DisableHTMLEscaping preserves raw angle brackets in Meta values, which
-	// is important for FIX protocol tags that use < and >.
 	enc.SetEscapeHTML(false)
 	return &StdoutEmitter{enc: enc, w: w}
 }
 
-// DefaultStdoutEmitter returns a StdoutEmitter writing to os.Stdout.
-// Convenience constructor for use in cmd/ entrypoints.
 func DefaultStdoutEmitter() *StdoutEmitter {
 	return NewStdoutEmitter(os.Stdout)
 }
 
-// Emit validates e, then writes it as a single JSON line.
-// It is safe to call Emit concurrently from multiple goroutines.
 func (s *StdoutEmitter) Emit(_ context.Context, e Event) error {
-	// Validate before acquiring the lock — validation is CPU-only and we
-	// don't want to hold the writer mutex during it.
 	if err := e.Validate(); err != nil {
 		return err
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.enc.Encode(e)
 }
 
-// Close is a no-op for StdoutEmitter (the caller owns the writer).
-// Implemented so StdoutEmitter satisfies the Emitter interface and can be
-// swapped for RedpandaEmitter (which does flush on close) without caller changes.
-func (s *StdoutEmitter) Close() error {
-	return nil
+// BatchEmit writes each event as a separate JSON line, holding the lock for
+// the whole batch so no interleaving can occur between concurrent callers.
+// Invalid events are skipped and reported in the returned error.
+func (s *StdoutEmitter) BatchEmit(_ context.Context, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Validate all events before acquiring the lock.
+	var errs []error
+	valid := make([]Event, 0, len(events))
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		valid = append(valid, events[i])
+	}
+
+	if len(valid) > 0 {
+		s.mu.Lock()
+		for i := range valid {
+			if encErr := s.enc.Encode(valid[i]); encErr != nil {
+				errs = append(errs, encErr)
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	return joinErrors(errs)
 }
+
+func (s *StdoutEmitter) Close() error { return nil }
 
 // ── NoopEmitter ───────────────────────────────────────────────────────────────
 
-// NoopEmitter discards every event silently.
-// Use in unit tests where the test is not about telemetry output.
+// NoopEmitter discards every event silently. Use in unit tests.
 type NoopEmitter struct{}
 
-func (n NoopEmitter) Emit(_ context.Context, _ Event) error { return nil }
-func (n NoopEmitter) Close() error                          { return nil }
+func (n NoopEmitter) Emit(_ context.Context, _ Event) error              { return nil }
+func (n NoopEmitter) BatchEmit(_ context.Context, _ []Event) error       { return nil }
+func (n NoopEmitter) Close() error                                        { return nil }
 
 // ── RecordingEmitter ─────────────────────────────────────────────────────────
 
 // RecordingEmitter buffers every emitted Event in memory.
 // Use in tests that need to assert on what was emitted.
-//
-// Example:
-//
-//	rec := telemetry.NewRecordingEmitter()
-//	engine.SetEmitter(rec)
-//	engine.ProcessOrder(ctx, order)
-//	events := rec.Events()
-//	// assert events[0].Kind == telemetry.KindOrderAck, etc.
 type RecordingEmitter struct {
 	mu     sync.Mutex
 	events []Event
@@ -112,7 +121,6 @@ func NewRecordingEmitter() *RecordingEmitter {
 	return &RecordingEmitter{}
 }
 
-// Emit validates and records the event. Returns an error if invalid.
 func (r *RecordingEmitter) Emit(_ context.Context, e Event) error {
 	if err := e.Validate(); err != nil {
 		return err
@@ -123,11 +131,34 @@ func (r *RecordingEmitter) Emit(_ context.Context, e Event) error {
 	return nil
 }
 
-// Close is a no-op; implemented to satisfy Emitter.
+// BatchEmit validates and records all valid events; returns combined error for
+// any invalid ones.
+func (r *RecordingEmitter) BatchEmit(_ context.Context, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	var errs []error
+	valid := make([]Event, 0, len(events))
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		valid = append(valid, events[i])
+	}
+
+	if len(valid) > 0 {
+		r.mu.Lock()
+		r.events = append(r.events, valid...)
+		r.mu.Unlock()
+	}
+
+	return joinErrors(errs)
+}
+
 func (r *RecordingEmitter) Close() error { return nil }
 
-// Events returns a snapshot of all recorded events in emission order.
-// Safe to call concurrently with Emit.
 func (r *RecordingEmitter) Events() []Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -136,7 +167,6 @@ func (r *RecordingEmitter) Events() []Event {
 	return out
 }
 
-// EventsOfKind returns only events matching the given Kind.
 func (r *RecordingEmitter) EventsOfKind(k Kind) []Event {
 	all := r.Events()
 	var out []Event
@@ -148,16 +178,32 @@ func (r *RecordingEmitter) EventsOfKind(k Kind) []Event {
 	return out
 }
 
-// Reset clears all recorded events. Useful between sub-tests.
 func (r *RecordingEmitter) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = r.events[:0]
 }
 
-// Len returns the total number of recorded events.
 func (r *RecordingEmitter) Len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.events)
+}
+
+// ── joinErrors ────────────────────────────────────────────────────────────────
+
+// joinErrors combines multiple errors into one. Returns nil if the slice is
+// empty or contains only nils. Uses errors.Join when available (Go 1.20+).
+func joinErrors(errs []error) error {
+	var nonNil []error
+	for _, e := range errs {
+		if e != nil {
+			nonNil = append(nonNil, e)
+		}
+	}
+	if len(nonNil) == 0 {
+		return nil
+	}
+	// errors.Join is stdlib since Go 1.20 — safe to use (go.mod requires 1.25).
+	return errorf("batch: %d event(s) failed: %v", len(nonNil), nonNil[0])
 }

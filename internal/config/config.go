@@ -12,9 +12,6 @@ type Config struct {
 	ListenAddr string
 
 	// SubmissionDir is where uploaded archives are stored on the host.
-	// On Windows with Docker Desktop this MUST be under C:\ (or another
-	// shared drive) — Docker cannot bind-mount paths outside shared drives.
-	// Default: C:\nexusbench\submissions  (Windows-safe, Docker-shareable)
 	SubmissionDir string
 
 	// Per-language sandbox images — pre-built, spun on demand.
@@ -34,6 +31,25 @@ type Config struct {
 	SandboxPortMin int
 	SandboxPortMax int
 
+	// SandboxHost is the hostname the worker uses to reach published sandbox
+	// ports after the Docker daemon starts a sandbox container.
+	//
+	// The Docker daemon runs on the HOST machine. When the worker (running
+	// inside a container) asks the daemon to start a sandbox and publish port
+	// N, that port is bound on the HOST's network interface — not inside the
+	// worker's network namespace. So the worker must connect to the HOST, not
+	// to localhost.
+	//
+	// Docker Desktop (Windows/Mac): use "host-gateway" — Docker resolves this
+	// special name to the host's internal bridge IP automatically.
+	// Linux Docker Engine: typically "172.17.0.1" (the docker0 bridge IP).
+	// Local (non-containerised) dev: "localhost" (worker and daemon share the
+	// same network namespace).
+	//
+	// Set via environment variable: SANDBOX_HOST
+	// Default: "host-gateway" (correct for Docker Desktop; override for Linux).
+	SandboxHost string
+
 	// Maximum upload size (bytes)
 	MaxUploadBytes int64
 
@@ -41,40 +57,45 @@ type Config struct {
 
 	// DistributedMode switches the control plane from local (Phase 1/2) mode
 	// to distributed (Phase 3+) mode.
-	//
-	//   false (default) — Ingest deploys sandboxes directly in-process.
-	//                     RedpandaBrokers is ignored. No queue dependency.
-	//
-	//   true            — Ingest enqueues a Job to jobs.benchmark.
-	//                     A separate worker process picks it up and runs the
-	//                     sandbox. RedpandaBrokers must be set.
-	//
-	// Set via environment variable: DISTRIBUTED_MODE=true
 	DistributedMode bool
 
-	// RedpandaBrokers is the comma-separated list of Redpanda broker addresses
-	// used for the job queue in distributed mode.
-	// Example: "redpanda:9092" or "localhost:19092,localhost:29092"
-	// Set via environment variable: REDPANDA_BROKERS
+	// RedpandaBrokers is the comma-separated list of Redpanda broker addresses.
 	RedpandaBrokers []string
 
 	// ── Worker-specific ───────────────────────────────────────────────────────
 
 	// WorkerID uniquely identifies a worker instance in logs and metrics.
-	// Defaults to the system hostname so each pod/container is distinct.
-	// Set via environment variable: WORKER_ID
 	WorkerID string
 
-	// JobTimeout is the maximum wall-clock time a worker spends on a single
-	// job (sandbox deploy + health wait + bot fleet + result write).
-	// Set via environment variable: JOB_TIMEOUT
+	// JobTimeout is the maximum wall-clock time a worker spends on a single job.
 	JobTimeout time.Duration
 
-	// OrchestratorURL is the base URL of the control plane that the worker
-	// sends heartbeats to. Must be reachable from the worker container.
-	// Example: "http://control-plane:8080"
-	// Set via environment variable: ORCHESTRATOR_URL
+	// OrchestratorURL is the base URL of the control plane (for heartbeats).
 	OrchestratorURL string
+
+	// ── Bot fleet ─────────────────────────────────────────────────────────────
+
+	// BotCount is the number of concurrent virtual traders per benchmark run.
+	// Default: 100.
+	BotCount int
+
+	// BotTestDuration is the sustained load period after ramp-up completes.
+	// Default: 60s.
+	BotTestDuration time.Duration
+
+	// BotRampUpDuration is the period over which bots are staggered at startup.
+	// Default: 5s.
+	BotRampUpDuration time.Duration
+
+	// BotOrderRatioLimit / Market / Cancel are the fractions of each order type
+	// generated per bot. Must sum to 1.0. Defaults: 0.60 / 0.30 / 0.10.
+	BotOrderRatioLimit  float64
+	BotOrderRatioMarket float64
+	BotOrderRatioCancel float64
+
+	// BotPerRequestTimeout is the HTTP timeout for a single bot order round-trip.
+	// Default: 2s (tight enough to detect latency regressions).
+	BotPerRequestTimeout time.Duration
 }
 
 // Load reads configuration from environment variables with sane defaults.
@@ -82,9 +103,6 @@ func Load() *Config {
 	return &Config{
 		ListenAddr: getEnv("LISTEN_ADDR", ":8080"),
 
-		// Windows default: C:\nexusbench\submissions
-		// Linux/macOS default: /tmp/nexusbench/submissions
-		// Override with SUBMISSION_DIR env var.
 		SubmissionDir: getEnv("SUBMISSION_DIR", defaultSubmissionDir()),
 
 		ImageGo:     getEnv("SANDBOX_IMAGE_GO", "nexusbench-sandbox-go:latest"),
@@ -99,6 +117,7 @@ func Load() *Config {
 		SandboxNetworkMode: getEnv("SANDBOX_NETWORK_MODE", "bridge"),
 		SandboxPortMin:     getEnvInt("SANDBOX_PORT_MIN", 20000),
 		SandboxPortMax:     getEnvInt("SANDBOX_PORT_MAX", 21000),
+		SandboxHost:        getEnv("SANDBOX_HOST", "host-gateway"),
 		MaxUploadBytes:     getEnvInt64("MAX_UPLOAD_BYTES", 256*1024*1024),
 
 		DistributedMode: getEnvBool("DISTRIBUTED_MODE", false),
@@ -107,6 +126,15 @@ func Load() *Config {
 		WorkerID:        getEnv("WORKER_ID", hostname()),
 		JobTimeout:      getEnvDuration("JOB_TIMEOUT", 35*time.Minute),
 		OrchestratorURL: getEnv("ORCHESTRATOR_URL", "http://localhost:8080"),
+
+		// Bot fleet defaults
+		BotCount:             getEnvInt("BOT_COUNT", 100),
+		BotTestDuration:      getEnvDuration("BOT_TEST_DURATION", 60*time.Second),
+		BotRampUpDuration:    getEnvDuration("BOT_RAMP_UP_DURATION", 5*time.Second),
+		BotOrderRatioLimit:   getEnvFloat64("BOT_ORDER_RATIO_LIMIT", 0.60),
+		BotOrderRatioMarket:  getEnvFloat64("BOT_ORDER_RATIO_MARKET", 0.30),
+		BotOrderRatioCancel:  getEnvFloat64("BOT_ORDER_RATIO_CANCEL", 0.10),
+		BotPerRequestTimeout: getEnvDuration("BOT_PER_REQUEST_TIMEOUT", 2*time.Second),
 	}
 }
 
@@ -166,6 +194,15 @@ func getEnvInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
+func getEnvFloat64(key string, defaultVal float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return defaultVal
+}
+
 func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -175,9 +212,6 @@ func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
 	return defaultVal
 }
 
-// getEnvBool parses a boolean environment variable.
-// Accepts "true", "1", "yes" (case-insensitive) as true; everything else
-// (including unset) returns the defaultVal.
 func getEnvBool(key string, defaultVal bool) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	switch v {
@@ -190,9 +224,6 @@ func getEnvBool(key string, defaultVal bool) bool {
 	}
 }
 
-// getEnvStringSlice parses a comma-separated environment variable into a
-// slice of trimmed, non-empty strings.
-// Returns defaultVal if the variable is unset or empty.
 func getEnvStringSlice(key string, defaultVal []string) []string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -211,9 +242,6 @@ func getEnvStringSlice(key string, defaultVal []string) []string {
 	return out
 }
 
-// hostname returns the system hostname, falling back to "worker-unknown" if
-// os.Hostname fails. Used as the default WorkerID so each pod is distinct
-// without explicit configuration.
 func hostname() string {
 	h, err := os.Hostname()
 	if err != nil {

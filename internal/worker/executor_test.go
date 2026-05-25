@@ -1,11 +1,11 @@
 package worker_test
 
 // executor_test.go tests SandboxExecutor in isolation using a
-// fakeSandboxDeployer — no Docker daemon required.
+// fakeSandboxDeployer and a local httptest.Server as the sandbox endpoint.
+// No Docker daemon required.
 //
 // Tests:
-//   TestSandboxExecutor_InterfaceCompliance   — *sandbox.DockerManager satisfies sandboxDeployer
-//   TestSandboxExecutor_ReturnsStubResults    — happy path returns non-nil results
+//   TestSandboxExecutor_ReturnsRealResults    — happy path: fleet runs, real BenchmarkResults populated
 //   TestSandboxExecutor_DeployError           — Deploy failure surfaces as error
 //   TestSandboxExecutor_StoreLoadError        — store.Get failure surfaces as error
 //   TestSandboxExecutor_AlwaysStopsContainer  — container stopped even on health-check failure
@@ -13,45 +13,35 @@ package worker_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/nexusbench/nexusbench/internal/botfleet"
 	"github.com/nexusbench/nexusbench/internal/models"
 	"github.com/nexusbench/nexusbench/internal/queue"
 	"github.com/nexusbench/nexusbench/internal/worker"
 )
 
-// ── interface compliance note ──────────────────────────────────────────────
-// sandboxDeployer is unexported so we cannot write the standard
-//   var _ sandboxDeployer = (*sandbox.DockerManager)(nil)
-// check here. The equivalent compile-time check lives in cmd/worker/main.go
-// where NewSandboxExecutor(dockerMgr, store) is called with a concrete
-// *sandbox.DockerManager — the compiler rejects that call if DockerManager
-// ever stops satisfying the interface.
-
 // ── fakeSandboxDeployer ───────────────────────────────────────────────────────
 
-// fakeSandboxDeployer implements the sandboxDeployer interface for tests.
-// All behaviour is configurable via exported fields.
 type fakeSandboxDeployer struct {
-	// DeployErr, if non-nil, is returned by Deploy.
-	DeployErr error
-	// DeployedID is returned as the containerID on successful Deploy.
-	DeployedID string
-	// DeployedPort is returned as the hostPort on successful Deploy.
+	DeployErr    error
+	DeployedID   string
 	DeployedPort int
-	// HealthyAfter is the number of ContainerHealthy calls before returning true.
-	// 0 means healthy on the first call.
 	HealthyAfter int
-	// HealthErr, if non-nil, is returned by ContainerHealthy.
-	HealthErr error
+	HealthErr    error
 
-	// Counters — read after Execute returns.
-	deployCalls  atomic.Int32
-	stopCalls    atomic.Int32
-	healthCalls  atomic.Int32
+	deployCalls atomic.Int32
+	stopCalls   atomic.Int32
+	healthCalls atomic.Int32
 }
 
 func (f *fakeSandboxDeployer) Deploy(_ context.Context, _ *models.Submission) (string, int, error) {
@@ -63,11 +53,7 @@ func (f *fakeSandboxDeployer) Deploy(_ context.Context, _ *models.Submission) (s
 	if id == "" {
 		id = "fake-container-abc123"
 	}
-	port := f.DeployedPort
-	if port == 0 {
-		port = 20001
-	}
-	return id, port, nil
+	return id, f.DeployedPort, nil
 }
 
 func (f *fakeSandboxDeployer) Stop(_ context.Context, _ string) error {
@@ -85,10 +71,65 @@ func (f *fakeSandboxDeployer) ContainerHealthy(_ context.Context, _ string) (boo
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+// miniFleetConfig returns a tiny fleet config suitable for fast tests.
+func miniFleetConfig() botfleet.FleetConfig {
+	return botfleet.FleetConfig{
+		BotCount:          2,
+		RampUpDuration:    0,
+		TestDuration:      50 * time.Millisecond,
+		PerBotHTTPTimeout: time.Second,
+		GeneratorConfig:   botfleet.DefaultRandomGeneratorConfig(),
+	}
+}
+
+// echoSandboxServer starts an httptest.Server that accepts all orders and
+// returns a valid fill response. requestCount is incremented on each request.
+func echoSandboxServer(t *testing.T, requestCount *atomic.Int64) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestCount != nil {
+			requestCount.Add(1)
+		}
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		orderID, _ := req["order_id"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"order_id":       orderID,
+			"accepted":       true,
+			"executed_price": int64(10_000),
+			"executed_qty":   int64(10),
+		})
+	}))
+}
+
+// serverPort parses the TCP port from an httptest.Server URL.
+func serverPort(t *testing.T, srv *httptest.Server) int {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL %q: %v", srv.URL, err)
+	}
+	_, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("split host/port from %q: %v", u.Host, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse port %q: %v", portStr, err)
+	}
+	return port
+}
+
 // executorWithFastHealth returns a SandboxExecutor whose health poller ticks
 // every millisecond, so tests don't wait 2 seconds between polls.
-func executorWithFastHealth(docker *fakeSandboxDeployer, store worker.Store) *worker.SandboxExecutor {
-	return worker.NewSandboxExecutor(docker, store, worker.WithHealthPollInterval(time.Millisecond))
+func executorWithFastHealth(docker *fakeSandboxDeployer, store worker.Store, fleetCfg botfleet.FleetConfig) *worker.SandboxExecutor {
+	return worker.NewSandboxExecutor(
+		docker,
+		store,
+		worker.WithHealthPollInterval(time.Millisecond),
+		worker.WithFleetConfig(fleetCfg),
+	)
 }
 
 func fakeJob() queue.Job {
@@ -103,16 +144,22 @@ func fakeJob() queue.Job {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-func TestSandboxExecutor_ReturnsStubResults(t *testing.T) {
+func TestSandboxExecutor_ReturnsRealResults(t *testing.T) {
 	t.Parallel()
-	docker := &fakeSandboxDeployer{HealthyAfter: 0}
+
+	var reqCount atomic.Int64
+	srv := echoSandboxServer(t, &reqCount)
+	defer srv.Close()
+
+	port := serverPort(t, srv)
+	docker := &fakeSandboxDeployer{HealthyAfter: 0, DeployedPort: port}
 	sub := &models.Submission{
 		ID: "exec-test-sub", Status: models.StatusPending,
 		Language: models.LangGo, Protocol: models.ProtocolREST,
 		ArchivePath: "/submissions/exec-test-sub/archive.tar.gz",
 	}
 	store := newFakeStore(sub)
-	exec := executorWithFastHealth(docker, store)
+	exec := executorWithFastHealth(docker, store, miniFleetConfig())
 
 	results, err := exec.Execute(context.Background(), fakeJob())
 	if err != nil {
@@ -121,8 +168,17 @@ func TestSandboxExecutor_ReturnsStubResults(t *testing.T) {
 	if results == nil {
 		t.Fatal("Execute returned nil results")
 	}
-	if results.BenchmarkDuration != "stage-3.2-stub" {
-		t.Errorf("BenchmarkDuration = %q, want %q", results.BenchmarkDuration, "stage-3.2-stub")
+	if reqCount.Load() == 0 {
+		t.Error("echo server received no requests — fleet did not run")
+	}
+	if results.TotalOrders == 0 {
+		t.Error("TotalOrders = 0, expected > 0 after fleet run")
+	}
+	if results.CompositeScore < 0 || results.CompositeScore > 100 {
+		t.Errorf("CompositeScore = %f, want in [0,100]", results.CompositeScore)
+	}
+	if results.BenchmarkDuration == "" {
+		t.Error("BenchmarkDuration must not be empty")
 	}
 }
 
@@ -134,13 +190,12 @@ func TestSandboxExecutor_DeployError(t *testing.T) {
 		Language: models.LangGo, Protocol: models.ProtocolREST,
 	}
 	store := newFakeStore(sub)
-	exec := executorWithFastHealth(docker, store)
+	exec := executorWithFastHealth(docker, store, miniFleetConfig())
 
 	_, err := exec.Execute(context.Background(), fakeJob())
 	if err == nil {
 		t.Fatal("Execute should return error on Deploy failure")
 	}
-	// Container was never deployed, so Stop must not be called.
 	if docker.stopCalls.Load() != 0 {
 		t.Errorf("Stop called %d times; want 0 (deploy failed, nothing to stop)", docker.stopCalls.Load())
 	}
@@ -151,7 +206,7 @@ func TestSandboxExecutor_StoreLoadError(t *testing.T) {
 	docker := &fakeSandboxDeployer{}
 	store := newFakeStore() // empty — Get will fail
 
-	exec := executorWithFastHealth(docker, store)
+	exec := executorWithFastHealth(docker, store, miniFleetConfig())
 	_, err := exec.Execute(context.Background(), fakeJob())
 	if err == nil {
 		t.Fatal("Execute should return error when store.Get fails")
@@ -163,20 +218,18 @@ func TestSandboxExecutor_StoreLoadError(t *testing.T) {
 
 func TestSandboxExecutor_AlwaysStopsContainer(t *testing.T) {
 	t.Parallel()
-	// Health check always fails — Execute returns an error after Deploy.
 	docker := &fakeSandboxDeployer{HealthErr: errors.New("health: daemon unreachable")}
 	sub := &models.Submission{
 		ID: "exec-test-sub", Status: models.StatusPending,
 		Language: models.LangGo, Protocol: models.ProtocolREST,
 	}
 	store := newFakeStore(sub)
-	exec := executorWithFastHealth(docker, store)
+	exec := executorWithFastHealth(docker, store, miniFleetConfig())
 
 	_, err := exec.Execute(context.Background(), fakeJob())
 	if err == nil {
 		t.Fatal("Execute should return error on health-check failure")
 	}
-	// Even on error, the defer must have stopped the container.
 	if docker.stopCalls.Load() != 1 {
 		t.Errorf("Stop called %d times after health error; want 1", docker.stopCalls.Load())
 	}
@@ -184,14 +237,13 @@ func TestSandboxExecutor_AlwaysStopsContainer(t *testing.T) {
 
 func TestSandboxExecutor_ContextCancelledDuringHealth(t *testing.T) {
 	t.Parallel()
-	// Never becomes healthy — health always returns false.
 	docker := &fakeSandboxDeployer{HealthyAfter: 999}
 	sub := &models.Submission{
 		ID: "exec-test-sub", Status: models.StatusPending,
 		Language: models.LangGo, Protocol: models.ProtocolREST,
 	}
 	store := newFakeStore(sub)
-	exec := executorWithFastHealth(docker, store)
+	exec := executorWithFastHealth(docker, store, miniFleetConfig())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -200,11 +252,6 @@ func TestSandboxExecutor_ContextCancelledDuringHealth(t *testing.T) {
 	if err == nil {
 		t.Fatal("Execute should return error when ctx is cancelled during health poll")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		// The error is wrapped — check the string contains the cause.
-		t.Logf("err = %v (expected to wrap context.DeadlineExceeded)", err)
-	}
-	// Container must still be stopped.
 	if docker.stopCalls.Load() != 1 {
 		t.Errorf("Stop called %d times after ctx cancel; want 1", docker.stopCalls.Load())
 	}

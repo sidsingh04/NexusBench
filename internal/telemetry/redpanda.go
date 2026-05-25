@@ -259,6 +259,59 @@ func (r *RedpandaEmitter) Emit(ctx context.Context, e Event) error {
 	return nil
 }
 
+// BatchEmit validates and produces a slice of events in a single produce
+// batch for efficiency. This is the preferred path for the bot fleet, which
+// may generate thousands of OrderAck events per second.
+//
+// Implementation:
+//   - All valid events are serialised and handed to ProduceSync as a single
+//     multi-record batch. franz-go's linger window aggregates them further.
+//   - Invalid events are skipped (not sent); a combined error is returned.
+//   - The function returns after all valid records are buffered — not after
+//     the broker has acknowledged them (same non-blocking contract as Emit).
+//
+// BatchEmit is safe to call concurrently.
+func (r *RedpandaEmitter) BatchEmit(ctx context.Context, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	select {
+	case <-r.closed:
+		return fmt.Errorf("telemetry: emitter is closed")
+	default:
+	}
+
+	var errs []error
+	records := make([]*kgo.Record, 0, len(events))
+
+	for i := range events {
+		e := &events[i]
+		if err := e.Validate(); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		payload, err := json.Marshal(e)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("marshal event %s: %w", e.OrderID, err))
+			continue
+		}
+		records = append(records, &kgo.Record{
+			Topic: TopicForKind(e.Kind),
+			Key:   []byte(e.SubmissionID),
+			Value: payload,
+		})
+	}
+
+	if len(records) > 0 {
+		if err := r.client.ProduceSync(ctx, records...).FirstErr(); err != nil {
+			errs = append(errs, fmt.Errorf("produce batch: %w", err))
+		}
+	}
+
+	return joinErrors(errs)
+}
+
 // Close flushes all buffered records to the broker, waits for in-flight
 // produce requests to complete, then tears down the client connection.
 // Safe to call multiple times — subsequent calls are no-ops.

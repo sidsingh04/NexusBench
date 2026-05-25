@@ -261,6 +261,15 @@ services:
       SANDBOX_NETWORK_MODE: "bridge"
       SANDBOX_PORT_MIN:     "21000"
       SANDBOX_PORT_MAX:     "22000"
+      SANDBOX_HOST:         "host.docker.internal"
+      # Bot fleet configuration
+      BOT_COUNT:              "100"
+      BOT_TEST_DURATION:      "60s"
+      BOT_RAMP_UP_DURATION:   "5s"
+      BOT_ORDER_RATIO_LIMIT:  "0.60"
+      BOT_ORDER_RATIO_MARKET: "0.30"
+      BOT_ORDER_RATIO_CANCEL: "0.10"
+      BOT_PER_REQUEST_TIMEOUT: "2s"
     volumes:
       - submissions_data:/data/submissions
       - /var/run/docker.sock:/var/run/docker.sock:rw

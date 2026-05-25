@@ -130,6 +130,52 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 
 ---
 
+### Stage 3.3 — Real Distributed Bot Fleet + Correctness Engine ✅
+
+**Core insight:** the sandbox executor stub is replaced by a real distributed load generator. N goroutines act as independent trading bots, each running a tight send-loop against the sandbox endpoint. A deterministic golden orderbook validates fills for correctness. Telemetry is batched and streamed to Redpanda after each run.
+
+**Files created:**
+
+| File | Purpose |
+|---|---|
+| `internal/botfleet/order.go` | Protocol-agnostic `Order`, `Fill`, `OrderResult` types — the atomic data structures flowing through the entire fleet |
+| `internal/botfleet/generator.go` | `OrderGenerator` interface + `RandomGenerator`: configurable Limit/Market/Cancel ratios, per-bot seeded RNG, price/quantity ranges |
+| `internal/botfleet/bot.go` | `Bot` struct + `RESTTransport`: single bot run-loop, sends orders to sandbox endpoint, records per-order `OrderResult` |
+| `internal/botfleet/fleet.go` | `Fleet`: spawns N bots with configurable ramp-up, collects all results via a buffered channel, returns `FleetResult` |
+| `internal/botfleet/stats.go` | `ComputeStats`: sort-based p50/p90/p99, 100ms sliding-window MaxTPS, SustainedTPS — stdlib only |
+| `internal/botfleet/fleet_test.go` | 12 unit tests: exact percentile assertions, ratio distribution ±10%, goroutine leak check, context cancellation, fleet echo server integration |
+| `internal/correctness/orderbook.go` | `GoldenOrderbook`: deterministic price-time priority matching engine — pure in-memory, no randomness, identical fills for identical input sequences |
+| `internal/correctness/checker.go` | `Checker`: compares contestant fills vs golden fills by OrderID, computes `CorrectnessResult{Score, TotalFills, CorrectFills, IncorrectFills}` |
+| `internal/correctness/checker_test.go` | 13 unit tests: perfect match, zero match, partial match, empty slices, missing/extra fills, all orderbook scenarios |
+| `scripts/smoke_test_phase3_stage3.sh` | 7-step smoke test: offline compile/vet/test + online submission lifecycle + concurrent worker assertion |
+
+**Files modified:**
+
+| File | Change |
+|---|---|
+| `internal/worker/executor.go` | Replaced stub with real fleet: `runFleet` → `Fleet.Run`, `checkCorrectness`, `emitFleetTelemetry` (batched); set `StatusBenchmarking` before fleet; `WithEmitter` functional option |
+| `internal/worker/executor_test.go` | Updated tests: `TestSandboxExecutor_ReturnsRealResults` now uses an `httptest.Server` echo endpoint; `miniFleetConfig()` helper; `WithFleetConfig` option for fast 50ms test runs |
+| `internal/telemetry/emitter.go` | Added `BatchEmit(ctx, []Event) error` to `Emitter` interface; implemented on `StdoutEmitter`, `NoopEmitter`, `RecordingEmitter` with concurrent-safe batch buffering |
+| `internal/telemetry/redpanda.go` | `RedpandaEmitter.BatchEmit`: validates all events, builds `[]*kgo.Record` slice, calls `ProduceSync` once per batch for efficiency |
+| `internal/telemetry/event_test.go` | Added 4 `BatchEmit` tests: all-valid batch, skip-invalid with error, concurrent `RecordingEmitter`, empty batch no-op |
+| `internal/config/config.go` | Added `BotCount`, `BotTestDuration`, `BotRampUpDuration`, `BotOrderRatio{Limit,Market,Cancel}`, `BotPerRequestTimeout`; `getEnvFloat64` helper |
+| `docker-compose.yml` | Added `BOT_COUNT`, `BOT_TEST_DURATION`, `BOT_RAMP_UP_DURATION`, `BOT_ORDER_RATIO_*`, `BOT_PER_REQUEST_TIMEOUT` env vars to `worker` service |
+
+**Key design decisions:**
+
+- **No external deps in botfleet/correctness**: sort-based percentiles (stdlib), no prometheus/opentelemetry in the hot path — these packages can be imported by any future component without dependency bloat
+- **Telemetry never blocks results**: `emitFleetTelemetry` runs *after* `buildResults` is computed; errors are logged but not propagated — a Redpanda hiccup cannot fail a benchmark
+- **Batching strategy**: 100-event batches amortise lock + network overhead; the final partial batch is always flushed so no events are silently dropped
+- **`StatusBenchmarking` lifecycle**: executor explicitly sets this before the fleet starts so the API reflects real in-progress state (not the generic `StatusDeploying`)
+- **`WithEmitter` functional option**: keeps `SandboxExecutor` testable without Redpanda; `cmd/worker` wires the real `RedpandaEmitter`; tests use `NoopEmitter` (the default)
+- **`RESTTransport` as the default bot transport**: FIX and WebSocket transports implement `BotTransport` in Stage 5 without changing `Bot` or `Fleet`
+
+**Smoke test:** `scripts/smoke_test_phase3_stage3.sh`
+- Steps 1–3 offline: botfleet + correctness compile/test, full test suite, go vet, all binaries build
+- Steps 4–7 online: control plane health, worker registered, echo server submission reaches `completed` with real metrics, 3 concurrent jobs verified
+
+---
+
 ## Architecture Diagram
 
 ```
@@ -152,15 +198,21 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
   │       └─ SandboxExecutor    │
   │            ├─ Deploy        │──► Docker sandbox container
   │            ├─ WaitHealthy   │
-  │            └─ [Stage 3.3]   │ Bot fleet (stub for now)
+  │            ├─ [StatusBenchmarking set]
+  │            ├─ Bot Fleet     │──► N goroutine bots ──► sandbox /orders
+  │            │    └─ FleetResult{Stats, Results}
+  │            ├─ GoldenOrderbook → CorrectnessResult
+  │            ├─ BuildResults  │──► CompositeScore (p99+TPS+correctness)
+  │            └─ BatchEmit     │──► metrics.latency (Redpanda)
   └─────────────────────────────┘
          │ writes results
          ▼
-  ┌─────────────────────────────┐
-  │  DiskStore (shared volume)  │
-  │  /data/submissions/{id}/    │
-  │  meta.json                  │
-  └─────────────────────────────┘
+  ┌─────────────────────────────┐         ┌───────────────────────┐
+  │  DiskStore (shared volume)  │         │  Consumer             │
+  │  /data/submissions/{id}/    │         │  metrics.latency      │
+  │  meta.json                  │         │  → TimescaleDB        │
+  └─────────────────────────────┘         │  → Grafana dashboard  │
+                                          └───────────────────────┘
 ```
 
 ---
@@ -196,30 +248,27 @@ docker compose up --scale worker=3 -d
 | `internal/queue` | 9 | None |
 | `internal/worker` | 13 (8 worker + 5 executor) | None |
 | `internal/orchestrator` | 10 | None |
+| `internal/botfleet` | 12 | None (httptest.Server) |
+| `internal/correctness` | 13 | None |
 | `internal/submission` | existing | None |
-| `internal/telemetry` | existing | None (unit) / Redpanda (integration) |
+| `internal/telemetry` | existing + 4 BatchEmit | None (unit) / Redpanda (integration) |
 
-All unit tests run in < 2 seconds total. The race detector is enabled on every `make test` run.
+All unit tests run in < 5 seconds total. The race detector is enabled on every `make test` run.
 
 ---
 
 ## What's Next
 
-### Stage 3.3 — Parallel Job Dispatch
+### Stage 3.4 — Terraform + Kubernetes
 
-Replace the `SandboxExecutor` stub with the real distributed bot fleet:
-- Wire `internal/botfleet` package: spawns N goroutines each sending Limit/Market/Cancel orders to the sandbox endpoint
-- Collect per-order latency, compute p50/p90/p99, calculate correctness against golden orderbook
-- Write real `BenchmarkResults` to the store
-- Validate: 3 concurrent submissions → 3 workers execute concurrently → metrics all stream correctly
-
-### Stage 3.4 — Terraform
-
-- Provision cloud node pool with Terraform
-- Kubernetes manifests for control-plane, worker (HPA on queue depth), Redpanda
+- Provision cloud node pool with Terraform (GCP or AWS)
+- Kubernetes manifests for control-plane, worker (HPA on Redpanda queue depth), Redpanda operator
+- Autoscaling policies: HPA scales worker replicas when `jobs.benchmark` consumer lag grows
+- CI/CD pipeline: GitHub Actions workflow that builds sandbox images, runs `make test`, deploys to K8s
 
 ### Stage 3.5 — Advanced Benchmarking
 
-- Stress benchmark (volatile-only replay)
-- Latency injection / chaos engineering
-- Pause / Resume / Kill controls on running benchmarks
+- Stress benchmark (volatile-only replay from historical market data via Redpanda)
+- Latency injection: artificial delays injected between bot orders to model network jitter
+- Chaos engineering: random container kills, network partition simulation
+- Pause / Resume / Kill controls on running benchmarks via the API

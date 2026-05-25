@@ -426,6 +426,81 @@ func TestRecordingEmitter_Concurrent(t *testing.T) {
 	}
 }
 
+func TestBatchEmit_StdoutEmitter_AllValid(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	emitter := telemetry.NewStdoutEmitter(&buf)
+
+	events := []telemetry.Event{
+		validEvent(),
+		validEvent(),
+		validEvent(),
+	}
+	if err := emitter.BatchEmit(context.Background(), events); err != nil {
+		t.Fatalf("BatchEmit: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Errorf("expected 3 NDJSON lines, got %d", len(lines))
+	}
+}
+
+func TestBatchEmit_StdoutEmitter_SkipsInvalid(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	emitter := telemetry.NewStdoutEmitter(&buf)
+
+	bad := telemetry.Event{} // empty — will fail Validate
+	events := []telemetry.Event{validEvent(), bad, validEvent()}
+
+	err := emitter.BatchEmit(context.Background(), events)
+	if err == nil {
+		t.Error("BatchEmit should return error for invalid events")
+	}
+	// Two valid events should still have been written.
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Errorf("expected 2 valid NDJSON lines, got %d", len(lines))
+	}
+}
+
+func TestBatchEmit_RecordingEmitter_Concurrent(t *testing.T) {
+	t.Parallel()
+	rec := telemetry.NewRecordingEmitter()
+
+	const goroutines = 10
+	const batchSize = 50
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			batch := make([]telemetry.Event, batchSize)
+			for j := range batch {
+				batch[j] = validEvent()
+			}
+			_ = rec.BatchEmit(context.Background(), batch)
+		}()
+	}
+	wg.Wait()
+
+	if got, want := rec.Len(), goroutines*batchSize; got != want {
+		t.Errorf("concurrent BatchEmit Len() = %d, want %d", got, want)
+	}
+}
+
+func TestBatchEmit_Empty(t *testing.T) {
+	t.Parallel()
+	emitter := telemetry.NoopEmitter{}
+	if err := emitter.BatchEmit(context.Background(), nil); err != nil {
+		t.Errorf("BatchEmit(nil) should return nil, got %v", err)
+	}
+	if err := emitter.BatchEmit(context.Background(), []telemetry.Event{}); err != nil {
+		t.Errorf("BatchEmit([]) should return nil, got %v", err)
+	}
+}
+
 func TestRecordingEmitter_EventsReturnsCopy(t *testing.T) {
 	t.Parallel()
 	// Mutating the returned slice must not affect internal state.

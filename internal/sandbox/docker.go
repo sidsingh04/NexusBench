@@ -2,6 +2,7 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
@@ -116,13 +117,7 @@ func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (con
 		}
 	}()
 
-	// ── 3. Bind-mount: submission DIRECTORY → /submission ─────────────────────
-	// Docker requires directory→directory mounts.
-	// sub.ArchivePath = C:\nexusbench\submissions\<id>\archive.tar.gz
-	// We mount the parent dir so /submission/archive.tar.gz exists inside.
-	submissionDir := filepath.Dir(sub.ArchivePath)
-	bindMount := toDockerPath(submissionDir) + ":/submission:ro"
-	slog.Info("bind mount", "spec", bindMount)
+	// ── 3. (Removed bind mount in favour of CopyToContainer) ──────────────────
 
 	// ── 4. Container config ───────────────────────────────────────────────────
 	portBindings := nat.PortMap{
@@ -157,7 +152,6 @@ func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (con
 			PortBindings: portBindings,
 			Resources:    resources,
 			NetworkMode:  container.NetworkMode(m.cfg.SandboxNetworkMode),
-			Binds:        []string{bindMount},
 
 			// ── Capability model ──────────────────────────────────────────────
 			// Drop everything, then add back only what the entrypoint needs:
@@ -208,6 +202,13 @@ func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (con
 	)
 	if err != nil {
 		return "", 0, fmt.Errorf("create container: %w", err)
+	}
+
+	// ── 4.5. Inject archive ───────────────────────────────────────────────────
+	slog.Info("injecting archive into sandbox", "archive", sub.ArchivePath)
+	if err := m.injectArchive(ctx, resp.ID, sub.ArchivePath); err != nil {
+		_ = m.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		return "", 0, fmt.Errorf("inject archive: %w", err)
 	}
 
 	// ── 5. Start ──────────────────────────────────────────────────────────────
@@ -365,14 +366,39 @@ func (m *DockerManager) EnsureImage(ctx context.Context, image string) error {
 	return nil
 }
 
-// toDockerPath converts a Windows host path to the format Docker Desktop
-// requires for bind mounts: C:\foo\bar → /c/foo/bar
-// No-op on Linux/macOS.
-func toDockerPath(p string) string {
-	p = strings.ReplaceAll(p, `\`, "/")
-	if len(p) >= 2 && p[1] == ':' {
-		drive := strings.ToLower(string(p[0]))
-		p = "/" + drive + p[2:]
+func (m *DockerManager) injectArchive(ctx context.Context, containerID string, archivePath string) error {
+	fileInfo, err := os.Stat(archivePath)
+	if err != nil {
+		return err
 	}
-	return p
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		tw := tar.NewWriter(pw)
+		defer tw.Close()
+
+		file, err := os.Open(archivePath)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		defer file.Close()
+
+		hdr := &tar.Header{
+			Name: filepath.Base(archivePath),
+			Mode: 0644,
+			Size: fileInfo.Size(),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(tw, file); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+	}()
+
+	return m.cli.CopyToContainer(ctx, containerID, "/submission", pr, types.CopyToContainerOptions{})
 }
