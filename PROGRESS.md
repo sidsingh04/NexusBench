@@ -17,6 +17,18 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 
 ---
 
+## Overall Roadmap
+
+| Phase | Name | Status |
+|-------|------|--------|
+| Phase 1 | Core MVP | ✅ Complete |
+| Phase 2 | Telemetry | ✅ Complete |
+| Phase 3 | Distributed Workers | ✅ Complete |
+| Phase 4 | Terraform & Infra Automation | 🔄 In Progress |
+| Phase 5 | Advanced Benchmarking | ⏳ Pending |
+
+---
+
 ## Phases Completed
 
 ### Phase 1 — Core MVP ✅
@@ -27,7 +39,7 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 
 - `internal/models` — core domain types: `Submission`, `BenchmarkResults`, `LeaderboardEntry`, all lifecycle statuses (`pending` → `deploying` → `running` → `benchmarking` → `completed` / `failed`)
 - `internal/config` — single `Config` struct loaded from environment variables; `ImageForLanguage`, `AllImages` helpers
-- `internal/sandbox` — `DockerManager`: deploys contestant code into isolated containers with cgroup CPU pinning, memory limits, capability dropping, bind-mount of the submission archive, and port allocation from a configurable pool
+- `internal/sandbox` — `DockerManager`: deploys contestant code into isolated containers with cgroup CPU pinning, memory limits, capability dropping, `CopyToContainer` archive injection, and port allocation from a configurable pool
 - `internal/submission` — `Service` + `DiskStore`: validates uploads, stores archives on disk, orchestrates container lifecycle; `Store` interface for testability
 - `internal/api` — HTTP router (gorilla/mux): `POST /api/v1/submissions`, `GET /api/v1/submissions/{id}`, `GET /api/v1/leaderboard`, `GET /health`, `GET /metrics`
 - `cmd/server` — control plane binary
@@ -39,140 +51,113 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 
 **What was built:**
 
-- `internal/telemetry` — `Event` type (kind, submission ID, timestamp, latency ns, meta), `Emitter` interface, `StdoutEmitter`, `RedpandaEmitter` (franz-go, AllISRAcks, idempotent production), `RecordingEmitter` (tests), `NoopEmitter`; topic layout: `metrics.latency`, `metrics.heartbeat`, `metrics.dlq`
+- `internal/telemetry` — `Event` type, `Emitter` interface with `Emit` + `BatchEmit`, `StdoutEmitter`, `RedpandaEmitter` (franz-go, AllISRAcks), `RecordingEmitter` (tests), `NoopEmitter`; topic layout: `metrics.latency`, `metrics.heartbeat`, `metrics.dlq`
 - `internal/consumer` — `Consumer` polls `metrics.latency` from Redpanda, writes rows to TimescaleDB via `pgxpool`; `PercentileStore` computes p50/p90/p99 from the time-series table
-- `internal/metrics` — Prometheus `Registry`: HTTP request counter + duration histogram; `RecordHTTPRequest` on every route
+- `internal/metrics` — Prometheus `Registry`: HTTP request counter + duration histogram
 - `docker-compose.yml` — full observability stack: Redpanda + Console, TimescaleDB, Prometheus, Grafana, Loki, Promtail, cAdvisor, Node Exporter
-- `cmd/consumer` — metrics consumer binary
 - Grafana dashboards provisioned automatically on startup
 
-### Phase 3 — Distributed Workers (in progress)
+### Phase 3 — Distributed Workers ✅
 
 **Goal:** multiple benchmark nodes + scheduler
 
----
+**Stages completed:**
 
-## Phase 3 Detail
+| Stage | Description | Status |
+|-------|-------------|--------|
+| 3.1 | Worker abstraction + Redpanda job queue | ✅ |
+| 3.2 | Orchestrator + worker heartbeat registry | ✅ |
+| 3.3 | Real distributed bot fleet + correctness engine | ✅ |
 
-### Stage 3.1 — Worker Abstraction + Job Queue ✅
+**Key packages added in Phase 3:**
 
-**Core insight:** extract "run a benchmark" from a monolithic in-process call into a self-contained `Job` that travels over a durable queue to whichever worker is free.
-
-**Files created:**
-
-| File | Purpose |
+| Package | Purpose |
 |---|---|
-| `internal/queue/job.go` | `Job` type (self-contained snapshot of Submission) + `Queue` interface (Enqueue / Dequeue / CommitJob / Close) |
-| `internal/queue/memory.go` | `MemoryQueue` — in-process fake; used by all unit tests |
-| `internal/queue/redpanda.go` | `RedpandaQueue` — durable production transport on `jobs.benchmark` topic; separate producer/consumer clients; manual offset commit for at-least-once delivery |
-| `internal/worker/worker.go` | `Worker` poll loop; `Store` + `Executor` interfaces; idempotent guard (checks submission status before executing); at-least-once commit discipline |
-| `internal/worker/executor.go` | `SandboxExecutor` — deploys sandbox via `sandboxDeployer` interface (satisfied by `*sandbox.DockerManager`), waits for health; Stage 3.1 returns stub results |
-| `internal/worker/worker_test.go` | 8 unit tests: happy path, idempotent skip, executor failure, offset commit on success/failure, context cancel, store error does not commit, nil dep validation |
-| `internal/worker/executor_test.go` | 5 unit tests: stub results, deploy error, store load error, container always stopped on error, ctx cancel during health poll |
-| `cmd/worker/main.go` | Worker binary entrypoint |
-| `cmd/smokecheck/main.go` | CLI tool using `kadm.ListEndOffsets` to verify topic watermark; used by smoke tests |
+| `internal/queue` | `Job` type, `Queue` interface, `MemoryQueue` (tests), `RedpandaQueue` (production) |
+| `internal/worker` | `Worker` poll loop, `SandboxExecutor`, `Heartbeater` |
+| `internal/orchestrator` | `WorkerRegistry`, HTTP handler for fleet visibility routes |
+| `internal/botfleet` | `Fleet`, `Bot`, `OrderGenerator`, `RESTTransport`, `ComputeStats` |
+| `internal/correctness` | `GoldenOrderbook`, `Checker`, deterministic price-time priority matching |
 
-**Files modified (backward-compatible):**
-
-| File | Change |
-|---|---|
-| `internal/config/config.go` | Added `DistributedMode`, `RedpandaBrokers`, `WorkerID`, `JobTimeout`, `OrchestratorURL`; added `getEnvBool`, `getEnvStringSlice`, `hostname()` |
-| `internal/submission/service.go` | Added `jobQueue queue.Queue` field + `WithQueue()` method; `Ingest` dispatches to queue when non-nil, preserving Phase 1/2 path when nil |
-| `Dockerfile.server` | Builds three binaries: `server`, `consumer`, `worker` |
-| `docker-compose.yml` | Added `DISTRIBUTED_MODE=true` to control-plane; added `worker` service |
-| `Makefile` | Added `run-worker`, `test-queue`, `test-worker` targets |
-
-**Key design decisions:**
-
-- **Redpanda as job queue** (not Redis): no new dependency, same broker already used for telemetry, gives at-least-once delivery via consumer groups, partition-keyed by submission ID
-- **`Queue` interface is deep**: 4 methods hide all transport complexity; `MemoryQueue` lets all worker tests run in milliseconds with zero infrastructure
-- **No circular imports**: `worker.Store` is defined in the `worker` package (mirrors `submission.Store`) so `worker` never imports `submission`
-- **`sandboxDeployer` interface**: `SandboxExecutor` accepts an interface, not `*sandbox.DockerManager`; satisfied at the `cmd/worker` call site — tests inject a fake with no Docker
-
-**Smoke test:** `scripts/smoke_test_phase3_stage1.sh`
-- Steps 1–4 offline: compile, unit tests, binary builds, full test suite
-- Steps 5–6 online: Redpanda reachable, topic exists, watermark increases after submission
+**Critical bug fixed in Stage 3.3:** Docker-in-Docker networking — workers running inside containers were connecting to `localhost:{sandboxPort}` but sandbox ports are published on the host machine's network interface, not inside the worker container's namespace. Fixed via `SANDBOX_HOST=host.docker.internal` (Docker Desktop) with `WithSandboxHost` executor option.
 
 ---
 
-### Stage 3.2 — Orchestrator + Worker Heartbeat ✅
+## Phase 4 — Terraform & Infra Automation 🔄
 
-**Core insight:** the queue handles job delivery; the orchestrator handles *fleet visibility*. These are separate concerns. Workers register with the orchestrator on startup and send heartbeats every 5 seconds. The orchestrator marks workers dead after 15 seconds with no heartbeat, surfacing fleet health via the API without requiring any changes to the Redpanda at-least-once delivery mechanism.
+**Goal:** Provision cloud infrastructure with Terraform, deploy all services to Kubernetes, implement autoscaling on worker fleet based on queue depth, and establish a CI/CD pipeline.
 
-**Files created:**
+> **⚠️ ARCHITECTURAL DECISION (Security vs. Stability):** 
+> We are deliberately **skipping gVisor** (which was mentioned in `docker.go` comments) for this hackathon. GVisor introduces syscall overhead that skews p99 latency and TPS metrics. Since correctness and stability matter most, we will stick to native Docker capability-dropping. 
+> To mitigate the container-escape risk without a "screening service", Phase 4 MUST implement **Disposable Workers**: 
+> 1. Worker pods/nodes must be highly ephemeral (e.g., rapid recycling or using Spot instances).
+> 2. Implement strict Kubernetes NetworkPolicies (no outbound internet access for workers, isolated from the control plane).
+> 3. Mount contestant code as Read-Only volumes.
+
+> **See TASK.md for the full incremental execution plan with per-stage gates.**
+
+### Stage breakdown
+
+| Stage | Description | Status |
+|-------|-------------|--------|
+| 4.1 | Terraform Cloud Provisioning — VPC, managed K8s cluster, two node pools (on-demand control-plane + spot worker), container registry | ✅ Complete |
+| 4.2 | Kubernetes Manifests — all seven services deployed, zero-trust NetworkPolicies, RBAC, PodDisruptionBudgets, read-only worker mounts | ⏳ Pending |
+| 4.3 | Autoscaling — KEDA ScaledObject on Redpanda consumer-group lag; `QueueDepth` method on `Queue` interface; Prometheus gauge | ⏳ Pending |
+| 4.4 | CI/CD Pipeline — GitHub Actions: lint + test + tf-validate + k8s-validate on PRs; build + push + rolling deploy on `main` | ⏳ Pending |
+
+### New files planned
+
+```
+terraform/
+├── main.tf / variables.tf / outputs.tf / versions.tf
+└── modules/
+    ├── cluster/      # managed K8s cluster
+    ├── node-pools/   # control-plane (on-demand) + worker (spot, tainted)
+    └── registry/     # container registry + Workload Identity binding
+k8s/
+├── namespace.yaml
+├── configmaps / secrets/
+├── control-plane / worker / consumer
+├── redpanda / timescaledb StatefulSets
+├── network-policies/   # default-deny-all + allow-* per service
+└── rbac/               # minimal worker ServiceAccount + Role
+.github/
+├── workflows/ci.yml      # PR gate
+└── workflows/deploy.yml  # main → build + push + rolling deploy
+```
+
+### Code changes planned
+
+| Package | Change |
+|---|---|
+| `internal/queue` | Add `QueueDepth(ctx) (int64, error)` to `Queue` interface; implement on `RedpandaQueue` and `MemoryQueue` |
+| `internal/metrics` | Add `nexusbench_queue_depth` Prometheus gauge; wired via 15s background scrape in control plane |
+| `Makefile` | Add `lint`, `ci`, `tf-validate`, `k8s-validate`, `build-push` targets |
+
+### Stage 4.1 — What was built
+
+**16 files created across `terraform/` and `Makefile`.**
 
 | File | Purpose |
 |---|---|
-| `internal/orchestrator/registry.go` | `WorkerRegistry` — goroutine-safe in-memory map of `workerID → WorkerRecord`; `Register`, `Heartbeat`, `List`, `Get`, `Stats`; TTL-based dead detection in `List` |
-| `internal/orchestrator/handler.go` | HTTP handlers for worker fleet routes; exported `HTTPRegister`, `HTTPHeartbeat`, `HTTPList`, `HTTPStats` methods for gorilla/mux integration |
-| `internal/orchestrator/registry_test.go` | 10 unit tests: register, re-register resets state, empty ID error, heartbeat updates, heartbeat unknown worker, list marks dead, list alive, stats counts, get returns copy, concurrent heartbeats (race detector) |
-| `internal/worker/heartbeat.go` | `Heartbeater` — background goroutine; registers on startup, pings every 5s, auto-re-registers on 404; exported `HeartbeatStatus` type decouples worker from orchestrator package |
-| `scripts/smoke_test_phase3_stage2.sh` | 6-step smoke test: offline compile/test + online route check + worker registers + stays alive after 2 intervals |
+| `terraform/versions.tf` | Pins `hashicorp/google ~> 5.30`, `google-beta ~> 5.30`, `kubernetes ~> 2.30`; GCS remote backend block |
+| `terraform/variables.tf` | All 15 input variables with descriptions, type constraints, and validation rules; no defaults for sensitive vars |
+| `terraform/outputs.tf` | 6 outputs: `cluster_name`, `cluster_endpoint` (sensitive), `cluster_ca_certificate` (sensitive), `kubeconfig_command`, `registry_url`, `worker_pool_id`, `workload_identity_pool` |
+| `terraform/main.tf` | Thin root: 2 data sources + 3 module calls, zero resource blocks |
+| `terraform/modules/cluster/main.tf` | VPC + subnet (with alias IP ranges for pods/services), Cloud Router + NAT, GKE node service account + 3 IAM role bindings, Workload Identity Pool + OIDC provider, private VPC-native GKE cluster with Calico NetworkPolicy, STABLE release channel, weekly maintenance window |
+| `terraform/modules/cluster/variables.tf` | 10 variables scoped to cluster concerns |
+| `terraform/modules/cluster/outputs.tf` | 7 outputs consumed by node-pools and registry modules |
+| `terraform/modules/node-pools/main.tf` | Control-plane pool (on-demand, fixed count, surge upgrades) + worker pool (spot, cluster autoscaler, `role=benchmark-worker:NoSchedule` taint, 100 GB SSD) |
+| `terraform/modules/node-pools/variables.tf` | 8 variables |
+| `terraform/modules/node-pools/outputs.tf` | 6 outputs including taint key/value for manifest cross-reference |
+| `terraform/modules/registry/main.tf` | Artifact Registry Docker repo with 10-tag keep + 7-day untagged cleanup policies; node SA reader binding; CI push SA + WIF binding scoped to `github_repository` |
+| `terraform/modules/registry/variables.tf` | 8 variables |
+| `terraform/modules/registry/outputs.tf` | `repository_url`, `repository_id`, `ci_push_service_account_email` |
+| `terraform/envs/dev.tfvars` | `e2-standard-2`, worker min=0 max=3, single zone, open master CIDR |
+| `terraform/envs/prod.tfvars` | `c2-standard-8`, worker min=1 max=10, 3 zones, IAP + CI CIDR |
+| `Makefile` (updated) | `tf-validate` (fmt-check + init -backend=false + validate), `k8s-validate` (kubectl dry-run, graceful skip if kubectl absent), `lint`, `ci`, `build-push` targets; all documented in header |
 
-**Files modified:**
-
-| File | Change |
-|---|---|
-| `internal/api/router.go` | `NewRouter` accepts `*orchestrator.Handler` (nil-safe); mounts `/internal/workers/*` routes only in distributed mode |
-| `internal/worker/executor.go` | Replaced `WithHealthPollInterval` method with functional options pattern (`ExecutorOption`); added `WithJobCallbacks(onStart, onFinish)` so heartbeater tracks busy/idle state |
-| `cmd/server/main.go` | Constructs `WorkerRegistry` + `orchestrator.Handler`; passes handler to `NewRouter` |
-| `cmd/worker/main.go` | Wires `Heartbeater` + status callbacks via atomics; starts heartbeater goroutine alongside worker poll loop |
-| `internal/config/config.go` | Added `OrchestratorURL` field + env var parsing |
-| `docker-compose.yml` | Added `ORCHESTRATOR_URL` to worker service; added `control-plane` health dependency for worker |
-| `Makefile` | Added `test-orchestrator` target |
-
-**Key design decisions:**
-
-- **Orchestrator does not dispatch jobs** — that is the queue's responsibility. It only tracks liveness, decoupling fleet visibility from delivery semantics
-- **No cycle between `worker` and `orchestrator`**: `heartbeat.go` defines its own `heartbeatPayload` struct (matching `orchestrator.HeartbeatUpdate` JSON tags) rather than importing the orchestrator package
-- **Nil-safe router**: `orchHandler == nil` in local mode → zero overhead, zero routes mounted, Phase 1/2 completely unchanged
-- **Status via atomics**: `workerBusy` is `atomic.Int32`, `currentJobID` guarded by `sync.RWMutex` — no lock contention between the poll loop and the heartbeat ticker
-
----
-
-### Stage 3.3 — Real Distributed Bot Fleet + Correctness Engine ✅
-
-**Core insight:** the sandbox executor stub is replaced by a real distributed load generator. N goroutines act as independent trading bots, each running a tight send-loop against the sandbox endpoint. A deterministic golden orderbook validates fills for correctness. Telemetry is batched and streamed to Redpanda after each run.
-
-**Files created:**
-
-| File | Purpose |
-|---|---|
-| `internal/botfleet/order.go` | Protocol-agnostic `Order`, `Fill`, `OrderResult` types — the atomic data structures flowing through the entire fleet |
-| `internal/botfleet/generator.go` | `OrderGenerator` interface + `RandomGenerator`: configurable Limit/Market/Cancel ratios, per-bot seeded RNG, price/quantity ranges |
-| `internal/botfleet/bot.go` | `Bot` struct + `RESTTransport`: single bot run-loop, sends orders to sandbox endpoint, records per-order `OrderResult` |
-| `internal/botfleet/fleet.go` | `Fleet`: spawns N bots with configurable ramp-up, collects all results via a buffered channel, returns `FleetResult` |
-| `internal/botfleet/stats.go` | `ComputeStats`: sort-based p50/p90/p99, 100ms sliding-window MaxTPS, SustainedTPS — stdlib only |
-| `internal/botfleet/fleet_test.go` | 12 unit tests: exact percentile assertions, ratio distribution ±10%, goroutine leak check, context cancellation, fleet echo server integration |
-| `internal/correctness/orderbook.go` | `GoldenOrderbook`: deterministic price-time priority matching engine — pure in-memory, no randomness, identical fills for identical input sequences |
-| `internal/correctness/checker.go` | `Checker`: compares contestant fills vs golden fills by OrderID, computes `CorrectnessResult{Score, TotalFills, CorrectFills, IncorrectFills}` |
-| `internal/correctness/checker_test.go` | 13 unit tests: perfect match, zero match, partial match, empty slices, missing/extra fills, all orderbook scenarios |
-| `scripts/smoke_test_phase3_stage3.sh` | 7-step smoke test: offline compile/vet/test + online submission lifecycle + concurrent worker assertion |
-
-**Files modified:**
-
-| File | Change |
-|---|---|
-| `internal/worker/executor.go` | Replaced stub with real fleet: `runFleet` → `Fleet.Run`, `checkCorrectness`, `emitFleetTelemetry` (batched); set `StatusBenchmarking` before fleet; `WithEmitter` functional option |
-| `internal/worker/executor_test.go` | Updated tests: `TestSandboxExecutor_ReturnsRealResults` now uses an `httptest.Server` echo endpoint; `miniFleetConfig()` helper; `WithFleetConfig` option for fast 50ms test runs |
-| `internal/telemetry/emitter.go` | Added `BatchEmit(ctx, []Event) error` to `Emitter` interface; implemented on `StdoutEmitter`, `NoopEmitter`, `RecordingEmitter` with concurrent-safe batch buffering |
-| `internal/telemetry/redpanda.go` | `RedpandaEmitter.BatchEmit`: validates all events, builds `[]*kgo.Record` slice, calls `ProduceSync` once per batch for efficiency |
-| `internal/telemetry/event_test.go` | Added 4 `BatchEmit` tests: all-valid batch, skip-invalid with error, concurrent `RecordingEmitter`, empty batch no-op |
-| `internal/config/config.go` | Added `BotCount`, `BotTestDuration`, `BotRampUpDuration`, `BotOrderRatio{Limit,Market,Cancel}`, `BotPerRequestTimeout`; `getEnvFloat64` helper |
-| `docker-compose.yml` | Added `BOT_COUNT`, `BOT_TEST_DURATION`, `BOT_RAMP_UP_DURATION`, `BOT_ORDER_RATIO_*`, `BOT_PER_REQUEST_TIMEOUT` env vars to `worker` service |
-
-**Key design decisions:**
-
-- **No external deps in botfleet/correctness**: sort-based percentiles (stdlib), no prometheus/opentelemetry in the hot path — these packages can be imported by any future component without dependency bloat
-- **Telemetry never blocks results**: `emitFleetTelemetry` runs *after* `buildResults` is computed; errors are logged but not propagated — a Redpanda hiccup cannot fail a benchmark
-- **Batching strategy**: 100-event batches amortise lock + network overhead; the final partial batch is always flushed so no events are silently dropped
-- **`StatusBenchmarking` lifecycle**: executor explicitly sets this before the fleet starts so the API reflects real in-progress state (not the generic `StatusDeploying`)
-- **`WithEmitter` functional option**: keeps `SandboxExecutor` testable without Redpanda; `cmd/worker` wires the real `RedpandaEmitter`; tests use `NoopEmitter` (the default)
-- **`RESTTransport` as the default bot transport**: FIX and WebSocket transports implement `BotTransport` in Stage 5 without changing `Bot` or `Fleet`
-
-**Smoke test:** `scripts/smoke_test_phase3_stage3.sh`
-- Steps 1–3 offline: botfleet + correctness compile/test, full test suite, go vet, all binaries build
-- Steps 4–7 online: control plane health, worker registered, echo server submission reaches `completed` with real metrics, 3 concurrent jobs verified
+*(Stages updated as work proceeds — see TASK.md for current status)*
 
 ---
 
@@ -213,6 +198,19 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
   │  meta.json                  │         │  → TimescaleDB        │
   └─────────────────────────────┘         │  → Grafana dashboard  │
                                           └───────────────────────┘
+
+  Phase 4 target — Kubernetes:
+  ┌──────────────────────────────────────────────────────────┐
+  │  GKE / EKS Cluster                                       │
+  │  ├─ Deployment: control-plane  (1 replica)               │
+  │  ├─ Deployment: metrics-consumer (1 replica)             │
+  │  ├─ Deployment: worker  ──► HPA (scale on queue depth)   │
+  │  │       min=1  max=10  target=5 pending jobs/replica     │
+  │  ├─ StatefulSet: Redpanda (3 replicas, PVC storage)      │
+  │  ├─ StatefulSet: TimescaleDB (1 replica, PVC storage)    │
+  │  ├─ PersistentVolumeClaim: submissions-data (RWX)        │
+  │  └─ Ingress: NGINX → control-plane :8080                 │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -226,11 +224,8 @@ make images
 # Start full stack with distributed mode
 docker compose up --build -d
 
-# Run Stage 3.1 smoke test
-STACK_RUNNING=1 bash scripts/smoke_test_phase3_stage1.sh
-
-# Run Stage 3.2 smoke test
-STACK_RUNNING=1 bash scripts/smoke_test_phase3_stage2.sh
+# Run smoke tests
+STACK_RUNNING=1 bash scripts/smoke_test_phase3_stage3.sh
 
 # Run all unit tests (offline, no infrastructure)
 make test
@@ -257,18 +252,34 @@ All unit tests run in < 5 seconds total. The race detector is enabled on every `
 
 ---
 
-## What's Next
+## What's Next — Phase 5
 
-### Stage 3.4 — Terraform + Kubernetes
+### Advanced Benchmarking
 
-- Provision cloud node pool with Terraform (GCP or AWS)
-- Kubernetes manifests for control-plane, worker (HPA on Redpanda queue depth), Redpanda operator
-- Autoscaling policies: HPA scales worker replicas when `jobs.benchmark` consumer lag grows
-- CI/CD pipeline: GitHub Actions workflow that builds sandbox images, runs `make test`, deploys to K8s
-
-### Stage 3.5 — Advanced Benchmarking
-
-- Stress benchmark (volatile-only replay from historical market data via Redpanda)
-- Latency injection: artificial delays injected between bot orders to model network jitter
+- Stress benchmark: volatile-only market data replay via Redpanda historical feed
+- Latency injection: artificial jitter between bot orders to model real network conditions
 - Chaos engineering: random container kills, network partition simulation
-- Pause / Resume / Kill controls on running benchmarks via the API
+- Pause / Resume / Kill controls on live benchmark runs via the API
+- FIX protocol transport for `BotTransport` interface
+- WebSocket transport for streaming order feeds
+
+---
+
+## Running the Stack (updated for Phase 4)
+
+```bash
+# Local dev (unchanged from Phase 3)
+make images && docker compose up --build -d
+
+# Validate Terraform (no cloud credentials needed)
+make tf-validate
+
+# Validate K8s manifests (no cluster needed)
+make k8s-validate
+
+# Full local CI gate (mirrors GitHub Actions)
+make ci
+
+# Deploy to dev cluster (requires kubeconfig + registry access)
+make build-push deploy
+```

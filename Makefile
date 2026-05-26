@@ -10,6 +10,13 @@
 # Run worker unit tests:            make test-worker
 # Run telemetry integration tests:  make test-integration
 # Full local stack:                 make up
+#
+# ── Phase 4 additions ────────────────────────────────────────────────────────────
+# Validate Terraform HCL:           make tf-validate
+# Validate K8s manifests (dry-run): make k8s-validate
+# Lint Go code:                     make lint
+# Full local CI gate:               make ci
+# Build + push all images to reg:   make build-push REGISTRY=<url>
 
 REGISTRY   ?= nexusbench
 TAG        ?= latest
@@ -24,7 +31,8 @@ GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
 .PHONY: images $(addprefix image-,$(LANGUAGES)) \
         run run-worker up up-infra down \
         test test-telemetry test-queue test-worker test-integration \
-        smoke deps clean-images sizes
+        smoke deps clean-images sizes \
+        lint tf-validate k8s-validate ci build-push
 
 # ── Image targets ─────────────────────────────────────────────────────────────
 
@@ -128,3 +136,81 @@ clean-images:
 sizes:
 	@docker images --filter "reference=$(REGISTRY)-sandbox-*" \
 	    --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+
+# ── Phase 4: Terraform & Infra Automation ───────────────────────────────────────
+
+TF_DIR     = terraform
+TF_VARFILE = envs/dev.tfvars
+
+## Validate Terraform HCL: fmt check + validate (no cloud credentials needed).
+## Mirrors the tf-validate job in .github/workflows/ci.yml.
+##
+## Requires: terraform CLI in PATH (https://developer.hashicorp.com/terraform/install)
+## The backend block is skipped with -backend=false so no GCS bucket is needed locally.
+tf-validate:
+	@echo "─── terraform fmt ───"
+	terraform -chdir=$(TF_DIR) fmt -check -recursive
+	@echo "─── terraform validate ───"
+	terraform -chdir=$(TF_DIR) init -backend=false -input=false -reconfigure > /dev/null
+	terraform -chdir=$(TF_DIR) validate
+	@echo "✓ Terraform HCL is valid"
+
+## Dry-run all Kubernetes manifests against the current cluster context.
+## Requires: kubectl in PATH and a valid kubeconfig (or KUBECONFIG env var).
+## Does NOT require the cluster to exist — kubectl --dry-run=client validates
+## manifest structure without contacting the API server.
+##
+## If you want to run this offline without a kubeconfig, use:
+##   docker run --rm -v $(PWD)/k8s:/k8s bitnami/kubectl apply --dry-run=client -f /k8s/
+k8s-validate:
+	@echo "─── kubectl dry-run (client-side) ───"
+	@if command -v kubectl > /dev/null 2>&1; then \
+		kubectl apply --dry-run=client -f k8s/ --recursive; \
+		echo "✓ K8s manifests are valid"; \
+	else \
+		echo "kubectl not found — skipping k8s-validate (install kubectl to enable)"; \
+	fi
+
+## Run golangci-lint on all Go packages.
+## Config: .golangci.yml (created in Stage 4.4).
+## Requires: golangci-lint >= 1.59 (https://golangci-lint.run/usage/install/)
+lint:
+	@if command -v golangci-lint > /dev/null 2>&1; then \
+		golangci-lint run ./... ; \
+		echo "✓ lint passed"; \
+	else \
+		echo "golangci-lint not found — run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"; \
+		exit 1; \
+	fi
+
+## Full local CI gate: runs every check that GitHub Actions runs on a PR.
+## All checks must pass before opening a PR or merging to main.
+## Does NOT require cloud credentials (tf-validate uses -backend=false,
+## k8s-validate uses --dry-run=client).
+ci: lint test tf-validate k8s-validate
+	@echo ""
+	@echo "✓ All CI checks passed — safe to push"
+
+## Build all images and push to the registry.
+## Usage:  make build-push REGISTRY=us-docker.pkg.dev/my-project/nexusbench TAG=abc1234
+## Requires: docker login to the registry (or Workload Identity in CI).
+build-push:
+	@echo "Building and pushing to $(REGISTRY) with tag $(TAG)"
+	docker build -t $(REGISTRY)/control-plane:$(TAG) -f Dockerfile.server .
+	docker push $(REGISTRY)/control-plane:$(TAG)
+	docker build -t $(REGISTRY)/sandbox-go:$(TAG) \
+	    -f $(SANDBOX_DIR)/Dockerfile.golang $(SANDBOX_DIR)
+	docker push $(REGISTRY)/sandbox-go:$(TAG)
+	docker build -t $(REGISTRY)/sandbox-rust:$(TAG) \
+	    -f $(SANDBOX_DIR)/Dockerfile.rust $(SANDBOX_DIR)
+	docker push $(REGISTRY)/sandbox-rust:$(TAG)
+	docker build -t $(REGISTRY)/sandbox-cpp:$(TAG) \
+	    -f $(SANDBOX_DIR)/Dockerfile.cpp $(SANDBOX_DIR)
+	docker push $(REGISTRY)/sandbox-cpp:$(TAG)
+	docker build -t $(REGISTRY)/sandbox-python:$(TAG) \
+	    -f $(SANDBOX_DIR)/Dockerfile.python $(SANDBOX_DIR)
+	docker push $(REGISTRY)/sandbox-python:$(TAG)
+	docker build -t $(REGISTRY)/sandbox-binary:$(TAG) \
+	    -f $(SANDBOX_DIR)/Dockerfile.binary $(SANDBOX_DIR)
+	docker push $(REGISTRY)/sandbox-binary:$(TAG)
+	@echo "✓ All images pushed to $(REGISTRY)"
