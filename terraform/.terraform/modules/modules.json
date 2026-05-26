@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"cluster","Source":"./modules/cluster","Dir":"modules/cluster"},{"Key":"node_pools","Source":"./modules/node-pools","Dir":"modules/node-pools"},{"Key":"registry","Source":"./modules/registry","Dir":"modules/registry"}]}
