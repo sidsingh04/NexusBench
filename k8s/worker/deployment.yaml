@@ -1,0 +1,170 @@
+# k8s/worker/deployment.yaml
+#
+# Benchmark Worker Deployment — the most security-sensitive manifest in this repo.
+#
+# ── Security model ────────────────────────────────────────────────────────────
+#
+#   The worker runs as root. This is a deliberate, reasoned decision:
+#   the worker binary must communicate with the Docker daemon socket
+#   (/var/run/docker.sock), which is owned by root on the host. There is no
+#   practical alternative that avoids rootless-Docker complexity while keeping
+#   the hackathon timeline.
+#
+#   The security boundary is therefore NOT "non-root user inside the container"
+#   but instead the four controls below, which together limit blast radius if
+#   a contestant's sandbox escapes:
+#
+#   1. Spot node pool isolation — nodeSelector + toleration pins workers to
+#      the tainted spot node pool. No control-plane service (Redpanda,
+#      TimescaleDB, API server) runs on these nodes. A compromised worker node
+#      cannot directly access any persistent state.
+#
+#   2. capabilities drop ALL — despite running as root, no Linux capabilities
+#      are granted beyond the base set that Docker preserves for uid 0. The
+#      worker cannot load kernel modules, raw-socket sniff traffic, or change
+#      system time.
+#
+#   3. readOnlyRootFilesystem: true — the worker binary cannot overwrite itself
+#      or any file in the image layers. The only writable paths are explicit
+#      volume mounts: /tmp (emptyDir) and /var/run/docker.sock (hostPath).
+#
+#   4. NetworkPolicy (allow-worker-egress-redpanda.yaml) — workers can reach
+#      only Redpanda:9092 and control-plane:8080. TimescaleDB, any internet
+#      address, and all other cluster services are unreachable even from root.
+#
+# ── Local dev note ────────────────────────────────────────────────────────────
+#
+#   The nodeSelector below requires a node labelled role=benchmark-worker.
+#   On a single-node local cluster (Docker Desktop, kind, minikube) there is
+#   only one node and it cannot carry that label alongside role=control-plane.
+#
+#   To run locally, label your single node:
+#     kubectl label node <node-name> role=benchmark-worker --overwrite
+#
+#   DO NOT comment out the nodeSelector for local testing and forget to
+#   restore it. The node segregation is a hard security requirement for
+#   production. If you need to bypass it temporarily, use a patch file:
+#     kubectl patch deployment worker -n nexusbench \
+#       --patch '{"spec":{"template":{"spec":{"nodeSelector":null}}}}'
+#   This is reversible with a single `kubectl apply` of this file.
+#
+# ── Replica note ─────────────────────────────────────────────────────────────
+#
+#   replicas: 1 here is the cold-start baseline. KEDA (Stage 4.3) takes over
+#   replica management via a ScaledObject once installed. The KEDA controller
+#   overrides this field; the value here only applies before KEDA is running.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: nexusbench
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: nexusbench-worker
+
+      # ── Node placement: spot worker pool only ─────────────────────────────
+      # The nodeSelector and toleration work together:
+      #   nodeSelector — schedules the pod ONLY onto nodes labelled
+      #                  role=benchmark-worker (the spot worker pool).
+      #   toleration   — allows the pod past the NoSchedule taint that
+      #                  prevents every other pod from landing on those nodes.
+      # Both fields are required. Removing either one breaks the isolation.
+      #
+      # Local dev: if your cluster has only one node, label it manually:
+      #   kubectl label node <node-name> role=benchmark-worker --overwrite
+      # See the header comment above for the safe temporary override procedure.
+      nodeSelector:
+        role: benchmark-worker
+
+      tolerations:
+        - key: "role"
+          operator: "Equal"
+          value: "benchmark-worker"
+          effect: "NoSchedule"
+
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: worker
+          image: nexusbench/control-plane:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/app/worker"]
+          envFrom:
+            - configMapRef:
+                name: nexusbench-config
+          env:
+            # Workers fetch archives from the control-plane over HTTP and
+            # stage them under /tmp/submissions. The global ConfigMap sets
+            # SUBMISSION_DIR=/data/submissions (the control-plane's PVC path),
+            # which is not mounted here. Override it to the writable emptyDir.
+            - name: SUBMISSION_DIR
+              value: "/tmp/submissions"
+            # Unique worker identity — used in logs and the orchestrator registry.
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # NODE_IP: the host's internal IP address.
+            # The Docker daemon publishes sandbox ports on the HOST network
+            # interface, not inside the worker container's network namespace.
+            # Workers must connect to NODE_IP:port, not localhost:port.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Override SANDBOX_HOST so the SandboxExecutor connects to the
+            # correct host interface for Docker-published ports.
+            - name: SANDBOX_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              # 2 vCPU: handles 100 concurrent bot goroutines (I/O-bound).
+              # 1Gi:    worker binary + bot fleet goroutine stacks.
+              cpu: "2000m"
+              memory: "1Gi"
+          securityContext:
+            # Root is required to communicate with the Docker daemon socket.
+            # All other hardening controls are applied below.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+        - name: tmp
+          emptyDir: {}

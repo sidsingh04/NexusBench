@@ -1,0 +1,41 @@
+# k8s/network-policies/allow-ingress-external.yaml
+#
+# Allows the NGINX Ingress Controller to forward traffic into the namespace.
+#
+# Without this policy, the default-deny-all baseline blocks the ingress
+# controller's forwarded connections even though the Ingress object is defined.
+# The Ingress object defines routing rules; this NetworkPolicy opens the
+# actual TCP path from the ingress controller pod to the control-plane pod.
+#
+# The ingress controller runs in the ingress-nginx namespace (installed by
+# the NGINX Helm chart). We select it by namespace label + pod label.
+#
+# This policy grants ingress to control-plane pods only on port 8080.
+# All other pods in the nexusbench namespace remain unreachable from the
+# ingress controller.
+#
+# Redpanda + TimescaleDB are not exposed via ingress — they are internal only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-external
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP

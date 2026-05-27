@@ -1,0 +1,59 @@
+# k8s/network-policies/allow-consumer-egress.yaml
+#
+# NetworkPolicy for the metrics consumer pod.
+#
+# The consumer is a pure read-from-Redpanda / write-to-TimescaleDB pipeline.
+# It has no inbound connections and only two outbound targets.
+#
+# Egress allowed:
+#   1. Redpanda port 9092 — consume from metrics.latency topic.
+#   2. TimescaleDB port 5432 — write computed latency windows.
+#   3. kube-dns port 53 — DNS resolution.
+#
+# Ingress: none (consumer does not serve any inbound requests).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-consumer-egress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: consumer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    # Redpanda: consume from metrics.latency topic.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda
+      ports:
+        - port: 9092
+          protocol: TCP
+    # TimescaleDB: write latency windows.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: timescaledb
+      ports:
+        - port: 5432
+          protocol: TCP
+    # kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

@@ -1,0 +1,23 @@
+# k8s/control-plane/service.yaml
+#
+# ClusterIP Service for the control plane.
+# Workers heartbeat to this service at /internal/workers/{id}/heartbeat.
+# The NGINX Ingress forwards contestant-facing traffic here (port 8080).
+# Prometheus scrapes /metrics via the ClusterIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  selector:
+    app.kubernetes.io/name: control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

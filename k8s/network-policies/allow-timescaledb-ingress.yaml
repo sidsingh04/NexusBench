@@ -1,0 +1,49 @@
+# k8s/network-policies/allow-timescaledb-ingress.yaml
+#
+# NetworkPolicy: allow ingress TO TimescaleDB pods.
+#
+# Why this file is necessary:
+#   The default-deny-all baseline blocks ALL ingress to every pod, including
+#   TimescaleDB. The egress policies for consumer and control-plane open the
+#   outbound side of their connections to port 5432, but NetworkPolicy is
+#   enforced per-direction — the receiving pod must also carry a matching
+#   ingress rule. Without this file, the consumer's INSERT statements and any
+#   future control-plane reads would be silently dropped at the TimescaleDB pod.
+#
+# Permitted sources (port 5432 only):
+#   • consumer  — writes computed latency windows from the metrics.latency topic
+#   • control-plane — reserved for future direct reads (leaderboard queries,
+#                     health checks). Costs nothing to allow now; removing it
+#                     later would require a manifest change.
+#
+# Workers are deliberately excluded:
+#   Workers never write to TimescaleDB directly — all metric data flows through
+#   the Redpanda → consumer pipeline. Excluding workers here means a
+#   container-escape from a sandbox cannot reach the database even if the
+#   worker's network namespace is compromised.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-timescaledb-ingress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: timescaledb
+  policyTypes:
+    - Ingress
+  ingress:
+    # PostgreSQL port — consumer writes, control-plane future reads.
+    # Workers are not in this list by design.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: consumer
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - port: 5432
+          protocol: TCP

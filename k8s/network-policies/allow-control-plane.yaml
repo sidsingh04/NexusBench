@@ -1,0 +1,108 @@
+# k8s/network-policies/allow-control-plane.yaml
+#
+# NetworkPolicy for the control-plane pod.
+#
+# Ingress allowed:
+#   1. From the NGINX Ingress Controller (port 8080) — contestant API traffic.
+#   2. From worker pods (port 8080) — heartbeat + worker registration.
+#   3. From any pod in the namespace on /metrics (port 8080) — Prometheus scrape.
+#      (Prometheus is deployed outside the nexusbench namespace in a full setup;
+#       for the hackathon we keep it in the same namespace for simplicity.)
+#
+# Egress allowed:
+#   1. To Redpanda (port 9092) — job enqueue + Bootstrap topic creation.
+#   2. To TimescaleDB (port 5432) — future: direct health check reads.
+#   3. To kube-dns (UDP/TCP port 53) — DNS resolution for service names.
+#      Without this, the control plane cannot resolve "redpanda" or "timescaledb".
+#
+# Note on DNS: every pod that makes outbound connections needs DNS egress.
+# We add it here and on every other allow-*.yaml that permits egress.
+# Alternatively, create a single allow-dns.yaml that grants all pods DNS
+# egress — either approach is correct. Inline is clearer for review.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-ingress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow traffic from the NGINX Ingress Controller.
+    # The ingress-nginx namespace and pod label are set by the NGINX Helm chart.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+    # Allow worker heartbeats and registration calls.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: worker
+      ports:
+        - port: 8080
+          protocol: TCP
+    # Allow Prometheus scraping /metrics.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-egress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    # Redpanda: job enqueue and topic bootstrap.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda
+      ports:
+        - port: 9092
+          protocol: TCP
+    # TimescaleDB: reserved for future direct reads (health checks, leaderboard).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: timescaledb
+      ports:
+        - port: 5432
+          protocol: TCP
+    # kube-dns: DNS resolution (UDP + TCP both required).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

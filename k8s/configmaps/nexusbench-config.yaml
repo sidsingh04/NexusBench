@@ -1,0 +1,82 @@
+# k8s/configmaps/nexusbench-config.yaml
+#
+# All non-secret configuration for every NexusBench service.
+#
+# Sensitive values (DSNs, passwords, API keys) are in Secret/nexusbench-secrets
+# (see k8s/secrets/.gitkeep for management instructions). They are never here.
+#
+# Each service reads only the keys it needs; keys irrelevant to a service are
+# present but harmless. Keeping everything in one ConfigMap avoids
+# inter-manifest ordering problems during `kubectl apply`.
+#
+# Image references use the REGISTRY placeholder. CI replaces this before apply:
+#   sed 's|REGISTRY|us-docker.pkg.dev/my-project/nexusbench|g' k8s/ -r
+# In local dev, override SANDBOX_IMAGE_* env vars directly on the pod spec.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nexusbench-config
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+data:
+  # ── Server / control plane ──────────────────────────────────────────────────
+  LISTEN_ADDR: ":8080"
+  SUBMISSION_DIR: "/data/submissions"
+  MAX_UPLOAD_BYTES: "268435456"   # 256 MiB
+
+  # ── Distributed mode ────────────────────────────────────────────────────────
+  DISTRIBUTED_MODE: "true"
+
+  # ── Redpanda (Kafka-compatible) ─────────────────────────────────────────────
+  # Points to the ClusterIP service (redpanda-client), NOT the headless service
+  # (redpanda). The headless service has clusterIP: None and is used only for
+  # stable per-pod DNS. Kafka clients must bootstrap via the ClusterIP VIP.
+  REDPANDA_BROKERS: "redpanda-client:9092"
+
+  # ── Orchestrator ────────────────────────────────────────────────────────────
+  # Workers heartbeat to this URL. Points to the control-plane ClusterIP.
+  ORCHESTRATOR_URL: "http://control-plane:8080"
+
+  # ── Sandbox images ──────────────────────────────────────────────────────────
+  # CI replaces REGISTRY with the actual Artifact Registry URL before apply.
+  # During local kubectl dev, override these on the Deployment directly.
+  SANDBOX_IMAGE_GO:     "nexusbench/sandbox-go:latest"
+  SANDBOX_IMAGE_RUST:   "nexusbench/sandbox-rust:latest"
+  SANDBOX_IMAGE_CPP:    "nexusbench/sandbox-cpp:latest"
+  SANDBOX_IMAGE_PYTHON: "nexusbench/sandbox-python:latest"
+  SANDBOX_IMAGE_BINARY: "nexusbench/sandbox-binary:latest"
+
+  # ── Sandbox resource limits ─────────────────────────────────────────────────
+  # CPU quota: 100000 = 100ms per 100ms period = 1 full vCPU for the sandbox.
+  SANDBOX_CPU_QUOTA:    "100000"
+  SANDBOX_MEMORY_BYTES: "536870912"   # 512 MiB
+  SANDBOX_TIMEOUT:      "30m"
+  SANDBOX_NETWORK_MODE: "bridge"
+
+  # Port range for sandbox containers spawned by the worker.
+  # Each worker gets its own block — avoid overlap if co-locating workers.
+  SANDBOX_PORT_MIN: "20000"
+  SANDBOX_PORT_MAX: "21000"
+
+  # Inside K8s, sandbox ports are published on the node's host network.
+  # Workers reach them via the node's internal IP (not localhost).
+  # The worker pod's downward API injects NODE_IP; SANDBOX_HOST is set there.
+  # This ConfigMap entry is a fallback for non-K8s environments.
+  SANDBOX_HOST: "localhost"
+
+  # ── Consumer ────────────────────────────────────────────────────────────────
+  CONSUMER_GROUP_ID: "nexusbench-consumer"
+  # TIMESCALE_DSN comes from the Secret (not here).
+
+  # ── Bot fleet defaults ───────────────────────────────────────────────────────
+  BOT_COUNT:               "100"
+  BOT_TEST_DURATION:       "60s"
+  BOT_RAMP_UP_DURATION:    "5s"
+  BOT_ORDER_RATIO_LIMIT:   "0.60"
+  BOT_ORDER_RATIO_MARKET:  "0.30"
+  BOT_ORDER_RATIO_CANCEL:  "0.10"
+  BOT_PER_REQUEST_TIMEOUT: "2s"
+
+  # ── Worker ──────────────────────────────────────────────────────────────────
+  JOB_TIMEOUT: "35m"

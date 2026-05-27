@@ -1,0 +1,76 @@
+# k8s/redpanda/service.yaml
+#
+# Two Services for Redpanda — naming follows the standard Kafka-on-K8s pattern:
+#
+# 1. Headless Service  (name: redpanda)
+#    This is the service referenced by the StatefulSet's `serviceName` field.
+#    Its name determines the stable per-pod DNS name:
+#      redpanda-0.redpanda.nexusbench.svc.cluster.local
+#    The StatefulSet spec, the --advertise-kafka-addr flag, and the
+#    --rpc-addr flag all use this DNS pattern. The name MUST match
+#    `serviceName` in the StatefulSet exactly — a mismatch means the
+#    advertised broker address is unresolvable, causing the broker to
+#    fail its own cluster-membership check and never become Ready.
+#
+# 2. ClusterIP Service  (name: redpanda-client)
+#    Used by all NexusBench services (control-plane, worker, consumer)
+#    as the Kafka bootstrap address: redpanda-client:9092.
+#    The ConfigMap key REDPANDA_BROKERS points here.
+#    Named separately from the headless service to make the two roles
+#    unambiguous and to avoid accidental use of the headless service
+#    as a bootstrap address (which works but returns pod IPs, not the VIP).
+---
+# Headless Service — name must match StatefulSet.spec.serviceName exactly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: redpanda
+    app.kubernetes.io/component: message-broker
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  clusterIP: None    # headless — no VIP; DNS returns each pod's IP directly
+  selector:
+    app.kubernetes.io/name: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+      protocol: TCP
+    - name: rpc
+      port: 33145
+      targetPort: rpc
+      protocol: TCP
+---
+# ClusterIP Service — stable bootstrap address for all Kafka clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda-client
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: redpanda
+    app.kubernetes.io/component: message-broker
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  selector:
+    app.kubernetes.io/name: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+      protocol: TCP
+    - name: pandaproxy
+      port: 8082
+      targetPort: pandaproxy
+      protocol: TCP
+    - name: schema-registry
+      port: 8081
+      targetPort: schema-registry
+      protocol: TCP
+    - name: admin
+      port: 9644
+      targetPort: admin
+      protocol: TCP

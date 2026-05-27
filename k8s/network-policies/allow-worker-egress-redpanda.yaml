@@ -1,0 +1,80 @@
+# k8s/network-policies/allow-worker-egress-redpanda.yaml
+#
+# NetworkPolicy for worker pods — the most restrictive egress in the system.
+#
+# Workers are the highest-risk pods: they run adjacent to contestant code
+# (via the Docker socket) and could be the target of a container-escape
+# attempt. This policy is the last line of network defence if a contestant's
+# sandbox escapes its container and runs code in the worker's network namespace.
+#
+# Egress allowed:
+#   1. To Redpanda port 9092 — Dequeue jobs, CommitJob offsets.
+#   2. To control-plane port 8080 — heartbeat + worker registration.
+#   3. To kube-dns port 53 — resolve "redpanda" and "control-plane" service names.
+#
+# Egress explicitly NOT allowed (blocked by default-deny-all):
+#   • TimescaleDB port 5432 — workers never write metrics directly.
+#   • Any internet address — no outbound NAT for the worker node subnet.
+#   • Any other pod in the namespace.
+#
+# Ingress allowed:
+#   None — workers don't serve any inbound connections. They are pure consumers.
+#   No ingress rule means no inbound TCP connections are accepted, even from
+#   within the cluster.
+#
+# Note on hostNetwork / Docker:
+#   The Docker daemon socket is a Unix socket on the node's filesystem, not
+#   a TCP connection routed through the pod network. NetworkPolicies only govern
+#   pod-network traffic — they do NOT block or allow Unix socket communication.
+#   The Docker socket access is controlled exclusively by the volume mount in
+#   worker/deployment.yaml and the node-level firewall.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-worker-egress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  policyTypes:
+    - Ingress
+    - Egress
+  # Explicit empty ingress → no inbound connections accepted.
+  ingress: []
+  egress:
+    # Redpanda: job dequeue and offset commit.
+    # Targets redpanda pods by label. Clients connect via the ClusterIP
+    # service redpanda-client:9092, which resolves to these pods.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda
+      ports:
+        - port: 9092
+          protocol: TCP
+    # Control-plane: heartbeat (POST /internal/workers/{id}/heartbeat)
+    # and registration (POST /internal/workers/register).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - port: 8080
+          protocol: TCP
+    # kube-dns: service name resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

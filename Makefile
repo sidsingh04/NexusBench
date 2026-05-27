@@ -155,21 +155,14 @@ tf-validate:
 	terraform -chdir=$(TF_DIR) validate
 	@echo "✓ Terraform HCL is valid"
 
-## Dry-run all Kubernetes manifests against the current cluster context.
-## Requires: kubectl in PATH and a valid kubeconfig (or KUBECONFIG env var).
-## Does NOT require the cluster to exist — kubectl --dry-run=client validates
-## manifest structure without contacting the API server.
+## Dry-run all Kubernetes manifests.
+## Does NOT require the cluster to exist — uses kubeconform for offline validation.
 ##
-## If you want to run this offline without a kubeconfig, use:
-##   docker run --rm -v $(PWD)/k8s:/k8s bitnami/kubectl apply --dry-run=client -f /k8s/
+## If you want to run this completely isolated, use:
+##   docker run --rm -v $(PWD)/k8s:/k8s ghcr.io/yannh/kubeconform:latest -strict -summary /k8s/
 k8s-validate:
-	@echo "─── kubectl dry-run (client-side) ───"
-	@if command -v kubectl > /dev/null 2>&1; then \
-		kubectl apply --dry-run=client -f k8s/ --recursive; \
-		echo "✓ K8s manifests are valid"; \
-	else \
-		echo "kubectl not found — skipping k8s-validate (install kubectl to enable)"; \
-	fi
+	@echo "─── k8s manifest validation (offline) ───"
+	@bash scripts/smoke_test_phase4_stage2.sh --dry-run
 
 ## Run golangci-lint on all Go packages.
 ## Config: .golangci.yml (created in Stage 4.4).

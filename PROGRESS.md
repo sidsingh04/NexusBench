@@ -101,7 +101,7 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 | Stage | Description | Status |
 |-------|-------------|--------|
 | 4.1 | Terraform Cloud Provisioning — VPC, managed K8s cluster, two node pools (on-demand control-plane + spot worker), container registry | ✅ Complete |
-| 4.2 | Kubernetes Manifests — all seven services deployed, zero-trust NetworkPolicies, RBAC, PodDisruptionBudgets, read-only worker mounts | ⏳ Pending |
+| 4.2 | Kubernetes Manifests — all seven services deployed, zero-trust NetworkPolicies, RBAC, PodDisruptionBudgets, read-only worker mounts | ✅ Complete |
 | 4.3 | Autoscaling — KEDA ScaledObject on Redpanda consumer-group lag; `QueueDepth` method on `Queue` interface; Prometheus gauge | ⏳ Pending |
 | 4.4 | CI/CD Pipeline — GitHub Actions: lint + test + tf-validate + k8s-validate on PRs; build + push + rolling deploy on `main` | ⏳ Pending |
 
@@ -133,6 +133,61 @@ k8s/
 | `internal/queue` | Add `QueueDepth(ctx) (int64, error)` to `Queue` interface; implement on `RedpandaQueue` and `MemoryQueue` |
 | `internal/metrics` | Add `nexusbench_queue_depth` Prometheus gauge; wired via 15s background scrape in control plane |
 | `Makefile` | Add `lint`, `ci`, `tf-validate`, `k8s-validate`, `build-push` targets |
+
+### Stage 4.2 — What was built
+
+**17 files created across `k8s/`.**
+
+| File | Key decisions |
+|---|---|
+| `k8s/namespace.yaml` | `nexusbench.io/network-policy: enabled` label used as namespaceSelector anchor in all NetworkPolicy objects |
+| `k8s/configmaps/nexusbench-config.yaml` | Single ConfigMap for all non-secret env vars across all services; `REGISTRY` placeholder replaced by CI `sed` before apply |
+| `k8s/secrets/.gitkeep` | Documents three secret management strategies: `kubectl create secret` (dev), GitHub Actions Environments (CI), Sealed Secrets / External Secrets Operator (prod) |
+| `k8s/rbac/worker-serviceaccount.yaml` | `automountServiceAccountToken: false` — eliminates the default token mount that contestant code could exfiltrate |
+| `k8s/rbac/worker-role.yaml` | Namespace-scoped Role (not ClusterRole); only `get`+`list` on `pods`; RoleBinding wires it to the ServiceAccount |
+| `k8s/redpanda/statefulset.yaml` | Stable pod DNS via headless service; uid 101 (redpanda image user); capabilities DROP ALL; per-pod PVC via `volumeClaimTemplates` |
+| `k8s/redpanda/service.yaml` | Two services: headless (stable per-pod DNS for broker-to-broker RPC) + ClusterIP (client bootstrap address `redpanda:9092`) |
+| `k8s/timescaledb/statefulset.yaml` | uid 1000; pg-run emptyDir (tmpfs) for socket files; PGDATA in PVC subdirectory to avoid `lost+found` incompatibility |
+| `k8s/timescaledb/service.yaml` | ClusterIP only — no ingress, no NodePort; NetworkPolicies block workers from reaching it |
+| `k8s/timescaledb/pvc.yaml` | 20Gi ReadWriteOnce; capacity math documented (200M rows at ~100B/row) |
+| `k8s/control-plane/deployment.yaml` | No Docker socket; `readOnlyRootFilesystem`; `/tmp` emptyDir for multipart form buffering; NODE_IP Downward API injection |
+| `k8s/control-plane/service.yaml` | ClusterIP:8080 — used by workers for heartbeats and by NGINX for forwarding |
+| `k8s/control-plane/ingress.yaml` | Rate limiting (1 RPS / 10 connections per IP); 256 MiB proxy-body-size; 300s proxy timeout; TLS termination |
+| `k8s/control-plane/pvc.yaml` | 50Gi ReadWriteOnce; comment documents why RWO is sufficient (workers fetch archives over HTTP, not via volume mount) |
+| `k8s/worker/deployment.yaml` | Both `nodeSelector` AND `toleration` required — nodeSelector targets the label, toleration permits scheduling on the tainted node; SANDBOX_HOST set from NODE_IP Downward API so workers reach Docker-published ports on the host |
+| `k8s/worker/pdb.yaml` | `maxUnavailable: 1` — serialises GKE upgrade drains across the worker pool; does not protect against spot evictions (by design) |
+| `k8s/consumer/deployment.yaml` | TIMESCALE_DSN from Secret; REDPANDA_BROKERS + CONSUMER_GROUP_ID from ConfigMap individual keys (not envFrom, to avoid pulling in unneeded vars) |
+| `k8s/network-policies/default-deny-all.yaml` | Empty podSelector selects all pods; empty ingress/egress lists + explicit policyTypes = total deny |
+| `k8s/network-policies/allow-control-plane.yaml` | Split into two NetworkPolicy objects (ingress + egress) for clarity; DNS egress to kube-system/kube-dns included |
+| `k8s/network-policies/allow-worker-egress-redpanda.yaml` | Explicit `ingress: []` makes intent clear; Docker socket is a Unix socket, not pod-network traffic — not governed by NetworkPolicy |
+| `k8s/network-policies/allow-consumer-egress.yaml` | Minimal: Redpanda read + TimescaleDB write + DNS only |
+| `k8s/network-policies/allow-ingress-external.yaml` | Scoped to `ingress-nginx` namespace + pod label — only the actual NGINX controller pod can forward traffic |
+| `k8s/network-policies/allow-redpanda-ingress.yaml` | Added after live-cluster testing revealed the missing ingress side. Two separate rules: port 9092 from worker/consumer/control-plane; port 33145 (broker-to-broker RPC) from redpanda pods only — split to prevent clients reaching the internal RPC port |
+| `k8s/network-policies/allow-timescaledb-ingress.yaml` | Added after live-cluster testing. Permits port 5432 from consumer + control-plane only; workers explicitly excluded |
+| `scripts/smoke_test_phase4_stage2.sh` | Two modes: `--dry-run` (kubeconform offline schema validation, python3 YAML syntax fallback) and `--live` (apply + rollout wait + HTTP health check + NetworkPolicy connectivity audit with `kubectl wait` before `nc -z` to eliminate race condition) |
+
+### Stage 4.2 — Post-deployment fixes applied
+
+The following issues were found during live-cluster smoke testing and corrected:
+
+| # | Issue | Fix applied | Production note |
+|---|---|---|---|
+| 1 | `REGISTRY` placeholder is uppercase — K8s rejects image names with uppercase chars | Changed to `nexusbench/control-plane:latest` for local dev | CI pipeline must substitute the real Artifact Registry URL via `envsubst` before `kubectl apply` |
+| 2 | All five `nodeSelector` blocks were commented out during local testing | Restored as live YAML in all five manifests; local-dev override documented in `worker/deployment.yaml` header | **Never** comment out nodeSelector in production — use the `kubectl patch` procedure instead |
+| 3 | Redpanda crashed: `command:` bypasses the `rpk` entrypoint wrapper | Changed `command:` to `args:` so flags flow through the wrapper correctly | Keep permanently |
+| 4 | Redpanda AIO limit too low on Docker Desktop VM | Raised via `wsl -d docker-desktop sysctl fs.aio-max-nr=1048576` | GKE node pools have sufficient AIO limits by default; add privileged DaemonSet only if needed |
+| 5 | `nexusbench-secrets` Secret did not exist | Created manually for local dev via `kubectl create secret generic` | CI must inject secrets before apply — see `k8s/secrets/.gitkeep` for three management strategies |
+| 6 | `imagePullPolicy: Always` caused ImagePullBackOff for locally built images | Changed to `imagePullPolicy: IfNotPresent` for local dev | Use `Always` with a real remote registry and SHA-pinned image tags in production |
+| 7 | Control plane crashed with "docker daemon unreachable" in distributed mode | Wrapped `NewDockerManager` in `if !cfg.DistributedMode` in `cmd/server/main.go` | Keep permanently — decouples the control plane from container lifecycle in K8s |
+| 8 | NetworkPolicies only opened egress from clients; Redpanda + TimescaleDB had no matching ingress rules | Added `allow-redpanda-ingress.yaml` and `allow-timescaledb-ingress.yaml` | Keep permanently; both sides of every TCP connection require matching policy rules |
+| 9 | Smoke test ran `kubectl exec` before worker container was ready — misleading false-pass | Added `kubectl wait --for=condition=ready pod` before the `nc -z` NetworkPolicy audit | Keep permanently |
+| 10 | Worker crashed: `mkdir /data/submissions` failed on read-only root FS | Added `SUBMISSION_DIR=/tmp/submissions` env override in `worker/deployment.yaml` | Keep permanently |
+| 11 | Worker crashed: Docker socket permission denied when `runAsUser: 1001` set | Removed `runAsNonRoot`, `runAsUser`, `runAsGroup` from worker securityContext; worker runs as root (per Dockerfile) | Keep permanently; remaining hardening: capabilities drop ALL + readOnlyRootFilesystem + NetworkPolicy |
+| 12 | Redpanda rollout timed out (120s): root cause was three compounding bugs | (a) `serviceName: redpanda` referenced the old headless Service named `redpanda-headless` — mismatch means pod DNS unresolvable, broker fails cluster-membership check; (b) readiness probe used `rpk cluster info` which requires the advertised Kafka address to resolve — circular dependency with (a); (c) `storageClassName: standard` does not exist on Docker Desktop — PVC stays Pending, pod never starts; (d) 120s timeout too short for Docker Desktop storage I/O | Keep all four fixes permanently — see `k8s/redpanda/` |
+| 13 | Headless Service renamed, ClusterIP service added as `redpanda-client` | `serviceName` in StatefulSet now matches headless Service `redpanda`; Kafka clients bootstrap via `redpanda-client:9092`; ConfigMap `REDPANDA_BROKERS` updated accordingly | Keep permanently |
+| 14 | Redpanda readiness probe replaced | `rpk cluster info` exec replaced with `httpGet /v1/status/ready` on admin port 9644; `initialDelaySeconds` raised to 30, `failureThreshold` to 12 (120s window after delay) | Keep permanently |
+| 15 | All three PVCs had `storageClassName: standard` | Removed `storageClassName` from `redpanda` volumeClaimTemplate, `timescaledb/pvc.yaml`, and `control-plane/pvc.yaml` — cluster uses its default StorageClass | Keep permanently |
+| 16 | Smoke test timeout too short and gave no diagnostic output on failure | Raised `TIMEOUT` to 240s; `rollout_wait` helper now dumps pod describe + container log + previous-container log on failure | Keep permanently |
 
 ### Stage 4.1 — What was built
 

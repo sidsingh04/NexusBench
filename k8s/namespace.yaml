@@ -1,0 +1,22 @@
+# k8s/namespace.yaml
+#
+# The nexusbench namespace is the security and operational boundary for all
+# NexusBench services. Every resource in k8s/ targets this namespace.
+#
+# Labels are set deliberately:
+#   app.kubernetes.io/part-of — standard K8s label for grouping in dashboards
+#   nexusbench.io/network-policy — selector used by all NetworkPolicy objects
+#                                  in network-policies/. Every pod in this
+#                                  namespace inherits this label via the namespace
+#                                  selector, giving us a clean "everything in
+#                                  nexusbench" grouping for policy rules.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+    # This label is used as a namespaceSelector in NetworkPolicy objects.
+    # It ensures policies are scoped to this namespace even when cluster-admin
+    # creates resources in other namespaces that happen to have matching pod labels.
+    nexusbench.io/network-policy: enabled

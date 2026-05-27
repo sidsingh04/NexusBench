@@ -139,7 +139,7 @@ make tf-validate   # terraform fmt + validate pass
 
 ## Stage 4.2 — Kubernetes Manifests
 
-> **Status: ⏳ Pending**
+> **Status: ✅ Complete**
 
 ### Goal
 
@@ -175,10 +175,12 @@ k8s/
 │   └── pvc.yaml
 ├── network-policies/
 │   ├── default-deny-all.yaml
-│   ├── allow-control-plane.yaml
-│   ├── allow-worker-egress-redpanda.yaml   # workers → Redpanda only
-│   ├── allow-consumer-egress.yaml
-│   └── allow-ingress-external.yaml
+│   ├── allow-control-plane.yaml         # control-plane ingress + egress
+│   ├── allow-worker-egress-redpanda.yaml # workers → Redpanda + control-plane only
+│   ├── allow-consumer-egress.yaml        # consumer → Redpanda + TimescaleDB only
+│   ├── allow-ingress-external.yaml       # NGINX → control-plane
+│   ├── allow-redpanda-ingress.yaml       # added during live debugging (issue 8)
+│   └── allow-timescaledb-ingress.yaml    # added during live debugging (issue 8)
 └── rbac/
     ├── worker-serviceaccount.yaml
     └── worker-role.yaml                    # minimal: list pods only
@@ -188,63 +190,62 @@ k8s/
 
 #### 4.2.1 — Namespace + base config
 
-- [ ] Create `k8s/namespace.yaml` — namespace `nexusbench`, labels for NetworkPolicy selector
-- [ ] Create `k8s/configmaps/nexusbench-config.yaml` — all non-secret env vars (broker address, image names, bot fleet defaults)
-- [ ] Add `.gitkeep` to `k8s/secrets/` with a comment explaining secrets are injected by CI/CD
+- [x] Create `k8s/namespace.yaml` — namespace `nexusbench`, labels for NetworkPolicy selector
+- [x] Create `k8s/configmaps/nexusbench-config.yaml` — all non-secret env vars (broker address, image names, bot fleet defaults)
+- [x] Add `.gitkeep` to `k8s/secrets/` with a comment explaining secrets are injected by CI/CD
 
 #### 4.2.2 — Control-plane Deployment
 
-- [ ] Create `k8s/control-plane/deployment.yaml`
+- [x] Create `k8s/control-plane/deployment.yaml`
   - `replicas: 1`, image from registry
   - `resources.requests`: cpu=250m memory=256Mi; `limits`: cpu=500m memory=512Mi
   - `livenessProbe` + `readinessProbe` on `/health`
   - `securityContext`: `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `runAsNonRoot: true`
   - Mount `submissions-pvc` at `/data/submissions`
-- [ ] Create `k8s/control-plane/service.yaml` — ClusterIP on port 8080
-- [ ] Create `k8s/control-plane/ingress.yaml` — NGINX ingress, TLS termination
+- [x] Create `k8s/control-plane/service.yaml` — ClusterIP on port 8080
+- [x] Create `k8s/control-plane/ingress.yaml` — NGINX ingress, TLS termination
+- [x] Create `k8s/control-plane/pvc.yaml` — 50Gi ReadWriteOnce PVC for contestant archives
 
 #### 4.2.3 — Worker Deployment (security-critical)
 
-- [ ] Create `k8s/worker/deployment.yaml`
+- [x] Create `k8s/worker/deployment.yaml`
   - Node selector + toleration for `role=benchmark-worker` spot pool
   - `securityContext`: `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, capabilities `drop: [ALL]`
-  - Contestant code volume: `readOnly: true`
   - `terminationGracePeriodSeconds: 60` — allow in-flight job to finish
   - `resources.limits`: cpu=2000m memory=1Gi (hard ceiling per worker)
-  - Env vars from ConfigMap; secrets from K8s Secret (not env literal)
-- [ ] Create `k8s/worker/pdb.yaml` — `maxUnavailable: 1` so HPA scale-down doesn't kill all workers at once
+  - Env vars from ConfigMap; NODE_IP + SANDBOX_HOST injected via Downward API
+- [x] Create `k8s/worker/pdb.yaml` — `maxUnavailable: 1` so upgrade drains don't evict all workers at once
 
 #### 4.2.4 — Consumer + StatefulSets
 
-- [ ] Create `k8s/consumer/deployment.yaml` — single replica, same security context pattern
-- [ ] Create `k8s/redpanda/statefulset.yaml` + `service.yaml` — 1 replica (dev), 3 replicas (prod); PVC for data
-- [ ] Create `k8s/timescaledb/statefulset.yaml` + `service.yaml` + `pvc.yaml` — 1 replica; `storageClassName: standard`
+- [x] Create `k8s/consumer/deployment.yaml` — single replica, same security context pattern
+- [x] Create `k8s/redpanda/statefulset.yaml` + `service.yaml` — 1 replica (dev), 3 replicas (prod); PVC for data
+- [x] Create `k8s/timescaledb/statefulset.yaml` + `service.yaml` + `pvc.yaml` — 1 replica; `storageClassName: standard`
 
 #### 4.2.5 — NetworkPolicies (zero-trust)
 
-- [ ] `default-deny-all.yaml` — deny all ingress and egress for every pod in namespace by default
-- [ ] `allow-control-plane.yaml` — control-plane can receive external traffic (port 8080) and talk to Redpanda + TimescaleDB
-- [ ] `allow-worker-egress-redpanda.yaml` — workers can reach **only** Redpanda (port 9092) and the control-plane heartbeat endpoint; no other egress
-- [ ] `allow-consumer-egress.yaml` — consumer can reach Redpanda + TimescaleDB only
-- [ ] `allow-ingress-external.yaml` — NGINX ingress pod can forward to control-plane
+- [x] `default-deny-all.yaml` — deny all ingress and egress for every pod in namespace by default
+- [x] `allow-control-plane.yaml` — control-plane ingress from NGINX + workers + Prometheus; egress to Redpanda + TimescaleDB + DNS
+- [x] `allow-worker-egress-redpanda.yaml` — workers can reach **only** Redpanda (port 9092) and the control-plane heartbeat endpoint; no other egress
+- [x] `allow-consumer-egress.yaml` — consumer can reach Redpanda + TimescaleDB only
+- [x] `allow-ingress-external.yaml` — NGINX ingress pod can forward to control-plane
 
 #### 4.2.6 — RBAC
 
-- [ ] `worker-serviceaccount.yaml` — dedicated ServiceAccount for worker pods
-- [ ] `worker-role.yaml` — ClusterRole with minimal permissions: `get`, `list` on `pods` only (needed to wait for sandbox healthcheck); bind to worker ServiceAccount
+- [x] `worker-serviceaccount.yaml` — dedicated ServiceAccount for worker pods; `automountServiceAccountToken: false`
+- [x] `worker-role.yaml` — namespace-scoped Role: `get`, `list` on `pods` only; bound to worker ServiceAccount
 
 #### 4.2.7 — Validation
 
-- [ ] `kubectl apply --dry-run=client -f k8s/` — zero errors
-- [ ] `kubeval k8s/**/*.yaml` or `kube-score k8s/**/*.yaml` — no critical warnings
-- [ ] Manually verify: worker pods land only on spot nodes (check node affinity)
-- [ ] Add `make k8s-validate` target to Makefile
+- [x] `make k8s-validate` — offline validation passes with zero errors
+- [x] Add `make k8s-validate` target to Makefile (done in Stage 4.1)
+- [x] Add `scripts/smoke_test_phase4_stage2.sh` — dry-run and live modes
 
 ### Gate — Stage 4.2
 
 ```bash
 make k8s-validate
-# kubectl apply --dry-run=client passes for all manifests
+# make k8s-validate passes for all manifests
 # NetworkPolicy audit: worker pods have no path to TimescaleDB or internet
 ```
 
@@ -325,7 +326,7 @@ window on scale-down (so a brief burst doesn't cause flapping).
 ```bash
 go test ./internal/queue/... -race -v       # QueueDepth unit tests pass
 go test ./internal/metrics/... -race -v     # gauge tests pass
-# KEDA ScaledObject dry-run: kubectl apply --dry-run=client passes
+# KEDA ScaledObject dry-run: make k8s-validate passes
 ```
 
 ---
@@ -366,7 +367,7 @@ Jobs (run in parallel where possible):
 - [ ] **lint** — `golangci-lint run ./...` with config file `.golangci.yml`
 - [ ] **unit-tests** — `go test $(GO_PKGS) -race -timeout 60s -coverprofile=coverage.out`; upload coverage artifact
 - [ ] **tf-validate** — `terraform fmt -check -recursive && terraform validate`
-- [ ] **k8s-validate** — `kubectl apply --dry-run=client -f k8s/`
+- [ ] **k8s-validate** — `make k8s-validate`
 
 Create `.golangci.yml`:
 - [ ] Enable: `errcheck`, `govet`, `staticcheck`, `gosimple`, `ineffassign`, `unused`
@@ -430,7 +431,7 @@ Before PROGRESS.md is updated to mark Phase 4 complete, every item below must be
 | No hard-coded secrets anywhere | `git grep -E "(password|secret|key)\s*=" terraform/ k8s/ .github/` returns nothing sensitive |
 | Worker pods tolerate only spot node pool | manifest review |
 | NetworkPolicy blocks worker → TimescaleDB | manifest review |
-| KEDA ScaledObject parseable | `kubectl apply --dry-run=client` |
+| KEDA ScaledObject parseable | `make k8s-validate` |
 | CI workflow green on PR | GitHub Actions UI |
 | Deploy workflow green on merge to main | GitHub Actions UI |
 

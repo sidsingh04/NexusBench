@@ -1,0 +1,36 @@
+# k8s/timescaledb/pvc.yaml
+#
+# Shared PersistentVolumeClaim for TimescaleDB data.
+# TimescaleDB runs as a single-replica StatefulSet (no multi-master for
+# the hackathon scale). The PVC uses ReadWriteOnce — only one node mounts
+# it at a time, which is the correct access mode for a single-replica DB.
+#
+# storageClassName: standard
+#   On GKE this provisions a persistent disk (pd-standard or pd-ssd depending
+#   on the StorageClass configuration in the cluster). The Terraform cluster
+#   module uses the GKE-default StorageClass which is pd-balanced on GKE 1.29+.
+#   For better IOPS on prod, create a custom StorageClass with pd-ssd and
+#   reference it here.
+#
+# Storage size: 20Gi
+#   Each latency event row is ~100 bytes. 20Gi can store ~200M events.
+#   At 10,000 TPS × 60s benchmark × 30 teams = 18M events — well within budget.
+#   Increase to 50Gi for multi-day hackathons where history accumulates.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: timescaledb-data
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName intentionally omitted — uses the cluster's default
+  # StorageClass. GKE default: pd-balanced. Docker Desktop: hostpath.
+  # Do not set this to "standard" — it does not exist on Docker Desktop.
+  resources:
+    requests:
+      storage: 20Gi

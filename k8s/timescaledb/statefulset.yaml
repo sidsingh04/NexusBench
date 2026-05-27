@@ -1,0 +1,131 @@
+# k8s/timescaledb/statefulset.yaml
+#
+# TimescaleDB StatefulSet — time-series storage for all latency telemetry.
+#
+# Single replica. TimescaleDB has no built-in multi-master mode at the open
+# source tier; a second replica would require streaming replication setup that
+# is out of scope for Phase 4. Durability is provided by the PVC (persistent
+# disk), not by replica count.
+#
+# Security context:
+#   The timescale/timescaledb image runs as uid 1000 (postgres user).
+#   readOnlyRootFilesystem cannot be set here because PostgreSQL writes WAL
+#   files to /var/lib/postgresql/data and temp files to /tmp. Both are
+#   handled by volume mounts (PVC and emptyDir) rather than the root FS,
+#   but the initdb step also writes to /var/run/postgresql which is an
+#   ephemeral tmpfs — so we allow the root FS to be writable for this
+#   service only. All other capabilities are still dropped.
+#
+# Resource sizing:
+#   Requests: 250m CPU / 512Mi RAM — sufficient for the telemetry write rate
+#             at 10k TPS (one row per event ≈ 10k rows/s = ~1MB/s writes).
+#   Limits:   500m CPU / 1Gi RAM — cap to protect the control-plane node pool.
+#   Raise limits if you observe OOM kills during high-TPS benchmarks.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: timescaledb
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  serviceName: timescaledb
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: timescaledb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: timescaledb
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: nexusbench
+    spec:
+      # Schedule on the control-plane node pool — stateful database, must not
+      # land on preemptible/spot worker nodes.
+      # Local dev: label your single node with role=control-plane, or use the
+      # temporary kubectl patch procedure described in worker/deployment.yaml.
+      nodeSelector:
+        role: control-plane
+
+      terminationGracePeriodSeconds: 60  # allow in-flight transactions to commit
+
+      containers:
+        - name: timescaledb
+          image: timescale/timescaledb:2.15.2-pg16
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: nexusbench
+            - name: POSTGRES_USER
+              value: nexus
+            # Password comes from the Secret, never from ConfigMap.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexusbench-secrets
+                  key: timescale-password
+            # PGDATA points PostgreSQL at the mounted PVC subdirectory.
+            # Using a subdirectory avoids the "lost+found" incompatibility
+            # that occurs when PGDATA points directly at a volume root on some
+            # storage providers.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - nexus
+                - -d
+                - nexusbench
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - nexus
+                - -d
+                - nexusbench
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: timescaledb-data
+              mountPath: /var/lib/postgresql/data
+            # tmpfs for PostgreSQL socket and lock files — keeps them off
+            # the persistent disk and out of the root FS.
+            - name: pg-run
+              mountPath: /var/run/postgresql
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000    # postgres uid in the timescaledb image
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: timescaledb-data
+          persistentVolumeClaim:
+            claimName: timescaledb-data
+        - name: pg-run
+          emptyDir:
+            medium: Memory    # tmpfs — fast, ephemeral, no disk I/O

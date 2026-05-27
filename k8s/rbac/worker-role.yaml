@@ -1,0 +1,49 @@
+# k8s/rbac/worker-role.yaml
+#
+# Minimal RBAC for benchmark worker pods.
+#
+# Workers need exactly one K8s API operation: get/list their own Pod object.
+# This is used by the SandboxExecutor's health-check loop, which reads the
+# pod's status to detect when a sandbox sidecar is Ready — no other API
+# access is needed.
+#
+# Implementation note: We use a Role (namespace-scoped) not a ClusterRole.
+# Workers should never be able to read pods in other namespaces. If a
+# contestant's code escapes the sandbox container and reaches the worker's
+# API token, the damage is bounded to the nexusbench namespace.
+#
+# Rule: verbs = [get, list] on pods only.
+#   get  — read a specific pod by name
+#   list — enumerate pods with label selector (used to find sandbox pods)
+# No watch, no create, no delete, no update — workers spawn sandboxes via
+# the Docker daemon socket (mounted on the node), not via the K8s API.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nexusbench-worker
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: nexusbench
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nexusbench-worker
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: nexusbench
+subjects:
+  - kind: ServiceAccount
+    name: nexusbench-worker
+    namespace: nexusbench
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: nexusbench-worker

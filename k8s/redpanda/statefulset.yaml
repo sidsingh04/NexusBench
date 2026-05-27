@@ -1,0 +1,191 @@
+# k8s/redpanda/statefulset.yaml
+#
+# Redpanda StatefulSet — the streaming backbone for job dispatch and telemetry.
+#
+# ── Why a StatefulSet? ────────────────────────────────────────────────────────
+#   Redpanda is a stateful broker: each broker owns specific partitions and
+#   their data on disk. StatefulSet provides stable pod names (redpanda-0,
+#   redpanda-1 ...) and per-pod PersistentVolumeClaims so data survives pod
+#   restarts and node reassignments.
+#
+# ── serviceName must match the headless Service name exactly ──────────────────
+#   serviceName: redpanda
+#   This makes each pod's stable DNS name:
+#     redpanda-0.redpanda.nexusbench.svc.cluster.local
+#   If serviceName and the headless Service name differ, the broker's own
+#   advertised address becomes unresolvable. The broker then fails its
+#   cluster-membership check (even in single-node mode) and the readiness
+#   probe never passes — causing an indefinite rollout timeout.
+#
+# ── Readiness probe: HTTP on the admin port ───────────────────────────────────
+#   We use httpGet on /v1/status/ready (port 9644) instead of running
+#   `rpk cluster info`. Reasons:
+#     1. The HTTP health endpoint becomes ready as soon as the broker process
+#        is initialised, before cluster membership is fully established.
+#        `rpk cluster info` requires the advertised Kafka address to be
+#        reachable, which depends on DNS working correctly — a harder
+#        condition to satisfy during startup.
+#     2. httpGet requires no exec subprocess inside the container, making
+#        it faster and less prone to timing out on resource-constrained nodes.
+#     3. Docker Desktop is significantly slower than GKE — generous
+#        initialDelaySeconds and failureThreshold values prevent premature
+#        pod restarts that would themselves reset the 120s rollout timer.
+#
+# ── storageClassName omitted (use cluster default) ────────────────────────────
+#   GKE default: pd-balanced. Docker Desktop default: hostpath.
+#   Setting storageClassName: standard works on GKE but fails on Docker Desktop
+#   which uses hostpath as its default StorageClass (not standard).
+#   Omitting the field lets Kubernetes use whatever the default StorageClass
+#   is in the current cluster — correct for both environments.
+#
+# ── Replicas ──────────────────────────────────────────────────────────────────
+#   Dev: 1 replica — no replication overhead, faster startup.
+#   Prod: 3 replicas — fault tolerant (1 broker loss tolerated).
+#         Requires replication factor ≥ 2 on topics (update queue.go).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: redpanda
+    app.kubernetes.io/component: message-broker
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  # serviceName MUST match the name of the headless Service (clusterIP: None).
+  # This controls the DNS suffix for per-pod stable hostnames:
+  #   <pod-name>.<serviceName>.<namespace>.svc.cluster.local
+  serviceName: redpanda
+  replicas: 1                    # set to 3 for production
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redpanda
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redpanda
+        app.kubernetes.io/component: message-broker
+        app.kubernetes.io/part-of: nexusbench
+    spec:
+      # Schedule on the control-plane node pool — stateful broker, must not
+      # land on preemptible/spot worker nodes.
+      # Local dev: label your single node with role=control-plane, or use the
+      # temporary kubectl patch procedure described in worker/deployment.yaml.
+      nodeSelector:
+        role: control-plane
+
+      terminationGracePeriodSeconds: 90  # allow in-flight produce to flush
+
+      containers:
+        - name: redpanda
+          image: redpandadata/redpanda:v24.1.13
+
+          # args: passes flags through the rpk wrapper entrypoint (correct).
+          # command: would bypass the entrypoint entirely — do not use command:.
+          args:
+            - redpanda
+            - start
+            - --kafka-addr
+            - internal://0.0.0.0:9092
+            - --advertise-kafka-addr
+            # The advertised address uses the pod's stable headless-service DNS name.
+            # Pattern: <pod-name>.<headless-service-name>.<namespace>.svc.cluster.local
+            # This must be resolvable from within the cluster — it is, because the
+            # headless Service named "redpanda" creates exactly this DNS record.
+            - internal://$(POD_NAME).redpanda.nexusbench.svc.cluster.local:9092
+            - --pandaproxy-addr
+            - internal://0.0.0.0:8082
+            - --advertise-pandaproxy-addr
+            - internal://$(POD_NAME).redpanda.nexusbench.svc.cluster.local:8082
+            - --schema-registry-addr
+            - internal://0.0.0.0:8081
+            - --rpc-addr
+            - $(POD_NAME).redpanda.nexusbench.svc.cluster.local:33145
+            - --advertise-rpc-addr
+            - $(POD_NAME).redpanda.nexusbench.svc.cluster.local:33145
+            - --mode
+            - dev-container
+            - --smp
+            - "1"
+            - --default-log-level=warn
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: kafka
+              containerPort: 9092
+              protocol: TCP
+            - name: pandaproxy
+              containerPort: 8082
+              protocol: TCP
+            - name: schema-registry
+              containerPort: 8081
+              protocol: TCP
+            - name: rpc
+              containerPort: 33145
+              protocol: TCP
+            - name: admin
+              containerPort: 9644
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+          # Readiness: HTTP GET /v1/status/ready on the admin port.
+          # This endpoint becomes available as soon as the broker process
+          # initialises — before cluster membership is established — so it
+          # does not depend on the advertised Kafka address being reachable.
+          # initialDelaySeconds=30: Redpanda takes 20-40s to write initial
+          # data files, especially on slow Docker Desktop storage.
+          # failureThreshold=12 × periodSeconds=10 = 120s window after the
+          # initial delay, giving the broker up to 150s total to become ready.
+          readinessProbe:
+            httpGet:
+              path: /v1/status/ready
+              port: admin
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+
+          # Liveness: same endpoint, but only fires after a longer initial
+          # delay to avoid killing a slow-starting broker.
+          livenessProbe:
+            httpGet:
+              path: /v1/status/ready
+              port: admin
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: redpanda-data
+              mountPath: /var/lib/redpanda/data
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101    # redpanda image runs as uid 101
+            capabilities:
+              drop: ["ALL"]
+
+  volumeClaimTemplates:
+    - metadata:
+        name: redpanda-data
+        labels:
+          app.kubernetes.io/name: redpanda
+          app.kubernetes.io/part-of: nexusbench
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName intentionally omitted — uses the cluster's default
+        # StorageClass. GKE default: pd-balanced. Docker Desktop: hostpath.
+        # Do not set this to "standard" — it does not exist on Docker Desktop.
+        resources:
+          requests:
+            storage: 10Gi

@@ -1,0 +1,46 @@
+# k8s/network-policies/default-deny-all.yaml
+#
+# Zero-trust baseline: deny ALL ingress and ALL egress for every pod in the
+# nexusbench namespace by default.
+#
+# How Kubernetes NetworkPolicy works:
+#   A NetworkPolicy selects pods via podSelector. Once ANY NetworkPolicy
+#   selects a pod for a given traffic direction (ingress or egress), only
+#   traffic explicitly allowed by a matching rule is permitted — all other
+#   traffic for that direction is silently dropped.
+#
+#   An empty podSelector ({}) selects EVERY pod in the namespace.
+#   An empty ingress list ([]) allows NO ingress.
+#   An empty egress list ([]) allows NO egress.
+#
+#   This policy therefore creates a deny-all baseline for all pods.
+#   Each subsequent allow-*.yaml policy adds back only the specific flows
+#   that are legitimate for each service.
+#
+# Enforcement:
+#   NetworkPolicies are enforced by the CNI plugin (Calico on GKE, enabled
+#   via the `network_policy { provider = "CALICO" }` block in the cluster
+#   Terraform module). Without Calico, these policies are stored in etcd but
+#   have no effect — always verify with `kubectl get networkpolicies -n nexusbench`.
+#
+# What breaks without explicit allow rules:
+#   After applying this policy, ALL cross-pod TCP connections in nexusbench
+#   will be dropped until the allow-*.yaml files are applied. Apply all
+#   NetworkPolicy files in a single `kubectl apply -f k8s/network-policies/`
+#   invocation to avoid transient outages.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector: {}    # selects ALL pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules → deny all inbound traffic.
+  # No egress rules  → deny all outbound traffic.
+  # (Omitting the ingress/egress keys entirely would also deny, but being
+  #  explicit about policyTypes makes the intent clear during code review.)

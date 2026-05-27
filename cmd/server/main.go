@@ -33,26 +33,23 @@ func main() {
 	}
 	slog.Info("submission directory ready", "path", cfg.SubmissionDir)
 
-	// ── Docker manager ────────────────────────────────────────────────────────
-	dockerMgr, err := sandbox.NewDockerManager(cfg)
-	if err != nil {
-		slog.Error("failed to connect to Docker daemon", "err", err)
-		os.Exit(1)
-	}
-
 	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer startCancel()
 
-	if err := dockerMgr.PruneStale(startCtx); err != nil {
-		slog.Warn("prune stale containers failed", "err", err)
-	}
+	var dockerMgr *sandbox.DockerManager
+	if !cfg.DistributedMode {
+		var err error
+		dockerMgr, err = sandbox.NewDockerManager(cfg)
+		if err != nil {
+			slog.Error("failed to connect to Docker daemon", "err", err)
+			os.Exit(1)
+		}
 
-	if err := dockerMgr.VerifyImages(startCtx); err != nil {
-		if cfg.DistributedMode {
-			// Workers handle sandbox deployment — missing images are non-fatal
-			// on the control plane itself.
-			slog.Warn("image verification (non-fatal in distributed mode)", "err", err)
-		} else {
+		if err := dockerMgr.PruneStale(startCtx); err != nil {
+			slog.Warn("prune stale containers failed", "err", err)
+		}
+
+		if err := dockerMgr.VerifyImages(startCtx); err != nil {
 			slog.Error("image verification failed", "err", err)
 			os.Exit(1)
 		}

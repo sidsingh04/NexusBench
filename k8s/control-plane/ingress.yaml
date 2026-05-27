@@ -1,0 +1,70 @@
+# k8s/control-plane/ingress.yaml
+#
+# NGINX Ingress for the control plane.
+#
+# Exposes the contestant-facing API at the cluster's external IP/hostname.
+# TLS is terminated at the ingress; all traffic inside the cluster is plain
+# HTTP (acceptable because the cluster VPC is private and encrypted at the
+# network layer by GKE).
+#
+# Prerequisites:
+#   1. NGINX Ingress Controller must be installed in the cluster.
+#      Install via Helm:
+#        helm upgrade --install ingress-nginx ingress-nginx \
+#          --repo https://kubernetes.github.io/ingress-nginx \
+#          --namespace ingress-nginx --create-namespace
+#
+#   2. A TLS Secret named nexusbench-tls must exist in the nexusbench namespace.
+#      For development, generate a self-signed cert:
+#        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+#          -keyout tls.key -out tls.crt -subj "/CN=nexusbench.local"
+#        kubectl create secret tls nexusbench-tls \
+#          --namespace nexusbench --key tls.key --cert tls.crt
+#      For production, use cert-manager with a Let's Encrypt ClusterIssuer.
+#
+#   3. Replace nexusbench.example.com with your actual domain before applying.
+#
+# Rate limiting annotations prevent a single client from overwhelming the
+# submission endpoint. 60r/m = one submission per second per IP — enough for
+# a contestant portal, tight enough to blunt accidental DoS from test scripts.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nexusbench
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/part-of: nexusbench
+  annotations:
+    # NGINX ingress class — must match the IngressClass installed in the cluster.
+    kubernetes.io/ingress.class: "nginx"
+    # Redirect all HTTP traffic to HTTPS.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Upload size limit — match MAX_UPLOAD_BYTES in ConfigMap (256 MiB).
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    # Rate limiting: max 60 requests per minute per client IP.
+    # Applied globally to all paths — the submission path is the critical one.
+    nginx.ingress.kubernetes.io/limit-rps: "1"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    # Proxy read timeout — long enough for a large archive upload (256 MiB on
+    # a slow connection) but short enough to not hold goroutines forever.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  tls:
+    - hosts:
+        - nexusbench.example.com    # REPLACE with your domain
+      secretName: nexusbench-tls
+  rules:
+    - host: nexusbench.example.com  # REPLACE with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  name: http

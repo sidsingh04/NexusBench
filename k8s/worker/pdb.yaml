@@ -1,0 +1,35 @@
+# k8s/worker/pdb.yaml
+#
+# PodDisruptionBudget for the worker Deployment.
+#
+# Why maxUnavailable: 1?
+#   During a GKE cluster upgrade, the kubelet drains nodes one at a time
+#   (surge upgrade strategy set in the Terraform node-pools module). Without
+#   a PDB, the drain could evict ALL worker pods simultaneously — every
+#   in-flight benchmark job would be interrupted at once.
+#
+#   maxUnavailable: 1 means: at most 1 worker pod may be unavailable at any
+#   given time. If the worker Deployment has 3 replicas, 2 must always be
+#   running. The drain will proceed node-by-node only when the PDB budget
+#   allows it, serialising the upgrade across the worker pool.
+#
+#   Note: Spot evictions bypass PDBs — a preempted node disappears with 30s
+#   notice regardless of the PDB. That is intentional: jobs are re-delivered
+#   from Redpanda. The PDB is specifically for voluntary disruptions
+#   (cluster upgrades, kubectl drain).
+#
+# selector must match the worker Deployment's pod labels exactly.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker

@@ -1,0 +1,66 @@
+# k8s/network-policies/allow-redpanda-ingress.yaml
+#
+# NetworkPolicy: allow ingress TO Redpanda pods.
+#
+# Why this file is necessary:
+#   The default-deny-all baseline blocks ALL ingress to every pod, including
+#   Redpanda. The egress policies for workers, consumer, and control-plane
+#   open the outbound side of each connection, but NetworkPolicy is stateful
+#   per-direction — the receiving pod (Redpanda) must also have a matching
+#   ingress rule, otherwise the CNI plugin drops the packet at the destination.
+#   Both sides must permit the traffic for a TCP connection to complete.
+#
+# Ingress rules (two separate rules with distinct port sets):
+#
+#   Rule 1 — Kafka client traffic (port 9092):
+#     Permitted sources: worker, control-plane, consumer.
+#     These are the only pods that enqueue/dequeue from the Kafka API.
+#
+#   Rule 2 — Redpanda internal RPC (port 33145):
+#     Permitted source: other redpanda pods only.
+#     This is the inter-broker RPC port used for raft consensus and partition
+#     replication in a multi-replica (prod) deployment. Exposing it to
+#     workers or consumers would serve no purpose and widens the attack surface.
+#     In a single-replica dev setup this rule is harmless but still correct.
+#
+# The two rules are separate blocks (not combined) to enforce the port
+# restriction precisely. If they were merged into one block, every permitted
+# source would be allowed on both ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redpanda-ingress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redpanda
+  policyTypes:
+    - Ingress
+  ingress:
+    # Rule 1: Kafka API (port 9092) — clients only.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: consumer
+      ports:
+        - port: 9092
+          protocol: TCP
+
+    # Rule 2: Redpanda internal RPC (port 33145) — broker-to-broker only.
+    # Separated so workers/consumer/control-plane cannot reach the RPC port.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda
+      ports:
+        - port: 33145
+          protocol: TCP

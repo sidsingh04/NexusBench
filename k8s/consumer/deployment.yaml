@@ -1,0 +1,98 @@
+# k8s/consumer/deployment.yaml
+#
+# Metrics Consumer Deployment.
+#
+# The consumer reads from the metrics.latency Redpanda topic, computes
+# rolling 5-second latency windows, and writes them to TimescaleDB.
+# It is a single replica — the consumer group ensures exactly one pod
+# owns each topic partition at a time.
+#
+# Security context is the same as the control plane:
+#   readOnlyRootFilesystem: true  — consumer binary is read-only
+#   capabilities drop ALL         — no elevated privileges needed
+#   runAsNonRoot: true            — uid 1001 (nexus user in Dockerfile.server)
+#
+# The consumer does NOT need the Docker socket or the submissions PVC.
+# Its only external dependencies are Redpanda (read) and TimescaleDB (write),
+# both of which are reached over TCP within the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: consumer
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: consumer
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: consumer
+        app.kubernetes.io/component: consumer
+        app.kubernetes.io/part-of: nexusbench
+      annotations:
+        prometheus.io/scrape: "false"   # consumer does not expose /metrics
+    spec:
+      # Schedule on the control-plane node pool (on-demand, stateful services).
+      # Local dev: label your single node with role=control-plane, or use the
+      # temporary kubectl patch procedure described in worker/deployment.yaml.
+      nodeSelector:
+        role: control-plane
+
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: consumer
+          image: nexusbench/control-plane:latest   # same image, different entrypoint
+          imagePullPolicy: IfNotPresent
+          command: ["/app/consumer"]
+          env:
+            # Non-secret config from ConfigMap.
+            - name: REDPANDA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: nexusbench-config
+                  key: REDPANDA_BROKERS
+            - name: CONSUMER_GROUP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: nexusbench-config
+                  key: CONSUMER_GROUP_ID
+            # DSN comes from the Secret — password never in ConfigMap.
+            - name: TIMESCALE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: nexusbench-secrets
+                  key: timescale-dsn
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

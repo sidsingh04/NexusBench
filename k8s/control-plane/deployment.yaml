@@ -1,0 +1,136 @@
+# k8s/control-plane/deployment.yaml
+#
+# NexusBench control-plane Deployment.
+#
+# The control plane is stateless from a request perspective — all durable
+# state lives in TimescaleDB (results) and Redpanda (job queue). However it
+# does need access to the submissions PVC to serve uploaded archives to
+# workers and to write newly ingested archives. This is why replicas is kept
+# at 1: two replicas sharing a ReadWriteOnce PVC would cause a scheduling
+# conflict. To scale horizontally, switch the PVC to ReadWriteMany (GCS FUSE
+# or NFS) and set replicas > 1.
+#
+# Security context:
+#   readOnlyRootFilesystem: true — the binary cannot write to its own image
+#   layers. The only writable paths are:
+#     /data/submissions — PVC mount (contestant archives)
+#     /tmp              — emptyDir for multipart form temp files
+#   Both are explicit volume mounts. Any unexpected write (e.g. a memory
+#   corruption bug trying to overwrite the binary) will SIGBUS immediately.
+#
+# Docker socket:
+#   The control plane does NOT get the Docker socket. In Phase 1/2 local mode,
+#   the server managed containers directly. In distributed mode (DISTRIBUTED_MODE=true),
+#   workers own the Docker socket. The control plane only enqueues jobs and
+#   serves the API — no container management needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  # Rolling update: bring one new pod up before terminating the old one.
+  # MaxSurge=1 / MaxUnavailable=0 means zero downtime during deploys.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-plane
+        app.kubernetes.io/component: control-plane
+        app.kubernetes.io/part-of: nexusbench
+      annotations:
+        # Force a pod restart when the ConfigMap changes, even if the image
+        # tag hasn't changed. kubectl rollout restart triggers this.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Schedule on the control-plane node pool (on-demand, stateful services).
+      # Local dev: label your single node with role=control-plane, or use the
+      # temporary kubectl patch procedure described in worker/deployment.yaml.
+      nodeSelector:
+        role: control-plane
+
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: control-plane
+          # CI replaces REGISTRY and TAG before applying.
+          image: nexusbench/control-plane:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: nexusbench-config
+          # NODE_IP is injected via the Downward API so the control plane can
+          # include it in job payloads (workers need the node IP to reach sandbox
+          # ports published on the host network).
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: submissions
+              mountPath: /data/submissions
+            # /tmp is needed for multipart form file buffering during uploads.
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: submissions
+          persistentVolumeClaim:
+            claimName: submissions-data
+        # emptyDir for /tmp — ephemeral, lives only as long as the pod.
+        - name: tmp
+          emptyDir: {}

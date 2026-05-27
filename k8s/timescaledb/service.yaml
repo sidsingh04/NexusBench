@@ -1,0 +1,23 @@
+# k8s/timescaledb/service.yaml
+#
+# ClusterIP Service for TimescaleDB.
+# Only internal services (consumer, control-plane for health checks) should
+# reach this. NetworkPolicies enforce this — workers are explicitly blocked
+# from reaching port 5432 by the default-deny-all + allow-consumer-egress rules.
+apiVersion: v1
+kind: Service
+metadata:
+  name: timescaledb
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: timescaledb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  selector:
+    app.kubernetes.io/name: timescaledb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

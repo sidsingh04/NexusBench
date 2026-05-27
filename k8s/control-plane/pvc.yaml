@@ -1,0 +1,49 @@
+# k8s/control-plane/pvc.yaml
+#
+# PersistentVolumeClaim for contestant submission archives.
+#
+# This PVC is shared between:
+#   • control-plane — writes incoming archives on upload
+#   • worker pods   — reads archives (readOnly: true mount) to extract and run
+#
+# ReadWriteOnce (RWO) is sufficient as long as the control-plane Deployment
+# has replicas=1 and worker pods are on the same node as any co-located
+# control-plane pod. In our architecture, control-plane and workers are on
+# DIFFERENT node pools — the control-plane pod is on the control-plane pool
+# and workers are on the worker pool on different nodes.
+#
+# This means RWO will NOT work for the worker→PVC read path across nodes.
+# Two options:
+#
+#   Option A (current, simpler): Workers receive the archive path in the Job
+#   payload and fetch the archive bytes from the control-plane API over HTTP
+#   instead of reading the PVC directly. The worker executor downloads the
+#   archive, extracts it to a local emptyDir, and runs the sandbox from there.
+#   This makes the PVC only needed on the control-plane node (RWO is fine).
+#
+#   Option B (future): Switch to ReadWriteMany (GCS FUSE / Filestore / NFS)
+#   when you want workers to read archives directly from the shared volume.
+#   Requires a CSI driver (e.g. Cloud Filestore CSI) and a StorageClass that
+#   supports RWX.
+#
+# We implement Option A here. The PVC is RWO and is only mounted by the
+# single control-plane pod. Workers receive archive content via the job payload.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: submissions-data
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName intentionally omitted — uses the cluster's default
+  # StorageClass. GKE default: pd-balanced. Docker Desktop: hostpath.
+  # Do not set this to "standard" — it does not exist on Docker Desktop.
+  resources:
+    requests:
+      # 50Gi supports ~200 submissions at 256 MiB each with headroom.
+      storage: 50Gi
