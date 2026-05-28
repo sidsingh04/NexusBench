@@ -35,7 +35,7 @@ func main() {
 	cfg := config.Load()
 
 	// ── Submission directory ──────────────────────────────────────────────────
-	if err := os.MkdirAll(cfg.SubmissionDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.SubmissionDir, 0o750); err != nil {
 		slog.Error("cannot create submission directory",
 			"path", cfg.SubmissionDir, "err", err)
 		os.Exit(1)

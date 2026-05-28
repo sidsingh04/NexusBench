@@ -56,8 +56,11 @@ linters:
     gosec:
       excludes:
         - G104  # covered by errcheck
+        - G301  # 0o750/0o755 directory permissions are intentional in this codebase
         - G304  # intentional: user-provided archive paths
         - G307  # false positive: deferred close pattern
+        - G118  # goroutines using context.WithoutCancel are intentional (log tailing, async deploy)
+        - G120  # ParseMultipartForm is bounded by MaxBytesReader set immediately before
 
     misspell:
       locale: US
@@ -86,3 +89,10 @@ issues:
     - path: "internal/metrics/metrics.go"
       linters:
         - gochecknoglobals
+
+    # ST1000 fires on every file in a package — suppress on secondary files
+    # where the package comment already exists in the primary file.
+    - path: "internal/config/dir_unix.go"
+      linters:
+        - staticcheck
+      text: "ST1000"

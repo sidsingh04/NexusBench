@@ -1,3 +1,4 @@
+// Package models provides the core data structures.
 package models
 
 import "time"

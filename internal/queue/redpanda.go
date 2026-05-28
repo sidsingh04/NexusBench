@@ -1,5 +1,4 @@
-// RedpandaQueue implements Queue using Redpanda (Kafka-compatible) as the
-// durable job bus.
+// Package queue implements a durable job bus using Redpanda (Kafka-compatible).
 //
 // Topic: jobs.benchmark
 //   - One partition per worker is the ideal steady-state. For Stage 3.1

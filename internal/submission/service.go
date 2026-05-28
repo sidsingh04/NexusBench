@@ -39,7 +39,7 @@ type DiskStore struct {
 }
 
 func NewDiskStore(baseDir string) *DiskStore {
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+	if err := os.MkdirAll(baseDir, 0o750); err != nil {
 		slog.Error("failed to create submission dir", "path", baseDir, "err", err)
 	}
 	return &DiskStore{baseDir: baseDir}
@@ -53,7 +53,7 @@ func (s *DiskStore) Save(sub *models.Submission) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dir := filepath.Join(s.baseDir, sub.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	return writeJSON(s.metaPath(sub.ID), sub)
@@ -215,7 +215,7 @@ func (s *Service) Ingest(
 		slog.Info("submission dispatched to worker queue", "id", id, "job_id", j.ID)
 	} else {
 		// Local mode (Phase 1/2): deploy in this process. Unchanged behavior.
-		go s.deployAsync(sub)
+		go s.deployAsync(context.WithoutCancel(ctx), sub)
 	}
 
 	return sub, nil
@@ -223,13 +223,13 @@ func (s *Service) Ingest(
 
 // deployAsync picks the pre-built image for this submission's language
 // and spins it up as a container. Only called in local (Phase 1/2) mode.
-func (s *Service) deployAsync(sub *models.Submission) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.SandboxTimeout)
+func (s *Service) deployAsync(ctx context.Context, sub *models.Submission) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, s.cfg.SandboxTimeout)
 	defer cancel()
 
 	s.setStatus(sub, models.StatusDeploying, fmt.Sprintf("starting %s container", sub.Language))
 
-	containerID, exposedPort, err := s.docker.Deploy(ctx, sub)
+	containerID, exposedPort, err := s.docker.Deploy(timeoutCtx, sub)
 	if err != nil {
 		slog.Error("sandbox deploy failed", "id", sub.ID, "err", err)
 		s.setStatus(sub, models.StatusFailed, fmt.Sprintf("deploy error: %v", err))
@@ -289,7 +289,7 @@ func (s *Service) StopContainer(ctx context.Context, id string) error {
 //	We check the full filename suffix manually to preserve compound extensions.
 func (s *Service) storeArchive(id string, fh *multipart.FileHeader) (string, error) {
 	dir := filepath.Join(s.cfg.SubmissionDir, id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", err
 	}
 
@@ -306,7 +306,7 @@ func (s *Service) storeArchive(id string, fh *multipart.FileHeader) (string, err
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	if _, err := io.Copy(out, src); err != nil {
 		return "", err
@@ -357,7 +357,7 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
@@ -368,6 +368,6 @@ func readJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return json.NewDecoder(f).Decode(v)
 }

@@ -1,3 +1,4 @@
+// Package config provides configuration loading for NexusBench.
 package config
 
 import (

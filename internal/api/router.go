@@ -1,3 +1,4 @@
+// Package api provides the HTTP router and handlers.
 package api
 
 import (
@@ -109,6 +110,7 @@ func (h *handler) listImages(w http.ResponseWriter, r *http.Request) {
 func (h *handler) createSubmission(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes)
 
+	//nolint:gosec // bounded by MaxBytesReader
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_FORM", "failed to parse multipart form: "+err.Error())
 		return

@@ -53,7 +53,7 @@ func main() {
 	defer stop()
 
 	// ── Submission store ──────────────────────────────────────────────────────
-	if err := os.MkdirAll(cfg.SubmissionDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.SubmissionDir, 0o750); err != nil {
 		slog.Error("worker: cannot create submission dir",
 			"path", cfg.SubmissionDir, "err", err)
 		os.Exit(1)

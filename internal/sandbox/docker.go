@@ -226,7 +226,7 @@ func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (con
 		"submission_id", sub.ID,
 	)
 
-	go m.tailLogs(resp.ID, sub.ID)
+	go m.tailLogs(context.WithoutCancel(ctx), resp.ID, sub.ID)
 	return resp.ID, hostPort, nil
 }
 
@@ -322,8 +322,7 @@ func buildEnv(sub *models.Submission) []string {
 	}
 }
 
-func (m *DockerManager) tailLogs(containerID, submissionID string) {
-	ctx := context.Background()
+func (m *DockerManager) tailLogs(ctx context.Context, containerID, submissionID string) {
 	reader, err := m.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
@@ -375,16 +374,16 @@ func (m *DockerManager) injectArchive(ctx context.Context, containerID string, a
 
 	pr, pw := io.Pipe()
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		tw := tar.NewWriter(pw)
-		defer tw.Close()
+		defer func() { _ = tw.Close() }()
 
 		file, err := os.Open(archivePath)
 		if err != nil {
 			pw.CloseWithError(err)
 			return
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 
 		hdr := &tar.Header{
 			Name: filepath.Base(archivePath),
