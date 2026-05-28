@@ -26,17 +26,22 @@ concurrency:
 
 env:
   GO_VERSION: "1.25.x"
+  # Opt into Node.js 24 globally for all jobs to suppress the deprecation
+  # warning that becomes a hard failure after September 2026.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── Job 1: lint ────────────────────────────────────────────────────────────
+  #
+  # Installs golangci-lint via the official install script (not the GitHub
+  # Action). This avoids the golangci-lint-action's bundled Go toolchain,
+  # which cannot parse export data produced by Go 1.25+ (exit code 3,
+  # "unsupported version: 2"). Installing directly gives us the latest
+  # release whose internal toolchain is always in sync with the runner's Go.
   lint:
     name: Lint (golangci-lint)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      # Opt into Node.js 24 now to avoid the forced migration failure
-      # after September 2026 when Node.js 20 is removed from runners.
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,23 +51,24 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Install golangci-lint
+        run: |
+          # Install the latest golangci-lint release via the official script.
+          # Pinning to @latest ensures the bundled Go analyser supports the
+          # current toolchain (Go 1.25). The action wrapper (golangci-lint-action)
+          # ships its own stale Go toolchain which caused exit code 3 failures.
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" latest
+          golangci-lint --version
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          # Do NOT pin a specific version here.
-          # v1.59.1 ships an internal Go toolchain that cannot parse export
-          # data produced by Go 1.25+ ("unsupported version: 2" typecheck error).
-          # Omitting version resolves the latest release, which supports the
-          # current toolchain. Mirrors the fix applied during local testing.
-          args: --timeout=5m
+        run: golangci-lint run --timeout=5m ./...
 
   # ── Job 2: unit-tests ──────────────────────────────────────────────────────
   unit-tests:
     name: Unit Tests (race + coverage)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
