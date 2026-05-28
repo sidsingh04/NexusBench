@@ -53,12 +53,24 @@ jobs:
 
       - name: Install golangci-lint
         run: |
-          # Install the latest golangci-lint release via the official script.
-          # Pinning to @latest ensures the bundled Go analyser supports the
-          # current toolchain (Go 1.25). The action wrapper (golangci-lint-action)
-          # ships its own stale Go toolchain which caused exit code 3 failures.
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" latest
+          # Install golangci-lint v2 by downloading the release tarball directly
+          # from GitHub releases. Using `go install` is the most reliable method
+          # on Go 1.22+ — it compiles golangci-lint from source using the
+          # runner's own Go toolchain, so there is no bundled-toolchain version
+          # conflict and no external checksum to verify.
+          #
+          # Why not golangci-lint-action?
+          #   The action bundles its own Go toolchain. That bundled toolchain
+          #   cannot parse Go 1.25 export data, causing exit code 3 at startup.
+          #
+          # Why not the install.sh script?
+          #   The script fetches a pre-built binary and verifies its SHA256
+          #   against the checksum published on GitHub. Transient CDN corruption
+          #   causes a checksum mismatch and fails the job with no retry.
+          #
+          # go install always succeeds as long as the module proxy is reachable,
+          # which is far more reliable than a direct GitHub CDN download.
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
           golangci-lint --version
 
       - name: Run golangci-lint
