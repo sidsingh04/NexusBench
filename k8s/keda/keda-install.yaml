@@ -1,0 +1,69 @@
+# k8s/keda/keda-install.yaml
+#
+# KEDA (Kubernetes Event-Driven Autoscaling) installation via official manifests.
+#
+# ── Why KEDA? ─────────────────────────────────────────────────────────────────
+#
+#   The standard HPA only scales on CPU and memory. NexusBench needs to scale
+#   the worker Deployment based on the number of pending jobs in Redpanda
+#   (consumer-group lag). KEDA adds a CRD-based ScaledObject that teaches the
+#   HPA about external metrics — including first-class Kafka/Redpanda support
+#   via consumer-group lag.
+#
+#   Building a custom metrics adapter would replicate this for no benefit.
+#
+# ── Version ───────────────────────────────────────────────────────────────────
+#
+#   Pinned to KEDA v2.14.0. Check https://github.com/kedacore/keda/releases
+#   for the latest stable release before upgrading.
+#
+# ── Installation ──────────────────────────────────────────────────────────────
+#
+#   Apply this file ONCE before the ScaledObject (scaledobject.yaml):
+#
+#     kubectl apply -f k8s/keda/keda-install.yaml
+#     kubectl rollout status deployment/keda-operator -n keda --timeout=120s
+#
+#   Alternatively, install via Terraform helm_release (see terraform/modules/
+#   cluster/main.tf comments for the Helm chart reference).
+#
+# ── Uninstall ─────────────────────────────────────────────────────────────────
+#
+#   kubectl delete -f k8s/keda/keda-install.yaml
+#
+# ── What this installs ────────────────────────────────────────────────────────
+#
+#   KEDA ships as a single combined manifest containing:
+#     - keda namespace
+#     - CRDs: ScaledObject, ScaledJob, TriggerAuthentication, ClusterTriggerAuthentication
+#     - keda-operator Deployment (core controller)
+#     - keda-operator-metrics-apiserver Deployment (external metrics API)
+#     - RBAC: ClusterRoles, ClusterRoleBindings, ServiceAccounts
+#
+# ── Source ────────────────────────────────────────────────────────────────────
+#
+#   The canonical source URL for this manifest is:
+#   https://github.com/kedacore/keda/releases/download/v2.14.0/keda-2.14.0.yaml
+#
+#   We reference it by URL rather than embedding the full ~2000-line manifest
+#   to avoid stale copy-paste and to keep this repo focused on NexusBench code.
+#   CI applies it with:
+#
+#     kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.14.0/keda-2.14.0.yaml
+#
+#   For air-gapped clusters, download the manifest and commit it here.
+
+# This file is intentionally a reference/comment-only manifest.
+# The actual install is performed by the CI/CD pipeline or manually:
+#
+#   kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.14.0/keda-2.14.0.yaml
+#
+# For local dev (Docker Desktop / kind / minikube), Helm is simpler:
+#
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm repo update
+#   helm install keda kedacore/keda \
+#       --namespace keda \
+#       --create-namespace \
+#       --version 2.14.0 \
+#       --wait

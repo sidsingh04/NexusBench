@@ -10,6 +10,11 @@ package queue_test
 //   TestMemoryQueue_CloseUnblocksDequeue     — Close unblocks a waiting Dequeue
 //   TestMemoryQueue_BufferFull               — Enqueue returns error when buffer full
 //   TestMemoryQueue_CommitJobIsNoOp          — CommitJob never errors
+//   TestMemoryQueue_QueueDepth_Empty         — QueueDepth returns 0 on empty queue
+//   TestMemoryQueue_QueueDepth_AfterEnqueue  — QueueDepth tracks enqueued jobs
+//   TestMemoryQueue_QueueDepth_AfterDequeue  — QueueDepth decrements after Dequeue
+//   TestMemoryQueue_QueueDepth_Unbuffered    — QueueDepth always 0 for unbuffered queue
+//   TestMemoryQueue_QueueDepth_CancelledCtx  — QueueDepth returns 0, nil on cancelled ctx
 //   TestNewJob_FieldMapping                  — NewJob copies all fields from Submission
 //   TestJob_JSONRoundTrip                    — Job survives JSON marshal/unmarshal
 
@@ -78,7 +83,6 @@ func TestMemoryQueue_DequeueBlocksUntilJob(t *testing.T) {
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		if err := q.Enqueue(ctx, j); err != nil {
-			// t.Errorf is not goroutine-safe after t returns; best effort.
 			_ = err
 		}
 	}()
@@ -93,7 +97,6 @@ func TestMemoryQueue_DequeueBlocksUntilJob(t *testing.T) {
 	if got.SubmissionID != j.SubmissionID {
 		t.Errorf("SubmissionID: got %q, want %q", got.SubmissionID, j.SubmissionID)
 	}
-	// Must have blocked for at least 15ms (goroutine delay is 20ms).
 	if elapsed < 15*time.Millisecond {
 		t.Errorf("Dequeue returned too quickly (%v); expected blocking", elapsed)
 	}
@@ -143,7 +146,6 @@ func TestMemoryQueue_CloseUnblocksDequeue(t *testing.T) {
 
 func TestMemoryQueue_BufferFull(t *testing.T) {
 	t.Parallel()
-	// Buffer of 1: second Enqueue should fail immediately.
 	q := queue.NewMemoryQueue(1)
 	ctx := context.Background()
 
@@ -163,11 +165,152 @@ func TestMemoryQueue_CommitJobIsNoOp(t *testing.T) {
 	q := queue.NewMemoryQueue(4)
 	ctx := context.Background()
 
-	// CommitJob without a preceding Dequeue must be a no-op, not a panic.
 	if err := q.CommitJob(ctx); err != nil {
 		t.Errorf("CommitJob (no-op): unexpected error: %v", err)
 	}
 }
+
+// ── QueueDepth tests ──────────────────────────────────────────────────────────
+
+// TestMemoryQueue_QueueDepth_Empty verifies that a freshly created queue
+// reports depth 0 before any jobs are enqueued.
+func TestMemoryQueue_QueueDepth_Empty(t *testing.T) {
+	t.Parallel()
+	q := queue.NewMemoryQueue(8)
+	ctx := context.Background()
+
+	depth, err := q.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("QueueDepth on empty queue: unexpected error: %v", err)
+	}
+	if depth != 0 {
+		t.Errorf("QueueDepth = %d on empty queue, want 0", depth)
+	}
+}
+
+// TestMemoryQueue_QueueDepth_AfterEnqueue verifies that QueueDepth increases
+// by 1 for each job enqueued and matches the enqueued count exactly.
+func TestMemoryQueue_QueueDepth_AfterEnqueue(t *testing.T) {
+	t.Parallel()
+	const jobCount = 5
+	q := queue.NewMemoryQueue(jobCount + 2) // extra headroom
+	ctx := context.Background()
+
+	for i := 0; i < jobCount; i++ {
+		sub := makeSubmission("sub-depth-enq", "team-enq", models.LangGo)
+		if err := q.Enqueue(ctx, queue.NewJob(sub)); err != nil {
+			t.Fatalf("Enqueue[%d]: %v", i, err)
+		}
+
+		depth, err := q.QueueDepth(ctx)
+		if err != nil {
+			t.Fatalf("QueueDepth after enqueue[%d]: %v", i, err)
+		}
+		want := int64(i + 1)
+		if depth != want {
+			t.Errorf("after enqueue[%d]: QueueDepth = %d, want %d", i, depth, want)
+		}
+	}
+}
+
+// TestMemoryQueue_QueueDepth_AfterDequeue verifies that QueueDepth decrements
+// correctly as jobs are consumed.
+func TestMemoryQueue_QueueDepth_AfterDequeue(t *testing.T) {
+	t.Parallel()
+	const jobCount = 4
+	q := queue.NewMemoryQueue(jobCount)
+	ctx := context.Background()
+
+	// Fill the queue.
+	for i := 0; i < jobCount; i++ {
+		sub := makeSubmission("sub-depth-deq", "team-deq", models.LangRust)
+		if err := q.Enqueue(ctx, queue.NewJob(sub)); err != nil {
+			t.Fatalf("Enqueue[%d]: %v", i, err)
+		}
+	}
+
+	// Verify starting depth.
+	depth, err := q.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("QueueDepth (full): %v", err)
+	}
+	if depth != int64(jobCount) {
+		t.Errorf("QueueDepth (full) = %d, want %d", depth, jobCount)
+	}
+
+	// Consume one by one and verify depth decrements.
+	for i := 0; i < jobCount; i++ {
+		if _, err := q.Dequeue(ctx); err != nil {
+			t.Fatalf("Dequeue[%d]: %v", i, err)
+		}
+		depth, err := q.QueueDepth(ctx)
+		if err != nil {
+			t.Fatalf("QueueDepth after dequeue[%d]: %v", i, err)
+		}
+		want := int64(jobCount - i - 1)
+		if depth != want {
+			t.Errorf("after dequeue[%d]: QueueDepth = %d, want %d", i, depth, want)
+		}
+	}
+}
+
+// TestMemoryQueue_QueueDepth_Unbuffered verifies that an unbuffered (cap=0)
+// MemoryQueue always reports depth 0 — there is no buffer to measure.
+func TestMemoryQueue_QueueDepth_Unbuffered(t *testing.T) {
+	t.Parallel()
+	q := queue.NewMemoryQueue(0) // unbuffered
+	ctx := context.Background()
+
+	depth, err := q.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("QueueDepth on unbuffered queue: %v", err)
+	}
+	if depth != 0 {
+		t.Errorf("QueueDepth on unbuffered queue = %d, want 0", depth)
+	}
+}
+
+// TestMemoryQueue_QueueDepth_CancelledCtx verifies that QueueDepth does not
+// block on a cancelled context — the MemoryQueue implementation is non-blocking
+// and should return (0, nil) even when ctx is already cancelled.
+func TestMemoryQueue_QueueDepth_CancelledCtx(t *testing.T) {
+	t.Parallel()
+	q := queue.NewMemoryQueue(4)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	// QueueDepth must not block even with a cancelled ctx. It should return
+	// quickly because MemoryQueue's implementation uses len(ch) — no I/O.
+	done := make(chan struct{})
+	go func() {
+		depth, err := q.QueueDepth(ctx)
+		if err != nil {
+			t.Errorf("QueueDepth with cancelled ctx: unexpected error: %v", err)
+		}
+		if depth != 0 {
+			t.Errorf("QueueDepth with cancelled ctx = %d, want 0", depth)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// passed
+	case <-time.After(100 * time.Millisecond):
+		t.Error("QueueDepth blocked with cancelled ctx — should be non-blocking")
+	}
+}
+
+// TestMemoryQueue_QueueDepth_SatisfiesInterface ensures *MemoryQueue can be
+// assigned to the Queue interface — a compile-time check that QueueDepth is
+// correctly implemented. If this file compiles, the test trivially passes.
+func TestMemoryQueue_QueueDepth_SatisfiesInterface(t *testing.T) {
+	t.Parallel()
+	var _ queue.Queue = queue.NewMemoryQueue(1)
+}
+
+// ── Existing tests (unchanged) ────────────────────────────────────────────────
 
 func TestNewJob_FieldMapping(t *testing.T) {
 	t.Parallel()
@@ -234,7 +377,6 @@ func TestJob_JSONRoundTrip(t *testing.T) {
 	if decoded.ArchivePath != original.ArchivePath {
 		t.Errorf("ArchivePath: got %q, want %q", decoded.ArchivePath, original.ArchivePath)
 	}
-	// Time comparison: JSON marshals to RFC3339Nano; verify round-trip is lossless.
 	if !decoded.EnqueuedAt.Equal(original.EnqueuedAt) {
 		t.Errorf("EnqueuedAt: got %v, want %v", decoded.EnqueuedAt, original.EnqueuedAt)
 	}

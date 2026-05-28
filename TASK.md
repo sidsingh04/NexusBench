@@ -253,7 +253,7 @@ make k8s-validate
 
 ## Stage 4.3 — Autoscaling (HPA on Queue Depth)
 
-> **Status: ⏳ Pending**
+> **Status: ✅ Complete**
 
 ### Goal
 
@@ -284,12 +284,12 @@ window on scale-down (so a brief burst doesn't cause flapping).
 
 #### 4.3.1 — KEDA installation
 
-- [ ] Add KEDA to Terraform: `helm_release` resource for `kedacore/keda` chart, pinned version
-- [ ] Alternatively, add `k8s/keda/` manifest install as a pre-step in CI
+- [x] Add KEDA to Terraform: `helm_release` resource for `kedacore/keda` chart, pinned version
+- [x] Alternatively, add `k8s/keda/` manifest install as a pre-step in CI
 
 #### 4.3.2 — KEDA ScaledObject
 
-- [ ] Create `k8s/worker/scaledobject.yaml`
+- [x] Create `k8s/worker/scaledobject.yaml`
   - `scaleTargetRef`: worker Deployment
   - `minReplicaCount: 1`, `maxReplicaCount: 10`
   - `cooldownPeriod: 30` (seconds before scale-down after queue drains)
@@ -299,27 +299,46 @@ window on scale-down (so a brief burst doesn't cause flapping).
     - `topic`: `jobs.benchmark`
     - `lagThreshold: "5"` (1 extra worker per 5 unprocessed messages)
   - `advanced.restoreToOriginalReplicaCount: false` (don't snap to original)
+  - `advanced.horizontalPodAutoscalerConfig.behavior` — scale-up immediately (5 pods/15s), scale-down slowly (1 pod/30s)
+  - `pollingInterval: 15` — matches Prometheus scrape interval
 
 #### 4.3.3 — Internal metric for `internal/queue`
 
-- [ ] Add `QueueDepth(ctx) (int64, error)` method to the `Queue` interface in `internal/queue`
-- [ ] Implement on `RedpandaQueue` using `kadm.Client.Lag()` — single `ListConsumerGroupOffsets` + `FetchOffsets` call
-- [ ] Implement stub on `MemoryQueue` (returns `len(queue)`)
-- [ ] Expose queue depth on a new Prometheus gauge `nexusbench_queue_depth` in `internal/metrics`
-- [ ] Wire into control plane: scrape the gauge every 15s in a background goroutine
+- [x] Add `QueueDepth(ctx) (int64, error)` method to the `Queue` interface in `internal/queue`
+- [x] Implement on `RedpandaQueue` using `kadm.Client.ListEndOffsets` + `kadm.Client.FetchOffsets` — compute lag as sum(end - committed) across all partitions
+- [x] Implement on `MemoryQueue` (returns `int64(len(ch))`, non-blocking)
+- [x] Expose queue depth on a new Prometheus gauge `nexusbench_queue_depth` in `internal/metrics` with `SetQueueDepth(int64)` helper (negative values clamped to 0)
+- [x] Wire into control plane: `runQueueDepthScraper` goroutine fires immediately on startup then every 15s; uses a 5s per-poll context timeout; distributed mode only
 
 #### 4.3.4 — Tests
 
-- [ ] Unit test `QueueDepth` on `MemoryQueue` — verify depth matches enqueued count
-- [ ] Unit test Prometheus gauge increments/decrements correctly
+- [x] `TestMemoryQueue_QueueDepth_Empty` — depth is 0 on empty queue
+- [x] `TestMemoryQueue_QueueDepth_AfterEnqueue` — depth tracks enqueued count step-by-step
+- [x] `TestMemoryQueue_QueueDepth_AfterDequeue` — depth decrements correctly after each Dequeue
+- [x] `TestMemoryQueue_QueueDepth_Unbuffered` — always 0 for cap=0 queue
+- [x] `TestMemoryQueue_QueueDepth_CancelledCtx` — non-blocking even with cancelled context
+- [x] `TestMemoryQueue_QueueDepth_SatisfiesInterface` — compile-time check *MemoryQueue implements Queue
+- [x] `TestSetQueueDepth_InitiallyZero` — gauge reads 0 before any call
+- [x] `TestSetQueueDepth_UpdatesGauge` — overwrites (not accumulates) on each call
+- [x] `TestSetQueueDepth_Zero` — resets gauge to 0
+- [x] `TestSetQueueDepth_NegativeClamped` — negative values clamped to 0
+- [x] `TestSetQueueDepth_MetricNamePresent` — descriptor appears in /metrics output
+- [x] `TestSetQueueDepth_IsolatedFromOtherRegistries` — two registries are independent
 
-#### 4.3.5 — Smoke test (requires cluster)
+#### 4.3.6 — Post-smoke-test fixes (applied during live run)
 
-- [ ] Script `scripts/smoke_test_phase4_stage3.sh`
-  - Enqueue 20 synthetic jobs
-  - Assert worker replicas scale above 1 within 60s
-  - Drain queue (cancel all jobs)
-  - Assert replicas return to 1 within 90s
+- [x] `scripts/smoke_test_phase4_stage3.sh` — python stub detection (Windows Store alias guard), pass file path via `sys.argv[1]` so Git Bash path translation works, `--server-side` in KEDA failure hint, removed `tee /dev/stderr` pipeline hang
+- [x] `k8s/keda/keda-install.yaml` — both install commands updated to `kubectl apply --server-side` to bypass 256KB CRD annotation limit
+- [x] `k8s/network-policies/allow-redpanda-ingress.yaml` — added `namespaceSelector: kubernetes.io/metadata.name: keda` ingress rule on port 9092 so KEDA operator can read consumer-group lag from Redpanda across namespaces
+
+**Known operational gotchas documented (no code change needed):**
+- Docker Desktop restart wipes node labels — re-apply with `kubectl label node docker-desktop role=control-plane --overwrite`
+- Wait for pod `Ready` before starting `kubectl port-forward` to avoid race condition on port 8080
+- KEDA uses exponential backoff on broker failures — allow 2-3 minutes for recovery after Redpanda restarts
+
+- [x] Script `scripts/smoke_test_phase4_stage3.sh`
+  - `--dry-run` mode (default/CI): validates ScaledObject YAML fields, KEDA install reference, runs Go unit tests
+  - `--live` mode: checks KEDA operator running, applies ScaledObject, enqueues 20 jobs, asserts scale-up within 60s, drains queue, asserts scale-down within 90s
 
 ### Gate — Stage 4.3
 

@@ -9,8 +9,8 @@
 //     does not break in-flight jobs.
 //
 //  2. The Queue interface is intentionally narrow: Enqueue, Dequeue, CommitJob,
-//     Close. Richer operations (cancel, inspect, prioritise) belong to a
-//     scheduler layer built on top, not in this package.
+//     QueueDepth, Close. Richer operations (cancel, inspect, prioritise) belong
+//     to a scheduler layer built on top, not in this package.
 //
 //  3. This file has NO external dependencies — only stdlib. Any component
 //     can import queue.Job without pulling in Redpanda or any I/O library.
@@ -102,6 +102,21 @@ type Queue interface {
 	// Must be called after the job has been durably completed.
 	// Calling CommitJob without a preceding Dequeue is a safe no-op.
 	CommitJob(ctx context.Context) error
+
+	// QueueDepth returns the number of unconsumed (pending) jobs in the queue.
+	//
+	// For RedpandaQueue this is the consumer-group lag on the jobs.benchmark
+	// topic: the number of messages produced but not yet committed by any
+	// worker. KEDA reads the same lag metric directly from the broker; this
+	// method gives the control plane an in-process view for Prometheus.
+	//
+	// For MemoryQueue this is the number of jobs currently sitting in the
+	// in-memory channel buffer (len of the channel).
+	//
+	// Implementations must be non-blocking and return within the context
+	// deadline. A best-effort estimate is acceptable (e.g. the lag value
+	// may lag real-time by a few seconds).
+	QueueDepth(ctx context.Context) (int64, error)
 
 	// Close flushes any buffered produce records, commits pending offsets,
 	// and releases transport resources.

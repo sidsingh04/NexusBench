@@ -17,6 +17,7 @@ import (
 //     Go channel semantics and is useful for tightly-synchronised tests.
 //
 // CommitJob is a no-op — in-memory delivery has no offset to commit.
+// QueueDepth returns len(ch) — the current number of buffered jobs.
 type MemoryQueue struct {
 	ch     chan Job
 	mu     sync.Mutex
@@ -82,6 +83,14 @@ func (m *MemoryQueue) Dequeue(ctx context.Context) (Job, error) {
 // at-most-once and there is no offset to commit.
 func (m *MemoryQueue) CommitJob(_ context.Context) error {
 	return nil
+}
+
+// QueueDepth returns the number of jobs currently buffered in the channel.
+//
+// For unbuffered queues (cap == 0) this is always 0 — no buffering exists.
+// This is safe to call concurrently and never blocks.
+func (m *MemoryQueue) QueueDepth(_ context.Context) (int64, error) {
+	return int64(len(m.ch)), nil
 }
 
 // Close closes the underlying channel. Subsequent Dequeue calls return an

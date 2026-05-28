@@ -51,6 +51,10 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: consumer
+        # KEDA needs access to port 9092 to check consumer-group lag for autoscaling.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keda
       ports:
         - port: 9092
           protocol: TCP

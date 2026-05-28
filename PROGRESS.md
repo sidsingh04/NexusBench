@@ -102,7 +102,7 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 |-------|-------------|--------|
 | 4.1 | Terraform Cloud Provisioning — VPC, managed K8s cluster, two node pools (on-demand control-plane + spot worker), container registry | ✅ Complete |
 | 4.2 | Kubernetes Manifests — all seven services deployed, zero-trust NetworkPolicies, RBAC, PodDisruptionBudgets, read-only worker mounts | ✅ Complete |
-| 4.3 | Autoscaling — KEDA ScaledObject on Redpanda consumer-group lag; `QueueDepth` method on `Queue` interface; Prometheus gauge | ⏳ Pending |
+| 4.3 | Autoscaling — KEDA ScaledObject on Redpanda consumer-group lag; `QueueDepth` method on `Queue` interface; Prometheus gauge; dry-run + live smoke tests passing | ✅ Complete |
 | 4.4 | CI/CD Pipeline — GitHub Actions: lint + test + tf-validate + k8s-validate on PRs; build + push + rolling deploy on `main` | ⏳ Pending |
 
 ### New files planned
@@ -166,7 +166,38 @@ k8s/
 | `k8s/network-policies/allow-timescaledb-ingress.yaml` | Added after live-cluster testing. Permits port 5432 from consumer + control-plane only; workers explicitly excluded |
 | `scripts/smoke_test_phase4_stage2.sh` | Two modes: `--dry-run` (kubeconform offline schema validation, python3 YAML syntax fallback) and `--live` (apply + rollout wait + HTTP health check + NetworkPolicy connectivity audit with `kubectl wait` before `nc -z` to eliminate race condition) |
 
-### Stage 4.2 — Post-deployment fixes applied
+### Stage 4.3 — What was built
+
+**7 files created/updated across `k8s/`, `internal/`, `cmd/`, and `scripts/`.**
+
+| File | Key decisions |
+|---|---|
+| `k8s/keda/keda-install.yaml` | Reference/comment manifest documenting KEDA v2.14.0 install procedure via `kubectl apply` or Helm; kept as a doc artifact rather than embedding the 2000-line upstream manifest to avoid stale copy-paste |
+| `k8s/worker/scaledobject.yaml` | KEDA `ScaledObject` targeting the worker `Deployment`; kafka trigger on `jobs.benchmark` topic, `consumerGroup: nexusbench-workers`, `lagThreshold: "5"`; `minReplicaCount: 1` (one warm worker always up), `maxReplicaCount: 10`; `cooldownPeriod: 30s`, `pollingInterval: 15s`; HPA behavior: scale-up by 5 pods/15s immediately, scale-down by 1 pod/30s; `restoreToOriginalReplicaCount: false` |
+| `internal/queue/job.go` | Added `QueueDepth(ctx context.Context) (int64, error)` to the `Queue` interface with full godoc explaining the contract for both implementations |
+| `internal/queue/memory.go` | Implements `QueueDepth` as `int64(len(m.ch))` — zero-allocation, non-blocking, safe to call with a cancelled ctx |
+| `internal/queue/redpanda.go` | Implements `QueueDepth` via two admin RPCs: `adminCl.ListEndOffsets` (partition heads) + `adminCl.FetchOffsets` (committed offsets); lag = sum(end - committed) across all partitions; missing committed offset treated as full-partition lag (worst-case, correct for cold-start) |
+| `internal/metrics/metrics.go` | Added `QueueDepth prometheus.Gauge` field; registered as `nexusbench_queue_depth`; `SetQueueDepth(int64)` helper clamps negative values to 0 |
+| `cmd/server/main.go` | `runQueueDepthScraper(ctx, queue, metrics)` goroutine: fires immediately on startup (gauge populated before first Prometheus scrape), then every 15s via `time.NewTicker`; each poll uses a 5s deadline context so a slow broker never blocks across ticks; logs `slog.Warn` on error and skips gauge update; started only in distributed mode; cancelled via `defer scraperCancel()` on shutdown |
+| `scripts/smoke_test_phase4_stage3.sh` | Two modes: `--dry-run` (YAML field checks + Go unit tests, no cluster) and `--live` (KEDA operator check, ScaledObject apply, 20-job enqueue, 60s scale-up wait, queue drain, 90s scale-down wait) |
+
+**12 new unit tests across `internal/queue/` and `internal/metrics/`.**
+
+| Test | Package | What it verifies |
+|---|---|---|
+| `TestMemoryQueue_QueueDepth_Empty` | queue | Returns 0 before any enqueue |
+| `TestMemoryQueue_QueueDepth_AfterEnqueue` | queue | Depth increments by 1 per enqueue, checked at each step |
+| `TestMemoryQueue_QueueDepth_AfterDequeue` | queue | Depth decrements by 1 per dequeue, checked at each step |
+| `TestMemoryQueue_QueueDepth_Unbuffered` | queue | Always 0 for cap=0 (no buffer to measure) |
+| `TestMemoryQueue_QueueDepth_CancelledCtx` | queue | Non-blocking even with already-cancelled context |
+| `TestMemoryQueue_QueueDepth_SatisfiesInterface` | queue | Compile-time: `*MemoryQueue` satisfies `Queue` interface |
+| `TestSetQueueDepth_InitiallyZero` | metrics | Gauge reads 0 before `SetQueueDepth` is called |
+| `TestSetQueueDepth_UpdatesGauge` | metrics | Latest call overwrites; does not accumulate |
+| `TestSetQueueDepth_Zero` | metrics | `SetQueueDepth(0)` resets gauge to 0 |
+| `TestSetQueueDepth_NegativeClamped` | metrics | Negative depth clamped to 0 |
+| `TestSetQueueDepth_MetricNamePresent` | metrics | Descriptor appears in `/metrics` output |
+| `TestSetQueueDepth_IsolatedFromOtherRegistries` | metrics | Two `New()` registries are independent |
+
 
 The following issues were found during live-cluster smoke testing and corrected:
 

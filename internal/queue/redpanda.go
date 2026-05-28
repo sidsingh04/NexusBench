@@ -49,8 +49,8 @@ const (
 
 	// defaultPartitions and defaultReplFactor are used by Bootstrap()
 	// when creating the topic. Both can be overridden via Config.
-	defaultJobPartitions  int32 = 4
-	defaultJobReplFactor  int16 = 1
+	defaultJobPartitions int32 = 4
+	defaultJobReplFactor int16 = 1
 
 	// pollTimeout is how long Dequeue waits for a new record before
 	// returning (with no job) so the caller can check ctx.
@@ -85,10 +85,10 @@ func DefaultRedpandaQueueConfig() RedpandaConfig {
 // RedpandaQueue implements the Queue interface on top of Redpanda.
 // Use NewRedpandaQueue to construct one; the zero value is invalid.
 type RedpandaQueue struct {
-	producer  *kgo.Client
-	consumer  *kgo.Client
-	adminCl   *kadm.Client
-	cfg       RedpandaConfig
+	producer *kgo.Client
+	consumer *kgo.Client
+	adminCl  *kadm.Client
+	cfg      RedpandaConfig
 
 	// pendingRecord holds the most recently polled kgo.Record that has not
 	// yet been committed. CommitJob advances the offset for this record.
@@ -320,6 +320,60 @@ func (q *RedpandaQueue) CommitJob(ctx context.Context) error {
 		return fmt.Errorf("queue: commit job offset: %w", err)
 	}
 	return nil
+}
+
+// QueueDepth returns the total consumer-group lag for the nexusbench-workers
+// group on the jobs.benchmark topic.
+//
+// Lag = sum over all partitions of (latest_offset - committed_offset).
+// This is the exact value KEDA reads from the broker to drive the HPA;
+// exposing it as a Prometheus gauge gives the control-plane an in-process
+// view without duplicating broker RPC calls from a second scraper.
+//
+// Implementation notes:
+//   - Two admin RPCs are required: ListEndOffsets (head of each partition)
+//     and FetchOffsets (the consumer group's committed position).
+//   - Both calls are bounded by ctx, so a short deadline is safe.
+//   - A best-effort estimate is acceptable: lag may trail reality by a few
+//     seconds, which is fine for a 15s scrape interval.
+//   - If a partition has no committed offset yet (group just started) the
+//     lag for that partition is treated as the full end offset (worst case).
+func (q *RedpandaQueue) QueueDepth(ctx context.Context) (int64, error) {
+	// Step 1: fetch the latest (end) offset for each partition of the topic.
+	endOffsets, err := q.adminCl.ListEndOffsets(ctx, TopicJobs)
+	if err != nil {
+		return 0, fmt.Errorf("queue: ListEndOffsets: %w", err)
+	}
+
+	// Step 2: fetch the consumer group's committed offsets.
+	committedOffsets, err := q.adminCl.FetchOffsets(ctx, workerGroupID)
+	if err != nil {
+		return 0, fmt.Errorf("queue: FetchOffsets for group %q: %w", workerGroupID, err)
+	}
+
+	// Step 3: compute lag = sum(end - committed) across all partitions.
+	var totalLag int64
+	endOffsets.Each(func(o kadm.ListedOffset) {
+		if o.Err != nil {
+			// Skip partitions we cannot read; log at call site if needed.
+			return
+		}
+		// Look up the committed offset for this partition.
+		committed, ok := committedOffsets.Lookup(o.Topic, o.Partition)
+		if !ok || committed.At < 0 {
+			// No committed offset: the group hasn't consumed from this
+			// partition yet. Treat the full end offset as pending lag.
+			totalLag += o.Offset
+			return
+		}
+		lag := o.Offset - committed.At
+		if lag < 0 {
+			lag = 0 // committed offset can race ahead of end in edge cases
+		}
+		totalLag += lag
+	})
+
+	return totalLag, nil
 }
 
 // Close flushes the producer, commits the consumer's pending offsets, and

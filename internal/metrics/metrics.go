@@ -70,6 +70,22 @@ type Registry struct {
 	// the event timestamp. High values mean the consumer is falling behind.
 	// Labels: submission_id
 	ConsumerLagSeconds *prometheus.HistogramVec
+
+	// ── Queue / autoscaling layer ─────────────────────────────────────────────
+
+	// QueueDepth is the current number of pending (unconsumed) benchmark jobs
+	// in the jobs.benchmark topic, measured as consumer-group lag for the
+	// nexusbench-workers group.
+	//
+	// This gauge is updated every 15 seconds by a background goroutine in
+	// the control plane (see cmd/server/main.go). It mirrors the metric KEDA
+	// reads directly from the broker — exposing it in Prometheus lets Grafana
+	// alert on queue buildup without needing a separate KEDA dashboard.
+	//
+	// A value of 0 means all submitted jobs have been dequeued (workers are
+	// idle or processing their last job). A rising value means jobs are
+	// accumulating faster than workers can process them — KEDA will scale up.
+	QueueDepth prometheus.Gauge
 }
 
 // New creates a Registry with all metrics registered against a fresh
@@ -189,6 +205,17 @@ func New() *Registry {
 			},
 			[]string{"submission_id"},
 		),
+
+		QueueDepth: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: "nexusbench",
+				Subsystem: "queue",
+				Name:      "depth",
+				Help: "Current number of pending benchmark jobs in the jobs.benchmark topic " +
+					"(consumer-group lag for nexusbench-workers). " +
+					"Updated every 15 seconds. Mirrors the metric KEDA uses to drive HPA.",
+			},
+		),
 	}
 
 	reg.MustRegister(
@@ -202,6 +229,7 @@ func New() *Registry {
 		r.TelemetryEmitErrors,
 		r.ConsumerWindowsTotal,
 		r.ConsumerLagSeconds,
+		r.QueueDepth,
 	)
 
 	return r
@@ -259,4 +287,14 @@ func (r *Registry) RecordTelemetryEmitError() {
 func (r *Registry) RecordConsumerWindow(submissionID string, lagSecs float64) {
 	r.ConsumerWindowsTotal.WithLabelValues(submissionID).Inc()
 	r.ConsumerLagSeconds.WithLabelValues(submissionID).Observe(lagSecs)
+}
+
+// SetQueueDepth updates the queue depth gauge to the given value.
+// Call from the background scraper goroutine every 15 seconds.
+// depth must be non-negative; negative values are silently clamped to 0.
+func (r *Registry) SetQueueDepth(depth int64) {
+	if depth < 0 {
+		depth = 0
+	}
+	r.QueueDepth.Set(float64(depth))
 }

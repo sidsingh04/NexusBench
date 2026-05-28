@@ -1,0 +1,93 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scaledobject
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: worker-scaledobject
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: nexusbench
+  annotations:
+    # KEDA v2.14.0+ required.
+    # Install KEDA before applying this file:
+    #   kubectl apply -f https://github.com/kedacore/keda/releases/download/v2.14.0/keda-2.14.0.yaml
+    #   kubectl rollout status deployment/keda-operator -n keda --timeout=120s
+    #
+    # Scaling formula: desired_replicas = ceil(total_lag / lagThreshold)
+    # With lagThreshold=5:
+    #   0-5  jobs pending -> 1 replica  (minReplicaCount floor)
+    #   6-10 jobs pending -> 2 replicas
+    #   50   jobs pending -> 10 replicas (maxReplicaCount ceiling)
+    #
+    # Verify after apply:
+    #   kubectl get scaledobject worker-scaledobject -n nexusbench
+    #   kubectl get hpa -n nexusbench -w
+    nexusbench.io/stage: "4.3"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+
+  # Keep one warm worker alive so first-job latency is one poll interval (15s),
+  # not a pod cold-start (~30s). Set to 0 only if cost is the primary concern.
+  minReplicaCount: 1
+  maxReplicaCount: 10
+
+  # How often KEDA polls Redpanda for consumer-group lag (seconds).
+  # Matches the queueDepthScrapeInterval in cmd/server/main.go (15s) so
+  # Grafana and the autoscaler see the same lag value at the same cadence.
+  pollingInterval: 15
+
+  # Seconds KEDA waits after lag reaches 0 before scaling down.
+  # Absorbs re-submission bursts without thrashing pod counts.
+  cooldownPeriod: 30
+
+  advanced:
+    # Do not snap replicas back to the deployment.yaml baseline when this
+    # ScaledObject is deleted. Workers mid-job should not be evicted just
+    # because the ScaledObject was removed for maintenance.
+    restoreToOriginalReplicaCount: false
+
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Override the HPA default 300s stabilisation window.
+          # cooldownPeriod (30s) is the primary gate; the HPA should honour
+          # KEDA's scale-down decision promptly once cooldown has elapsed.
+          stabilizationWindowSeconds: 30
+          policies:
+            # At most 1 replica removed per 30s to protect in-flight jobs.
+            - type: Pods
+              value: 1
+              periodSeconds: 30
+        scaleUp:
+          # No stabilisation delay on scale-up: react to queue buildup immediately.
+          stabilizationWindowSeconds: 0
+          policies:
+            # Add up to 5 replicas every 15s. A burst of 50 jobs reaches
+            # full capacity (10 replicas) in two polling cycles (~30s).
+            - type: Pods
+              value: 5
+              periodSeconds: 15
+
+  triggers:
+    - type: kafka
+      metadata:
+        # ClusterIP service for Redpanda Kafka-protocol clients (port 9092).
+        # Service name defined in k8s/redpanda/service.yaml.
+        bootstrapServers: redpanda-client.nexusbench.svc.cluster.local:9092
+
+        # Must match workerGroupID in internal/queue/redpanda.go.
+        consumerGroup: nexusbench-workers
+
+        # Must match TopicJobs in internal/queue/redpanda.go.
+        topic: jobs.benchmark
+
+        # One extra worker replica per 5 pending jobs.
+        lagThreshold: "5"
+
+        # If the consumer group has no committed offset yet (fresh cluster),
+        # count all existing messages as pending lag. "latest" would hide
+        # pre-existing jobs from the scaler on first boot.
+        offsetResetPolicy: earliest
