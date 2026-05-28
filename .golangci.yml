@@ -2,17 +2,14 @@
 #
 # golangci-lint v2 configuration for NexusBench.
 # Docs: https://golangci-lint.run/usage/configuration/
-# Migration guide (v1 → v2): https://golangci-lint.run/docs/product/migration-guide
+# Migration guide (v1 -> v2): https://golangci-lint.run/docs/product/migration-guide
 #
-# v2 breaking changes applied here:
-#   - Added required top-level `version: "2"` key.
-#   - `gosimple` and `unused` removed: both merged into `staticcheck` in v2.
-#   - `linters-settings` renamed to `linters.settings` (nested under linters).
-#   - `issues.exclude-rules` moved to `issues.exclude-rules` (unchanged path,
-#     but `path` field now uses RE2 syntax — no change needed for our patterns).
-#
-# Run locally:  golangci-lint run ./...
-# Run in CI:    golangci-lint run --timeout=5m ./...
+# Key v2 changes applied here:
+#   - Required top-level `version: "2"` key.
+#   - `gosimple` and `unused` removed: merged into `staticcheck` in v2.
+#   - `linters-settings` is now `linters.settings` (nested).
+#   - `gofmt` reclassified as a formatter in v2: moved out of `linters.enable`
+#     and into the top-level `formatters` block.
 
 version: "2"
 
@@ -20,44 +17,22 @@ run:
   timeout: 5m
 
 linters:
-  # Disable all linters by default, then enable only the ones listed below.
-  # This avoids surprise breakage when golangci-lint adds new linters in a
-  # minor release.
   default: none
   enable:
     # ── Bug catchers ─────────────────────────────────────────────────────────
-
-    # errcheck: any unchecked error return is a potential silent failure.
     - errcheck
-
-    # govet: reports constructs the Go compiler considers suspicious.
     - govet
-
-    # staticcheck: covers staticcheck + gosimple + unused (all merged in v2).
-    - staticcheck
-
-    # ineffassign: detects assignments to variables that are never read.
+    - staticcheck  # covers staticcheck + gosimple + unused (all merged in v2)
     - ineffassign
 
     # ── Safety ───────────────────────────────────────────────────────────────
-
-    # gosec: reports common security issues.
     - gosec
 
     # ── Correctness ──────────────────────────────────────────────────────────
-
-    # bodyclose: HTTP response bodies must be closed.
     - bodyclose
-
-    # nilerr: catches `if err != nil { return nil }`.
     - nilerr
 
     # ── Style ────────────────────────────────────────────────────────────────
-
-    # gofmt: enforces standard Go formatting.
-    - gofmt
-
-    # misspell: catches common English spelling mistakes.
     - misspell
 
   settings:
@@ -84,11 +59,17 @@ linters:
         - G304  # intentional: user-provided archive paths
         - G307  # false positive: deferred close pattern
 
-    gofmt:
-      simplify: true
-
     misspell:
       locale: US
+
+# In golangci-lint v2, formatters are declared separately from linters.
+# gofmt is a formatter and cannot appear in linters.enable.
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
 
 issues:
   max-same-issues: 50
