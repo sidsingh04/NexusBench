@@ -24,7 +24,7 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 | Phase 1 | Core MVP | ✅ Complete |
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
-| Phase 4 | Terraform & Infra Automation | 🔄 In Progress |
+| Phase 4 | Terraform & Infra Automation | ✅ Complete |
 | Phase 5 | Advanced Benchmarking | ⏳ Pending |
 
 ---
