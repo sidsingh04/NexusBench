@@ -81,6 +81,7 @@ jobs:
     name: Build & Push Docker images
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: production
 
     # Required for Workload Identity Federation token exchange.
     permissions:
@@ -151,6 +152,7 @@ jobs:
     name: Build & Push control-plane
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: production
 
     permissions:
       contents: read
