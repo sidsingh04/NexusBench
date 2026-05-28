@@ -1,0 +1,47 @@
+# .github/actions/setup-go/action.yml
+#
+# Composite action: installs the Go toolchain and restores the module cache.
+#
+# Used by every job that compiles or tests Go code. Centralising the setup
+# here means a Go version bump or cache-key change is a one-line edit, not
+# a search-and-replace across every workflow file.
+#
+# Inputs:
+#   go-version  — Go toolchain version (default: reads from go.mod).
+#                 Passing "file" tells setup-go to read the version from
+#                 go.mod automatically, so this action stays in sync with
+#                 the module without manual updates.
+#
+# Cache strategy:
+#   Key:    runner OS + go.sum hash (changes when dependencies change)
+#   Restore keys: runner OS prefix (partial hit reuses an older cache,
+#                 then go mod download tops it up — faster than cold download)
+#
+# Why a composite action, not just inlining the steps?
+#   - DRY: lint, unit-tests, tf-validate, and build all need Go.
+#   - Visibility: one place to audit what toolchain version CI uses.
+#   - Speed: the module cache is shared across jobs on the same runner.
+
+name: Setup Go toolchain + module cache
+description: Installs Go and warms the module cache using go.sum as the cache key.
+
+inputs:
+  go-version:
+    description: >
+      Go toolchain version to install. Defaults to "file" which reads the
+      version from go.mod. Override with an explicit version (e.g. "1.22.x")
+      only when you need to test against a specific release.
+    required: false
+    default: "file"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Go ${{ inputs.go-version }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        # Let setup-go manage the module cache via its built-in caching.
+        # This is equivalent to actions/cache on $(go env GOPATH)/pkg/mod
+        # but handles edge cases (cache eviction, concurrent jobs) correctly.
+        cache: true

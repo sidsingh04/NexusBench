@@ -64,7 +64,7 @@ func NewRESTTransport(baseURL string, client *http.Client) *RESTTransport {
 	return &RESTTransport{baseURL: baseURL, client: client}
 }
 
-// Send serialises o to JSON, POSTs it to the engine, and decodes the response.
+// Send serializes o to JSON, POSTs it to the engine, and decodes the response.
 func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 	reqBody := restOrderRequest{
 		OrderID:  o.ID,
@@ -117,7 +117,7 @@ func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 // ── Bot ───────────────────────────────────────────────────────────────────────
 
 // Bot is a single virtual trading participant. It runs a tight loop:
-// generate order → send → record result → repeat until ctx is cancelled.
+// generate order → send → record result → repeat until ctx is canceled.
 //
 // Each Bot owns its OrderGenerator and BotTransport — no sharing, no locking.
 // The zero value is NOT valid. Use NewBot.
@@ -138,7 +138,7 @@ func NewBot(id string, gen OrderGenerator, transport BotTransport) (*Bot, error)
 	return &Bot{id: id, gen: gen, transport: transport}, nil
 }
 
-// Run sends orders in a tight loop until ctx is cancelled, collecting each
+// Run sends orders in a tight loop until ctx is canceled, collecting each
 // OrderResult. It returns all results accumulated during this run.
 //
 // Run blocks until ctx.Done() is closed. The caller (Fleet) must provide a

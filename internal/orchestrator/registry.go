@@ -12,20 +12,22 @@
 //
 // The Orchestrator does NOT dispatch jobs — that is the queue's job.
 // It only tracks which workers are alive so the control plane can:
-//   a) Surface worker fleet status via GET /internal/workers
-//   b) Detect dead workers and re-queue their in-progress jobs
+//
+//	a) Surface worker fleet status via GET /internal/workers
+//	b) Detect dead workers and re-queue their in-progress jobs
 //
 // Re-queue strategy (at-least-once):
-//   Workers commit the queue offset only after writing results to the store.
-//   If a worker dies mid-job, its partition offset is uncommitted.
-//   Redpanda will re-deliver that job to another worker after the consumer
-//   group session timeout (default 45s in franz-go). The orchestrator's
-//   TTL check (15s) catches this earlier and surfaces it in the status API
-//   so operators can see dead workers without waiting for Redpanda's timeout.
 //
-//   The orchestrator does NOT need to explicitly re-enqueue jobs — Redpanda
-//   handles that automatically via the uncommitted offset. The registry just
-//   marks the worker dead so the API reflects reality.
+//	Workers commit the queue offset only after writing results to the store.
+//	If a worker dies mid-job, its partition offset is uncommitted.
+//	Redpanda will re-deliver that job to another worker after the consumer
+//	group session timeout (default 45s in franz-go). The orchestrator's
+//	TTL check (15s) catches this earlier and surfaces it in the status API
+//	so operators can see dead workers without waiting for Redpanda's timeout.
+//
+//	The orchestrator does NOT need to explicitly re-enqueue jobs — Redpanda
+//	handles that automatically via the uncommitted offset. The registry just
+//	marks the worker dead so the API reflects reality.
 package orchestrator
 
 import (

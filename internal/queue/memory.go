@@ -9,12 +9,12 @@ import (
 // MemoryQueue is a thread-safe, in-memory implementation of Queue.
 // Use it in unit tests instead of RedpandaQueue — no broker required.
 //
-// Enqueue behaviour depends on buffer capacity:
+// Enqueue behavior depends on buffer capacity:
 //   - bufSize > 0: non-blocking send. Returns an error immediately if the
 //     buffer is full, which lets tests verify backpressure without deadlocking.
 //   - bufSize == 0: synchronous (unbuffered) channel. Enqueue blocks until
-//     a Dequeue call is ready to receive, or ctx is cancelled. This matches
-//     Go channel semantics and is useful for tightly-synchronised tests.
+//     a Dequeue call is ready to receive, or ctx is canceled. This matches
+//     Go channel semantics and is useful for tightly-synchronized tests.
 //
 // CommitJob is a no-op — in-memory delivery has no offset to commit.
 // QueueDepth returns len(ch) — the current number of buffered jobs.
@@ -38,7 +38,7 @@ func NewMemoryQueue(bufSize int) *MemoryQueue {
 // is full so callers fail fast rather than deadlocking.
 //
 // Unbuffered queues (cap == 0): blocking. Blocks until a Dequeue is ready
-// or ctx is cancelled, mirroring bare Go channel semantics.
+// or ctx is canceled, mirroring bare Go channel semantics.
 func (m *MemoryQueue) Enqueue(ctx context.Context, j Job) error {
 	m.mu.Lock()
 	if m.closed {
@@ -66,7 +66,7 @@ func (m *MemoryQueue) Enqueue(ctx context.Context, j Job) error {
 	}
 }
 
-// Dequeue blocks until a job is available or ctx is cancelled.
+// Dequeue blocks until a job is available or ctx is canceled.
 func (m *MemoryQueue) Dequeue(ctx context.Context) (Job, error) {
 	select {
 	case j, ok := <-m.ch:

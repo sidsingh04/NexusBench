@@ -19,7 +19,7 @@ import (
 //
 // Architecture decisions:
 //
-//  1. Non-blocking hot path — Emit() serialises and hands the record to the
+//  1. Non-blocking hot path — Emit() serializes and hands the record to the
 //     franz-go client's internal buffer, then returns immediately. The client
 //     flushes in the background. This means Emit() is ~microseconds even under
 //     high load, never blocking the matching engine.
@@ -213,7 +213,7 @@ func (r *RedpandaEmitter) Bootstrap(ctx context.Context) error {
 //
 // Hot path contract:
 //   - Validation is synchronous and CPU-only (~nanoseconds).
-//   - JSON serialisation is synchronous (~microseconds).
+//   - JSON serialization is synchronous (~microseconds).
 //   - ProduceSync hands the record to the client's internal batch buffer and
 //     returns. Network I/O to the broker happens asynchronously in the
 //     background. This means Emit() adds < 10µs to the caller's critical path
@@ -264,7 +264,7 @@ func (r *RedpandaEmitter) Emit(ctx context.Context, e Event) error {
 // may generate thousands of OrderAck events per second.
 //
 // Implementation:
-//   - All valid events are serialised and handed to ProduceSync as a single
+//   - All valid events are serialized and handed to ProduceSync as a single
 //     multi-record batch. franz-go's linger window aggregates them further.
 //   - Invalid events are skipped (not sent); a combined error is returned.
 //   - The function returns after all valid records are buffered — not after

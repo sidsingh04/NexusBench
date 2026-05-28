@@ -97,10 +97,10 @@ func DefaultRandomGeneratorConfig() RandomGeneratorConfig {
 // Order ID format: "{botID}-{sequenceNumber}" — guaranteed unique within a
 // single generator's lifetime.
 type RandomGenerator struct {
-	cfg    RandomGeneratorConfig
-	rng    *rand.Rand
-	botID  string
-	seq    uint64
+	cfg   RandomGeneratorConfig
+	rng   *rand.Rand
+	botID string
+	seq   uint64
 	// pendingIDs tracks the IDs of active (acknowledged) limit orders so
 	// cancel orders can reference a real existing order.
 	pendingIDs []string

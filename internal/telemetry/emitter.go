@@ -24,7 +24,7 @@ type Emitter interface {
 
 	// BatchEmit sends a slice of events in one logical operation.
 	// Callers should batch events in slices of ~100 before calling — this
-	// avoids per-event lock/unlock overhead and (for Redpanda) amortises
+	// avoids per-event lock/unlock overhead and (for Redpanda) amortizes
 	// network round-trips across multiple records.
 	//
 	// BatchEmit validates every event before sending. If any event is invalid
@@ -38,7 +38,7 @@ type Emitter interface {
 
 // ── StdoutEmitter ─────────────────────────────────────────────────────────────
 
-// StdoutEmitter serialises every Event as NDJSON (one JSON object per line).
+// StdoutEmitter serializes every Event as NDJSON (one JSON object per line).
 // The zero value is NOT valid. Use NewStdoutEmitter.
 type StdoutEmitter struct {
 	mu  sync.Mutex
@@ -104,9 +104,9 @@ func (s *StdoutEmitter) Close() error { return nil }
 // NoopEmitter discards every event silently. Use in unit tests.
 type NoopEmitter struct{}
 
-func (n NoopEmitter) Emit(_ context.Context, _ Event) error              { return nil }
-func (n NoopEmitter) BatchEmit(_ context.Context, _ []Event) error       { return nil }
-func (n NoopEmitter) Close() error                                        { return nil }
+func (n NoopEmitter) Emit(_ context.Context, _ Event) error        { return nil }
+func (n NoopEmitter) BatchEmit(_ context.Context, _ []Event) error { return nil }
+func (n NoopEmitter) Close() error                                 { return nil }
 
 // ── RecordingEmitter ─────────────────────────────────────────────────────────
 

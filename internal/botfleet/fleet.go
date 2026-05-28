@@ -99,11 +99,11 @@ func NewFleet(cfg FleetConfig) (*Fleet, error) {
 //
 // Ramp-up: bots are started in equal intervals over cfg.RampUpDuration so
 // the first bot starts at t=0 and the last at t≈RampUpDuration.
-// After RampUpDuration+TestDuration the root context is cancelled, which
+// After RampUpDuration+TestDuration the root context is canceled, which
 // causes every bot's Run loop to return.
 //
 // The outer ctx controls the maximum wall-clock time including ramp-up.
-// If ctx is cancelled before the test completes, Run returns immediately with
+// If ctx is canceled before the test completes, Run returns immediately with
 // whatever results have been collected so far.
 func (f *Fleet) Run(ctx context.Context) (*FleetResult, error) {
 	startedAt := time.Now()
@@ -111,7 +111,7 @@ func (f *Fleet) Run(ctx context.Context) (*FleetResult, error) {
 	// Per-bot HTTP client with its own timeout.
 	httpClient := &http.Client{Timeout: f.cfg.PerBotHTTPTimeout}
 
-	// testCtx is cancelled when the test duration (+ ramp-up) elapses.
+	// testCtx is canceled when the test duration (+ ramp-up) elapses.
 	totalDuration := f.cfg.RampUpDuration + f.cfg.TestDuration
 	testCtx, cancel := context.WithTimeout(ctx, totalDuration)
 	defer cancel()

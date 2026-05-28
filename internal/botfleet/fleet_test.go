@@ -38,8 +38,8 @@ import (
 // okFill returns a JSON-encoded accepted fill response for the given orderID.
 func okFill(orderID string) []byte {
 	b, _ := json.Marshal(map[string]any{
-		"order_id": orderID,
-		"accepted": true,
+		"order_id":       orderID,
+		"accepted":       true,
 		"executed_price": int64(10000),
 		"executed_qty":   int64(10),
 	})
@@ -289,7 +289,7 @@ func TestBot_Run_ContextCancel(t *testing.T) {
 		t.Error("expected at least one result before context cancel")
 	}
 	// reqCount may be slightly higher than len(results) due to in-flight
-	// requests when ctx was cancelled — that's fine.
+	// requests when ctx was canceled — that's fine.
 	if reqCount.Load() == 0 {
 		t.Error("server received zero requests")
 	}

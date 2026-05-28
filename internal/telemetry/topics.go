@@ -11,9 +11,10 @@ package telemetry
 //	metrics.dlq         — dead-letter: events that could not be delivered after retries
 //
 // Why separate latency from heartbeat?
-//   The consumer in Step 3 will compute p50/p90/p99 from metrics.latency.
-//   Mixing heartbeats into that topic would pollute the percentile calculation
-//   with zero-latency rows that don't represent real order processing.
+//
+//	The consumer in Step 3 will compute p50/p90/p99 from metrics.latency.
+//	Mixing heartbeats into that topic would pollute the percentile calculation
+//	with zero-latency rows that don't represent real order processing.
 const (
 	TopicLatency   = "metrics.latency"
 	TopicHeartbeat = "metrics.heartbeat"
@@ -21,7 +22,7 @@ const (
 )
 
 // TopicForKind returns the correct topic for a given event Kind.
-// Returns TopicDLQ for any unrecognised Kind — belt-and-suspenders guard
+// Returns TopicDLQ for any unrecognized Kind — belt-and-suspenders guard
 // so a future Kind that hasn't been wired up here doesn't silently drop events.
 func TopicForKind(k Kind) string {
 	switch k {

@@ -90,9 +90,11 @@ down:
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 
-## Run all unit tests (race detector on). Does NOT require Redpanda or Docker.
+## Run all unit tests (race detector on, coverage report written to coverage.out).
+## Does NOT require Redpanda or Docker.
 test:
-	go test $(GO_PKGS) -v -race -timeout 60s
+	go test $(GO_PKGS) -v -race -timeout 60s -count=1 -coverprofile=coverage.out -covermode=atomic
+	@go tool cover -func=coverage.out | tail -1
 
 ## Run only the telemetry package unit tests.
 ## Fast feedback loop — no broker needed, runs in ~1s.

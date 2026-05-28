@@ -75,24 +75,25 @@ func (m *DockerManager) VerifyImages(ctx context.Context) error {
 // Deploy starts a sandbox container for the given submission.
 //
 // Security model (Phase 1 — local dev):
-//   The entrypoint runs as root briefly to:
-//     1. Extract the archive (needs write access to /app)
-//     2. chown /app to runner  (needs CAP_CHOWN)
-//     3. su to runner          (needs CAP_SETUID + CAP_SETGID)
-//   After exec, the contestant binary runs as uid=1000 with no capabilities.
 //
-//   Capabilities kept:  CHOWN, SETUID, SETGID (dropped after exec via su)
-//   Capabilities dropped: everything else (NET_RAW, SYS_ADMIN, etc.)
-//   no-new-privileges: intentionally OFF — su requires it to be off
+//	The entrypoint runs as root briefly to:
+//	  1. Extract the archive (needs write access to /app)
+//	  2. chown /app to runner  (needs CAP_CHOWN)
+//	  3. su to runner          (needs CAP_SETUID + CAP_SETGID)
+//	After exec, the contestant binary runs as uid=1000 with no capabilities.
 //
-//   Phase 4 will replace this with gVisor (runsc) for true kernel isolation.
+//	Capabilities kept:  CHOWN, SETUID, SETGID (dropped after exec via su)
+//	Capabilities dropped: everything else (NET_RAW, SYS_ADMIN, etc.)
+//	no-new-privileges: intentionally OFF — su requires it to be off
+//
+//	Phase 4 will replace this with gVisor (runsc) for true kernel isolation.
 func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (containerID string, hostPort int, err error) {
 	// ── 1. Resolve image ──────────────────────────────────────────────────────
 	image, ok := m.cfg.ImageForLanguage(string(sub.Language))
 	if !ok {
 		return "", 0, fmt.Errorf("no sandbox image configured for language %q", sub.Language)
 	}
-	if _, _, err := m.cli.ImageInspectWithRaw(ctx, image); err != nil {
+	if _, _, errInspect := m.cli.ImageInspectWithRaw(ctx, image); errInspect != nil {
 		return "", 0, fmt.Errorf(
 			"sandbox image %q not found locally — run `make image-%s` first",
 			image, sub.Language,
@@ -117,7 +118,7 @@ func (m *DockerManager) Deploy(ctx context.Context, sub *models.Submission) (con
 		}
 	}()
 
-	// ── 3. (Removed bind mount in favour of CopyToContainer) ──────────────────
+	// ── 3. (Removed bind mount in favor of CopyToContainer) ──────────────────
 
 	// ── 4. Container config ───────────────────────────────────────────────────
 	portBindings := nat.PortMap{

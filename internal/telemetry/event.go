@@ -41,7 +41,7 @@ const (
 // Event is the atomic unit of telemetry emitted by a matching engine or
 // any other NexusBench component.
 //
-// Serialisation contract (NDJSON on stdout, Kafka message body in Step 2):
+// Serialization contract (NDJSON on stdout, Kafka message body in Step 2):
 //
 //	{
 //	  "kind":          "order_ack",
@@ -95,7 +95,7 @@ func (e *Event) Validate() error {
 }
 
 // isKnownKind returns true for any Kind constant defined in this package.
-// Centralising this check means adding a new Kind only requires editing one
+// Centralizing this check means adding a new Kind only requires editing one
 // place (the const block above) — Validate and any switch statements that
 // exhaustively cover Kinds will break at compile time if you forget to update.
 func isKnownKind(k Kind) bool {

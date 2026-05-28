@@ -5,6 +5,8 @@ nexusbench
 
 # Go build artifacts
 /vendor/
+coverage.out
+coverage
 
 # Submission data (local dev)
 /tmp/

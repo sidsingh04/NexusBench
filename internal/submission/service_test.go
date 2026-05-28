@@ -82,7 +82,7 @@ func TestValidation_BadLanguage(t *testing.T) {
 	fh := makeFakeFileHeader("test.tar.gz", []byte("fake archive content"))
 	req := models.SubmitRequest{
 		TeamName: "t",
-		Language: "cobol",   // invalid
+		Language: "cobol", // invalid
 		Protocol: models.ProtocolREST,
 	}
 

@@ -250,7 +250,7 @@ func TestSandboxExecutor_ContextCancelledDuringHealth(t *testing.T) {
 
 	_, err := exec.Execute(ctx, fakeJob())
 	if err == nil {
-		t.Fatal("Execute should return error when ctx is cancelled during health poll")
+		t.Fatal("Execute should return error when ctx is canceled during health poll")
 	}
 	if docker.stopCalls.Load() != 1 {
 		t.Errorf("Stop called %d times after ctx cancel; want 1", docker.stopCalls.Load())

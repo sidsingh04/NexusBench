@@ -1,0 +1,140 @@
+# .golangci.yml
+#
+# golangci-lint configuration for NexusBench.
+# Docs: https://golangci-lint.run/usage/configuration/
+#
+# Philosophy:
+#   Enable linters that catch real bugs and dead code (errcheck, govet,
+#   staticcheck, unused). Disable linters that enforce style opinions that
+#   conflict with this codebase's conventions (gochecknoglobals — Prometheus
+#   metric vars are intentionally package-level).
+#
+# Run locally:  make lint
+# Run in CI:    golangci-lint run ./...  (via golangci/golangci-lint-action)
+
+run:
+  timeout: 5m
+
+  # Only lint packages under these paths.
+  # Excludes the docker/sandbox directory — it contains Dockerfiles with
+  # .go-like names that are not Go source files.
+  build-tags: []
+
+linters:
+  # Disable all linters by default, then enable only the ones listed below.
+  # This avoids surprise breakage when golangci-lint adds new linters in a
+  # minor release.
+  disable-all: true
+  enable:
+    # ── Bug catchers ─────────────────────────────────────────────────────────
+
+    # errcheck: any unchecked error return is a potential silent failure.
+    # In a benchmarking platform, silent failures corrupt results.
+    - errcheck
+
+    # govet: reports constructs the Go compiler considers suspicious:
+    # unreachable code, misused sync primitives, bad Printf format strings.
+    - govet
+
+    # staticcheck: Go's most comprehensive static analyser. Catches
+    # deprecated API usage, ineffective assignments, and logic bugs.
+    - staticcheck
+
+    # gosimple: subset of staticcheck that suggests simpler code constructs.
+    # Enabled separately so we can tune it independently if needed.
+    - gosimple
+
+    # ineffassign: detects assignments to variables that are never read.
+    # Common source of logic bugs (e.g. err = f() where err was already
+    # declared and the new value is ignored).
+    - ineffassign
+
+    # unused: reports unexported functions, types, and variables that are
+    # never referenced. Keeps the codebase lean.
+    - unused
+
+    # ── Safety ───────────────────────────────────────────────────────────────
+
+    # gosec: reports common security issues (SQL injection, hardcoded creds,
+    # weak crypto). We run it with a narrow ruleset — see issues below.
+    - gosec
+
+    # ── Correctness ──────────────────────────────────────────────────────────
+
+    # bodyclose: HTTP response bodies must be closed; forgetting leaks
+    # file descriptors under load — critical for the control plane.
+    - bodyclose
+
+    # nilerr: catches `if err != nil { return nil }` — returning nil instead
+    # of the error is almost always a bug.
+    - nilerr
+
+    # ── Style (non-controversial) ────────────────────────────────────────────
+
+    # gofmt: enforces standard Go formatting. Zero tolerance — CI fails if
+    # gofmt would change anything.
+    - gofmt
+
+    # misspell: catches common English spelling mistakes in comments and
+    # string literals. Cheap to run, catches embarrassing typos.
+    - misspell
+
+linters-settings:
+  errcheck:
+    # Ignore errors returned by fmt.Print* — acceptable for debug output.
+    exclude-functions:
+      - fmt.Print
+      - fmt.Println
+      - fmt.Printf
+      - (io.Closer).Close
+
+  govet:
+    enable:
+      - shadow     # catch accidentally shadowed variables in inner scopes
+      - printf     # verify Printf format strings match argument types
+
+  staticcheck:
+    checks:
+      - "all"
+      - "-SA1019"  # allow use of deprecated identifiers during migrations
+
+  gosec:
+    # Disable rules that generate excessive noise for this codebase:
+    #   G104 — errors unhandled: covered by errcheck with our exclusions
+    #   G304 — file path provided as taint input: we intentionally read
+    #           user-provided archive paths in the submission service
+    #   G307 — closing file with deferred: false positive pattern
+    excludes:
+      - G104
+      - G304
+      - G307
+
+  gofmt:
+    simplify: true
+
+  misspell:
+    locale: US
+
+issues:
+  # Maximum number of issues of the same text to report. Set high so we see
+  # the full picture on first run rather than having to re-lint after each fix.
+  max-same-issues: 50
+
+  exclude-rules:
+    # Test files: allow longer functions (table-driven tests are naturally long)
+    # and unexported test helpers.
+    - path: "_test.go"
+      linters:
+        - unused
+        - errcheck   # t.Log, w.Write etc. in tests are intentionally unchecked
+
+    # cmd/ entry points: main() functions use os.Exit() which gosec flags.
+    - path: "cmd/"
+      linters:
+        - gosec
+
+    # Prometheus metric variables are intentionally package-level globals.
+    # gochecknoglobals is not enabled, but if it ever is, exclude metrics.go.
+    - path: "internal/metrics/metrics.go"
+      linters:
+        - gochecknoglobals

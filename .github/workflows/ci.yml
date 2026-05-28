@@ -1,0 +1,190 @@
+# .github/workflows/ci.yml
+#
+# CI gate — runs on every pull_request targeting main and on every push to main.
+#
+# ── Job graph ─────────────────────────────────────────────────────────────────
+#
+#   lint  ──┐
+#            ├── (all pass) ──► deploy.yml (on push to main only)
+#   test  ──┤
+#            │
+#   tf-validate ──┤
+#            │
+#   k8s-validate ──┘
+#
+# All four jobs run in parallel. The deploy workflow has `needs: [ci]` (via
+# workflow_run or direct job dependency) so a failed CI gate blocks deployment.
+#
+# ── No cloud credentials required ────────────────────────────────────────────
+#
+# This workflow intentionally contains zero cloud-specific steps. It validates
+# code correctness and manifest syntax entirely offline:
+#   - Go tests use MemoryQueue (no Redpanda broker needed)
+#   - terraform validate uses -backend=false (no GCS bucket needed)
+#   - k8s-validate uses --dry-run=client (no cluster needed)
+#
+# Cloud credentials only appear in deploy.yml (main branch only).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel any in-progress run for the same branch/PR when a new commit is pushed.
+# This prevents queued runs from wasting runner minutes on stale code.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Single source of truth for the Go version used across all jobs.
+  # Must match the `go` directive in go.mod.
+  GO_VERSION: "1.25.x"
+
+jobs:
+  # ── Job 1: lint ──────────────────────────────────────────────────────────────
+  #
+  # Runs golangci-lint with the project's .golangci.yml config.
+  # Catches: unused variables, unchecked errors, shadowed vars, staticcheck
+  # findings, and more — without blocking on stylistic preferences.
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59.1
+          # golangci-lint-action manages its own cache separate from the
+          # Go module cache, keyed on the lint binary version + .golangci.yml
+          # hash. Do not set `args: --config` here — it reads .golangci.yml
+          # from the repo root automatically.
+          args: --timeout=5m
+
+  # ── Job 2: unit-tests ─────────────────────────────────────────────────────
+  #
+  # Runs all Go unit tests with the race detector enabled.
+  # No external services (Redpanda, Docker, cluster) are required — the test
+  # suite uses MemoryQueue and in-process fakes throughout.
+  #
+  # Coverage report is uploaded as an artifact so it can be downloaded for
+  # review or forwarded to a coverage service (Codecov, Coveralls) later.
+  unit-tests:
+    name: Unit Tests (race + coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run tests
+        run: |
+          # GO_PKGS excludes docker/sandbox/ — those Dockerfiles have .go-like
+          # names but are not Go source. Mirrors the Makefile definition.
+          GO_PKGS=$(go list ./... | grep -v 'docker/sandbox')
+          go test $GO_PKGS \
+            -race \
+            -timeout 60s \
+            -count=1 \
+            -coverprofile=coverage.out \
+            -covermode=atomic
+
+      - name: Show coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          # Keep for 7 days — long enough for PR review, short enough to
+          # avoid accumulating stale artifacts.
+          retention-days: 7
+
+  # ── Job 3: tf-validate ────────────────────────────────────────────────────
+  #
+  # Validates all Terraform HCL in terraform/ without touching any cloud API.
+  # -backend=false skips S3/GCS bucket initialisation entirely.
+  #
+  # Catches: syntax errors, invalid resource arguments, missing required
+  # variables, and provider schema violations — all offline.
+  tf-validate:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          # Pin to a specific Terraform version to avoid behaviour drift.
+          # Update this when you intentionally upgrade Terraform.
+          terraform_version: "1.8.5"
+
+      - name: terraform fmt check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false -input=false -reconfigure
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+  # ── Job 4: k8s-validate ───────────────────────────────────────────────────
+  #
+  # Validates all Kubernetes manifests in k8s/ offline using the dry-run mode
+  # of the Stage 4.2 smoke test script (which uses kubectl --dry-run=client or
+  # kubeconform depending on what's available).
+  #
+  # Also runs the Stage 4.3 dry-run to validate the ScaledObject YAML and
+  # gate tests (Go unit tests for queue/metrics packages).
+  k8s-validate:
+    name: K8s manifest validation (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install kubeconform
+        run: |
+          # kubeconform validates manifests against the upstream JSON schemas
+          # without needing a running cluster. Much faster than kubectl dry-run.
+          KUBECONFORM_VERSION="v0.6.7"
+          curl -sSfL \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          kubeconform -v
+
+      - name: Validate K8s manifests (Stage 4.2 dry-run)
+        run: bash scripts/smoke_test_phase4_stage2.sh --dry-run
+
+      - name: Validate ScaledObject + Go gate tests (Stage 4.3 dry-run)
+        run: bash scripts/smoke_test_phase4_stage3.sh --dry-run

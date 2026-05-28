@@ -6,13 +6,13 @@ import "time"
 type SubmissionStatus string
 
 const (
-	StatusPending     SubmissionStatus = "pending"     // uploaded, not yet processed
-	StatusBuilding    SubmissionStatus = "building"    // being compiled / image built
-	StatusDeploying   SubmissionStatus = "deploying"   // container starting
-	StatusRunning     SubmissionStatus = "running"     // container healthy, endpoints live
+	StatusPending      SubmissionStatus = "pending"      // uploaded, not yet processed
+	StatusBuilding     SubmissionStatus = "building"     // being compiled / image built
+	StatusDeploying    SubmissionStatus = "deploying"    // container starting
+	StatusRunning      SubmissionStatus = "running"      // container healthy, endpoints live
 	StatusBenchmarking SubmissionStatus = "benchmarking" // bot fleet actively testing
-	StatusCompleted   SubmissionStatus = "completed"   // benchmark finished, results available
-	StatusFailed      SubmissionStatus = "failed"      // any terminal error
+	StatusCompleted    SubmissionStatus = "completed"    // benchmark finished, results available
+	StatusFailed       SubmissionStatus = "failed"       // any terminal error
 )
 
 // Language is the programming language of the submission.
@@ -37,12 +37,12 @@ const (
 
 // Submission is the core domain object representing one contestant's entry.
 type Submission struct {
-	ID          string           `json:"id"`
-	TeamName    string           `json:"team_name"`
-	Language    Language         `json:"language"`
-	Protocol    Protocol         `json:"protocol"`
-	Status      SubmissionStatus `json:"status"`
-	StatusMsg   string           `json:"status_message,omitempty"`
+	ID        string           `json:"id"`
+	TeamName  string           `json:"team_name"`
+	Language  Language         `json:"language"`
+	Protocol  Protocol         `json:"protocol"`
+	Status    SubmissionStatus `json:"status"`
+	StatusMsg string           `json:"status_message,omitempty"`
 
 	// File info
 	ArchivePath string `json:"archive_path,omitempty"` // path on disk
@@ -70,7 +70,7 @@ type BenchmarkResults struct {
 	P99LatencyMs float64 `json:"p99_latency_ms"`
 
 	// Throughput
-	MaxTPS      float64 `json:"max_tps"`
+	MaxTPS       float64 `json:"max_tps"`
 	SustainedTPS float64 `json:"sustained_tps"`
 
 	// Correctness (0.0 – 1.0)
@@ -82,23 +82,23 @@ type BenchmarkResults struct {
 	// Composite score used for leaderboard ranking
 	CompositeScore float64 `json:"composite_score"`
 
-	BenchmarkDuration string `json:"benchmark_duration"`
+	BenchmarkDuration string    `json:"benchmark_duration"`
 	CompletedAt       time.Time `json:"completed_at"`
 }
 
 // LeaderboardEntry is a projection of Submission used in list/leaderboard views.
 type LeaderboardEntry struct {
-	Rank           int              `json:"rank"`
-	SubmissionID   string           `json:"submission_id"`
-	TeamName       string           `json:"team_name"`
-	Language       Language         `json:"language"`
-	Protocol       Protocol         `json:"protocol"`
-	Status         SubmissionStatus `json:"status"`
-	CompositeScore float64          `json:"composite_score"`
-	P99LatencyMs   float64          `json:"p99_latency_ms"`
-	MaxTPS         float64          `json:"max_tps"`
-	CorrectnessScore float64        `json:"correctness_score"`
-	CompletedAt    *time.Time       `json:"completed_at,omitempty"`
+	Rank             int              `json:"rank"`
+	SubmissionID     string           `json:"submission_id"`
+	TeamName         string           `json:"team_name"`
+	Language         Language         `json:"language"`
+	Protocol         Protocol         `json:"protocol"`
+	Status           SubmissionStatus `json:"status"`
+	CompositeScore   float64          `json:"composite_score"`
+	P99LatencyMs     float64          `json:"p99_latency_ms"`
+	MaxTPS           float64          `json:"max_tps"`
+	CorrectnessScore float64          `json:"correctness_score"`
+	CompletedAt      *time.Time       `json:"completed_at,omitempty"`
 }
 
 // APIError is the standard error envelope returned by the API.

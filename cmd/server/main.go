@@ -175,7 +175,7 @@ func main() {
 // runQueueDepthScraper polls the queue's consumer-group lag on a fixed
 // interval and updates the nexusbench_queue_depth Prometheus gauge.
 //
-// It runs as a long-lived background goroutine and exits when ctx is cancelled.
+// It runs as a long-lived background goroutine and exits when ctx is canceled.
 // Errors are logged as warnings; the goroutine never crashes on a single failure.
 //
 // The scraper fires immediately on startup (so the gauge is non-zero on the

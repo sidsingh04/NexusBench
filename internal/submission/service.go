@@ -108,7 +108,7 @@ func (s *DiskStore) List() ([]*models.Submission, error) {
 //
 //   - jobQueue == nil (Phase 1/2 mode):
 //     Ingest calls deployAsync directly — runs the full sandbox lifecycle
-//     in-process. Identical to the original behaviour; no existing tests break.
+//     in-process. Identical to the original behavior; no existing tests break.
 //
 //   - jobQueue != nil (Phase 3 distributed mode):
 //     Ingest enqueues a Job to the queue. A separate worker process picks it
@@ -214,7 +214,7 @@ func (s *Service) Ingest(
 		}
 		slog.Info("submission dispatched to worker queue", "id", id, "job_id", j.ID)
 	} else {
-		// Local mode (Phase 1/2): deploy in this process. Unchanged behaviour.
+		// Local mode (Phase 1/2): deploy in this process. Unchanged behavior.
 		go s.deployAsync(sub)
 	}
 

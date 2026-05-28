@@ -60,7 +60,7 @@ func main() {
 	defer store.Close()
 
 	// Bootstrap is idempotent — creates the hypertable if it doesn't exist.
-	if err := store.Bootstrap(ctx); err != nil {
+	if err = store.Bootstrap(ctx); err != nil {
 		slog.Error("consumer: bootstrap schema", "err", err)
 		os.Exit(1)
 	}
@@ -80,7 +80,7 @@ func main() {
 	defer c.Close()
 
 	// ── Run ───────────────────────────────────────────────────────────────────
-	// Run blocks until ctx is cancelled (SIGINT/SIGTERM).
+	// Run blocks until ctx is canceled (SIGINT/SIGTERM).
 	if err := c.Run(ctx); err != nil {
 		slog.Error("consumer: run error", "err", err)
 		os.Exit(1)

@@ -14,7 +14,7 @@ package queue_test
 //   TestMemoryQueue_QueueDepth_AfterEnqueue  — QueueDepth tracks enqueued jobs
 //   TestMemoryQueue_QueueDepth_AfterDequeue  — QueueDepth decrements after Dequeue
 //   TestMemoryQueue_QueueDepth_Unbuffered    — QueueDepth always 0 for unbuffered queue
-//   TestMemoryQueue_QueueDepth_CancelledCtx  — QueueDepth returns 0, nil on cancelled ctx
+//   TestMemoryQueue_QueueDepth_CancelledCtx  — QueueDepth returns 0, nil on canceled ctx
 //   TestNewJob_FieldMapping                  — NewJob copies all fields from Submission
 //   TestJob_JSONRoundTrip                    — Job survives JSON marshal/unmarshal
 
@@ -111,7 +111,7 @@ func TestMemoryQueue_CancelledDequeue(t *testing.T) {
 
 	_, err := q.Dequeue(ctx)
 	if err == nil {
-		t.Fatal("Dequeue on empty queue with cancelled ctx should return error")
+		t.Fatal("Dequeue on empty queue with canceled ctx should return error")
 	}
 	if err != context.DeadlineExceeded {
 		t.Errorf("err = %v, want context.DeadlineExceeded", err)
@@ -271,8 +271,8 @@ func TestMemoryQueue_QueueDepth_Unbuffered(t *testing.T) {
 }
 
 // TestMemoryQueue_QueueDepth_CancelledCtx verifies that QueueDepth does not
-// block on a cancelled context — the MemoryQueue implementation is non-blocking
-// and should return (0, nil) even when ctx is already cancelled.
+// block on a canceled context — the MemoryQueue implementation is non-blocking
+// and should return (0, nil) even when ctx is already canceled.
 func TestMemoryQueue_QueueDepth_CancelledCtx(t *testing.T) {
 	t.Parallel()
 	q := queue.NewMemoryQueue(4)
@@ -280,16 +280,16 @@ func TestMemoryQueue_QueueDepth_CancelledCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	// QueueDepth must not block even with a cancelled ctx. It should return
+	// QueueDepth must not block even with a canceled ctx. It should return
 	// quickly because MemoryQueue's implementation uses len(ch) — no I/O.
 	done := make(chan struct{})
 	go func() {
 		depth, err := q.QueueDepth(ctx)
 		if err != nil {
-			t.Errorf("QueueDepth with cancelled ctx: unexpected error: %v", err)
+			t.Errorf("QueueDepth with canceled ctx: unexpected error: %v", err)
 		}
 		if depth != 0 {
-			t.Errorf("QueueDepth with cancelled ctx = %d, want 0", depth)
+			t.Errorf("QueueDepth with canceled ctx = %d, want 0", depth)
 		}
 		close(done)
 	}()
@@ -298,7 +298,7 @@ func TestMemoryQueue_QueueDepth_CancelledCtx(t *testing.T) {
 	case <-done:
 		// passed
 	case <-time.After(100 * time.Millisecond):
-		t.Error("QueueDepth blocked with cancelled ctx — should be non-blocking")
+		t.Error("QueueDepth blocked with canceled ctx — should be non-blocking")
 	}
 }
 

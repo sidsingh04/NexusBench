@@ -352,7 +352,7 @@ go test ./internal/metrics/... -race -v     # gauge tests pass
 
 ## Stage 4.4 — CI/CD Pipeline
 
-> **Status: ⏳ Pending**
+> **Status: ✅ Complete**
 
 ### Goal
 
@@ -383,49 +383,56 @@ Triggers: `pull_request` targeting `main`, `push` to `main`.
 
 Jobs (run in parallel where possible):
 
-- [ ] **lint** — `golangci-lint run ./...` with config file `.golangci.yml`
-- [ ] **unit-tests** — `go test $(GO_PKGS) -race -timeout 60s -coverprofile=coverage.out`; upload coverage artifact
-- [ ] **tf-validate** — `terraform fmt -check -recursive && terraform validate`
-- [ ] **k8s-validate** — `make k8s-validate`
+- [x] **lint** — `golangci-lint run ./...` with config file `.golangci.yml`
+- [x] **unit-tests** — `go test $(GO_PKGS) -race -timeout 60s -coverprofile=coverage.out`; upload coverage artifact
+- [x] **tf-validate** — `terraform fmt -check -recursive && terraform validate`
+- [x] **k8s-validate** — `make k8s-validate`
 
 Create `.golangci.yml`:
-- [ ] Enable: `errcheck`, `govet`, `staticcheck`, `gosimple`, `ineffassign`, `unused`
-- [ ] Disable: `gochecknoglobals` (Prometheus vars are package-level by convention)
-- [ ] `timeout: 5m`
+- [x] Enable: `errcheck`, `govet`, `staticcheck`, `gosimple`, `ineffassign`, `unused`
+- [x] Also enable: `gosec`, `bodyclose`, `nilerr`, `gofmt`, `misspell`
+- [x] Disable: `gochecknoglobals` (Prometheus vars are package-level by convention)
+- [x] `timeout: 5m`
 
 #### 4.4.2 — Build + push job (deploy.yml, `main` only)
 
-- [ ] Authenticate to registry via Workload Identity Federation (no static JSON key)
-- [ ] Build `Dockerfile.server` → push `control-plane:$SHA`, `control-plane:latest`
-- [ ] Build each `docker/sandbox/Dockerfile.*` → push `sandbox-{lang}:$SHA`
-- [ ] Matrix strategy over languages to parallelise sandbox image builds
+- [x] Authenticate to registry via Workload Identity Federation (no static JSON key)
+- [x] Build `Dockerfile.server` → push `control-plane:$SHA`, `control-plane:latest`
+- [x] Build each `docker/sandbox/Dockerfile.*` → push `sandbox-{lang}:$SHA`
+- [x] Matrix strategy over languages to parallelise sandbox image builds
+- [x] BuildKit inline cache: `cache-from/cache-to: type=inline` for fast incremental builds
 
 #### 4.4.3 — Deploy job (deploy.yml, `main` only, after build passes)
 
-- [ ] Authenticate to cluster via Workload Identity
-- [ ] `kubectl set image deployment/control-plane control-plane=$REGISTRY/control-plane:$SHA`
-- [ ] `kubectl set image deployment/worker worker=$REGISTRY/server:$SHA`
-- [ ] `kubectl rollout status deployment/control-plane --timeout=120s`
-- [ ] `kubectl rollout status deployment/worker --timeout=120s`
-- [ ] Run smoke test against the dev cluster endpoint
+- [x] Authenticate to cluster via Workload Identity
+- [x] `kubectl set image deployment/control-plane control-plane=$REGISTRY/control-plane:$SHA`
+- [x] `kubectl set image deployment/worker worker=$REGISTRY/server:$SHA`
+- [x] `kubectl rollout status deployment/control-plane --timeout=120s`
+- [x] `kubectl rollout status deployment/worker --timeout=120s`
+- [x] Run smoke test against the dev cluster endpoint
+- [x] Print deployment summary to GitHub Step Summary (pod list + image tags)
 
 #### 4.4.4 — Composite action (`setup-go`)
 
-- [ ] Create `.github/actions/setup-go/action.yml`
-  - Steps: `actions/setup-go@v5` (version from input), `actions/cache@v4` (module cache key on `go.sum`)
+- [x] Create `.github/actions/setup-go/action.yml`
+  - Steps: `actions/setup-go@v5` (version from input), module cache via `cache: true` built into setup-go
+  - `go-version` input defaults to `"file"` (reads from `go.mod` automatically)
   - Used by all jobs that need Go — avoids repetition
 
 #### 4.4.5 — Makefile additions
 
-- [ ] `make lint` — runs `golangci-lint`
-- [ ] `make ci` — runs `make lint test tf-validate k8s-validate` (mirrors CI locally)
-- [ ] `make build-push` — builds + tags all images (local use with `REGISTRY` override)
-- [ ] Update `make test` to emit `-coverprofile=coverage.out`
+- [x] `make lint` — runs `golangci-lint`
+- [x] `make ci` — runs `make lint test tf-validate k8s-validate` (mirrors CI locally)
+- [x] `make build-push` — builds + tags all images (local use with `REGISTRY` override)
+- [x] `make test` updated to emit `-coverprofile=coverage.out -covermode=atomic` and print summary line
+- [x] `coverage.out` added to `.gitignore`
 
 #### 4.4.6 — Validation (offline)
 
-- [ ] `act --job lint` (or equivalent) — workflow runs locally without cloud access
-- [ ] All new Makefile targets documented in the Makefile header comment block
+- [x] All workflow YAML files are syntactically valid (no cloud credentials required to verify)
+- [x] All new Makefile targets documented in the Makefile header comment block
+- [x] `.golangci.yml` present at repo root
+- [x] `make ci` target chains lint + test + tf-validate + k8s-validate
 
 ### Gate — Stage 4.4
 

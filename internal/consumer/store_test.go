@@ -19,7 +19,7 @@ import (
 // ── MemoryStore ───────────────────────────────────────────────────────────────
 
 // MemoryStore is an in-memory implementation of Store used in unit tests.
-// It mirrors the exact behaviour contract of TimescaleStore:
+// It mirrors the exact behavior contract of TimescaleStore:
 //   - Empty windows (SampleN == 0) are silently dropped.
 //   - Duplicate (WindowStart, SubmissionID) pairs are ignored (idempotent).
 //
@@ -36,7 +36,7 @@ func NewMemoryStore() *MemoryStore {
 
 func (m *MemoryStore) WriteWindow(_ context.Context, w LatencyWindow) error {
 	if w.SampleN == 0 {
-		return nil // match TimescaleStore behaviour exactly
+		return nil // match TimescaleStore behavior exactly
 	}
 	key := storeKey(w)
 	if _, exists := m.rows[key]; exists {

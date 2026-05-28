@@ -161,7 +161,7 @@ func New() *Registry {
 				Namespace: "nexusbench",
 				Subsystem: "sandbox",
 				Name:      "exits_total",
-				Help:      "Total sandbox container exits, labelled by reason.",
+				Help:      "Total sandbox container exits, labeled by reason.",
 			},
 			[]string{"language", "reason"},
 		),

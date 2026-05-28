@@ -185,7 +185,7 @@ func (q *RedpandaQueue) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-// Enqueue serialises j as JSON and produces it to jobs.benchmark.
+// Enqueue serializes j as JSON and produces it to jobs.benchmark.
 // The submission ID is used as the partition key to ensure all retries
 // for the same submission land on the same partition.
 //
@@ -218,13 +218,13 @@ func (q *RedpandaQueue) Enqueue(ctx context.Context, j Job) error {
 	return nil
 }
 
-// Dequeue blocks until a Job is available or ctx is cancelled.
+// Dequeue blocks until a Job is available or ctx is canceled.
 //
 // The returned Job has been polled from Redpanda but its offset has NOT been
 // committed. The caller must call CommitJob(ctx, j) after processing to
 // advance the consumer group's offset and prevent re-delivery.
 //
-// If ctx is cancelled, Dequeue returns (Job{}, ctx.Err()).
+// If ctx is canceled, Dequeue returns (Job{}, ctx.Err()).
 func (q *RedpandaQueue) Dequeue(ctx context.Context) (Job, error) {
 	for {
 		// Check for cancellation before blocking on poll.
@@ -236,7 +236,7 @@ func (q *RedpandaQueue) Dequeue(ctx context.Context) (Job, error) {
 
 		fetches := q.consumer.PollFetches(ctx)
 
-		// Context cancelled during poll.
+		// Context canceled during poll.
 		if ctx.Err() != nil {
 			return Job{}, ctx.Err()
 		}
@@ -302,7 +302,7 @@ func (q *RedpandaQueue) Dequeue(ctx context.Context) (Job, error) {
 // Call this after the job has been durably completed (results written to the
 // submission store). Failing to call CommitJob after Dequeue means the job
 // will be re-delivered on the next worker restart — this is intentional
-// at-least-once behaviour.
+// at-least-once behavior.
 //
 // Calling CommitJob without a preceding Dequeue is a no-op.
 func (q *RedpandaQueue) CommitJob(ctx context.Context) error {

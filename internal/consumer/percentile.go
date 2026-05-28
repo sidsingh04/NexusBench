@@ -99,7 +99,7 @@ func (a *Accumulator) Add(latencyNs int64) {
 // Len returns the number of samples added so far.
 func (a *Accumulator) Len() int { return len(a.samples) }
 
-// Compute finalises the window and returns a LatencyWindow.
+// Compute finalizes the window and returns a LatencyWindow.
 // It sorts the samples in place (O(n log n)) and computes all statistics.
 // After Compute(), the Accumulator should be discarded.
 //

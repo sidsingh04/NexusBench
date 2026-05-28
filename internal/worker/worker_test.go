@@ -9,7 +9,7 @@ package worker_test
 //   TestWorker_MarksFailedOnExecutorError      — executor error → submission StatusFailed
 //   TestWorker_CommitsOffsetAfterSuccess       — queue offset committed on success
 //   TestWorker_CommitsOffsetAfterFailure       — queue offset committed on failure (terminal)
-//   TestWorker_StopsOnContextCancel            — Run() returns when ctx cancelled
+//   TestWorker_StopsOnContextCancel            — Run() returns when ctx canceled
 //   TestWorker_StoreGetErrorDoesNotCommit      — store.Get failure leaves offset uncommitted
 //   TestNewWorker_RequiresNonNilDeps           — constructor validates all deps
 
@@ -76,7 +76,7 @@ type fakeExecutor struct {
 	mu      sync.Mutex
 	called  int
 	// done is closed by Execute after each call, allowing tests to
-	// synchronise on job completion without timing-dependent sleeps.
+	// synchronize on job completion without timing-dependent sleeps.
 	done chan struct{}
 }
 
@@ -170,7 +170,7 @@ func runWorkerUntilDone(
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Wait for Execute to complete — this is the precise synchronisation point.
+	// Wait for Execute to complete — this is the precise synchronization point.
 	exec.waitDone(t, 2*time.Second)
 
 	// Give processJob a moment to write the final status to the store and

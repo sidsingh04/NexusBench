@@ -74,7 +74,7 @@ type Config struct {
 
 	// JobTimeout is the maximum wall-clock time allowed for a single job
 	// (sandbox deploy + bot fleet + result collection).
-	// After this duration the job's context is cancelled and the job fails.
+	// After this duration the job's context is canceled and the job fails.
 	JobTimeout time.Duration
 }
 
@@ -125,7 +125,7 @@ func NewWorker(q queue.Queue, store Store, executor Executor, cfg Config) (*Work
 	}, nil
 }
 
-// Run starts the poll loop. It blocks until ctx is cancelled.
+// Run starts the poll loop. It blocks until ctx is canceled.
 // Jobs are processed one at a time; the loop only blocks between jobs
 // when the queue is empty (Dequeue blocks inside the queue implementation).
 //
@@ -143,11 +143,11 @@ func (w *Worker) Run(ctx context.Context) error {
 	)
 
 	for {
-		// Dequeue blocks until a job arrives or ctx is cancelled.
+		// Dequeue blocks until a job arrives or ctx is canceled.
 		j, err := w.q.Dequeue(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				slog.Info("worker: context cancelled, stopping poll loop", "worker_id", w.id)
+				slog.Info("worker: context canceled, stopping poll loop", "worker_id", w.id)
 				return nil
 			}
 			// Unexpected queue error — log and retry after a brief backoff

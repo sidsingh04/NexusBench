@@ -35,7 +35,7 @@ type SandboxExecutor struct {
 	fleetCfgOverride   *botfleet.FleetConfig
 	sandboxHost        string // hostname the worker uses to reach published sandbox ports
 
-	onStart func(submissionID string)
+	onStart  func(submissionID string)
 	onFinish func()
 
 	telemetryBatchSize int
@@ -43,7 +43,7 @@ type SandboxExecutor struct {
 
 // NewSandboxExecutor constructs a SandboxExecutor with production defaults.
 // Apply functional options (WithJobCallbacks, WithHealthPollInterval, etc.) to
-// customise behaviour for tests or cmd/worker.
+// customize behavior for tests or cmd/worker.
 func NewSandboxExecutor(docker sandboxDeployer, store Store, opts ...ExecutorOption) *SandboxExecutor {
 	e := &SandboxExecutor{
 		docker:             docker,
@@ -191,7 +191,7 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 		"container_id", containerID[:12],
 		"host_port", hostPort,
 	)
-	if err := e.waitHealthy(ctx, containerID, log); err != nil {
+	if err = e.waitHealthy(ctx, containerID, log); err != nil {
 		return nil, fmt.Errorf("executor: sandbox not healthy: %w", err)
 	}
 	log.Info("executor: container is healthy",
@@ -434,8 +434,8 @@ func buildResults(
 	stats := fr.Stats
 
 	const (
-		targetP99Ns  = 1_000_000     // 1ms
-		worstP99Ns   = 100_000_000   // 100ms — floor for score
+		targetP99Ns  = 1_000_000   // 1ms
+		worstP99Ns   = 100_000_000 // 100ms — floor for score
 		targetMaxTPS = float64(50_000)
 	)
 
@@ -462,10 +462,9 @@ func buildResults(
 		incorrectFills = cr.IncorrectFills
 	}
 
-	compositeScore := (0.5 * (1.0 - normP99)) + (0.3 * normTPS) + (0.2 * correctnessScore)
 	// Invert: lower P99 → higher composite. Correct formula per spec:
 	// 0.5*(normP99) + 0.3*(normTPS) + 0.2*(correctness)
-	compositeScore = (0.5 * normP99) + (0.3 * normTPS) + (0.2 * correctnessScore)
+	compositeScore := (0.5 * normP99) + (0.3 * normTPS) + (0.2 * correctnessScore)
 	// Scale to 0–100 for leaderboard readability.
 	compositeScore *= 100.0
 

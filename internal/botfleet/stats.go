@@ -61,8 +61,8 @@ func ComputeStats(results []OrderResult) BotStats {
 	}
 
 	var (
-		latencies        []int64   // nanoseconds, successful orders only
-		sentAts          []int64   // Unix nanoseconds, for TPS window
+		latencies        []int64 // nanoseconds, successful orders only
+		sentAts          []int64 // Unix nanoseconds, for TPS window
 		totalOrders      int64
 		successfulOrders int64
 		errorOrders      int64

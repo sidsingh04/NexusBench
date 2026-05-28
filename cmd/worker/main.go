@@ -70,7 +70,7 @@ func main() {
 	startCtx, startCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer startCancel()
 
-	if err := dockerMgr.VerifyImages(startCtx); err != nil {
+	if err = dockerMgr.VerifyImages(startCtx); err != nil {
 		slog.Warn("worker: some sandbox images are missing", "err", err)
 	}
 
@@ -85,12 +85,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		if err := jobQueue.Close(); err != nil {
-			slog.Warn("worker: job queue close error", "err", err)
+		if errClose := jobQueue.Close(); errClose != nil {
+			slog.Warn("worker: job queue close error", "err", errClose)
 		}
 	}()
 
-	if err := jobQueue.Bootstrap(ctx); err != nil {
+	if err = jobQueue.Bootstrap(ctx); err != nil {
 		slog.Error("worker: bootstrap job queue topic", "err", err)
 		os.Exit(1)
 	}

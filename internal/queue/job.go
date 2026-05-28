@@ -9,7 +9,7 @@
 //     does not break in-flight jobs.
 //
 //  2. The Queue interface is intentionally narrow: Enqueue, Dequeue, CommitJob,
-//     QueueDepth, Close. Richer operations (cancel, inspect, prioritise) belong
+//     QueueDepth, Close. Richer operations (cancel, inspect, prioritize) belong
 //     to a scheduler layer built on top, not in this package.
 //
 //  3. This file has NO external dependencies — only stdlib. Any component
@@ -30,7 +30,7 @@ import (
 // worker can operate fully offline — reading the archive, spinning up the
 // sandbox, running the bot fleet — without any further store lookups.
 //
-// Serialisation: JSON. Workers and the control plane may be different
+// Serialization: JSON. Workers and the control plane may be different
 // processes on different machines; JSON gives us human-readable messages
 // and schema evolution without a code-gen step.
 type Job struct {
@@ -88,7 +88,7 @@ func NewJob(sub *models.Submission) Job {
 // All implementations must be safe for concurrent use by multiple goroutines.
 type Queue interface {
 	// Enqueue publishes a job to the queue. Returns an error if the
-	// underlying transport is unavailable or the context is cancelled.
+	// underlying transport is unavailable or the context is canceled.
 	// Enqueue must not modify j.
 	Enqueue(ctx context.Context, j Job) error
 

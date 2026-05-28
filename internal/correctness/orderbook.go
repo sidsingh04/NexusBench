@@ -97,13 +97,13 @@ type bookEntry struct {
 // Concurrency: NOT goroutine-safe. The Checker creates one instance per
 // benchmark run and applies orders sequentially.
 type GoldenOrderbook struct {
-	buys  []*bookEntry // max-heap by price, then min-heap by seq (price-time)
-	sells []*bookEntry // min-heap by price, then min-heap by seq
+	buys  []*bookEntry          // max-heap by price, then min-heap by seq (price-time)
+	sells []*bookEntry          // min-heap by price, then min-heap by seq
 	index map[string]*bookEntry // id → entry for O(1) cancel lookup
 	seq   uint64
 }
 
-// NewGoldenOrderbook returns an initialised GoldenOrderbook.
+// NewGoldenOrderbook returns an initialized GoldenOrderbook.
 func NewGoldenOrderbook() *GoldenOrderbook {
 	return &GoldenOrderbook{
 		index: make(map[string]*bookEntry),
@@ -266,7 +266,7 @@ func (g *GoldenOrderbook) applyMarket(o GoldenOrder) (GoldenFill, error) {
 func (g *GoldenOrderbook) applyCancel(o GoldenOrder) (GoldenFill, error) {
 	entry, ok := g.index[o.ID]
 	if !ok {
-		// Unknown or already filled/cancelled — reject.
+		// Unknown or already filled/canceled — reject.
 		return GoldenFill{OrderID: o.ID, Accepted: false}, nil
 	}
 

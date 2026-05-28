@@ -103,7 +103,7 @@ Contestants upload a trading engine (matching engine / orderbook) written in C++
 | 4.1 | Terraform Cloud Provisioning — VPC, managed K8s cluster, two node pools (on-demand control-plane + spot worker), container registry | ✅ Complete |
 | 4.2 | Kubernetes Manifests — all seven services deployed, zero-trust NetworkPolicies, RBAC, PodDisruptionBudgets, read-only worker mounts | ✅ Complete |
 | 4.3 | Autoscaling — KEDA ScaledObject on Redpanda consumer-group lag; `QueueDepth` method on `Queue` interface; Prometheus gauge; dry-run + live smoke tests passing | ✅ Complete |
-| 4.4 | CI/CD Pipeline — GitHub Actions: lint + test + tf-validate + k8s-validate on PRs; build + push + rolling deploy on `main` | ⏳ Pending |
+| 4.4 | CI/CD Pipeline — GitHub Actions: lint + test + tf-validate + k8s-validate on PRs; build + push + rolling deploy on `main` | ✅ Complete |
 
 ### New files planned
 

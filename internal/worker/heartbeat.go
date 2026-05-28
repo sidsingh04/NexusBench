@@ -34,7 +34,8 @@ type HeartbeatStatus struct {
 // heartbeatPayload is the JSON body sent to the orchestrator.
 // Field names match orchestrator.HeartbeatUpdate exactly.
 // Defined here (not imported from orchestrator) to avoid a cycle:
-//   worker → orchestrator would mean orchestrator cannot import worker.
+//
+//	worker → orchestrator would mean orchestrator cannot import worker.
 type heartbeatPayload struct {
 	Status        string `json:"status"`
 	CurrentJobID  string `json:"current_job_id,omitempty"`
@@ -65,7 +66,7 @@ func NewHeartbeater(workerID, orchestratorURL string, statusFn func() HeartbeatS
 }
 
 // Run registers the worker then sends heartbeats every HeartbeatInterval
-// until ctx is cancelled. Designed to run as a goroutine:
+// until ctx is canceled. Designed to run as a goroutine:
 //
 //	go hb.Run(ctx)
 //

@@ -24,18 +24,20 @@ import (
 //	└─────────────┘           └──────────────────┘                 └───────┘
 //
 // Window bucketing:
-//   Events are grouped by (submissionID, 5-second bucket). The bucket is
-//   computed as: truncate(event.Timestamp, 5s). When we receive an event
-//   whose timestamp falls into a NEW bucket for a given submission, we
-//   close and flush the previous bucket first, then start the new one.
-//   This means windows close lazily (on the next event) rather than on a
-//   wall-clock ticker — correct for a single-partition ordered stream.
+//
+//	Events are grouped by (submissionID, 5-second bucket). The bucket is
+//	computed as: truncate(event.Timestamp, 5s). When we receive an event
+//	whose timestamp falls into a NEW bucket for a given submission, we
+//	close and flush the previous bucket first, then start the new one.
+//	This means windows close lazily (on the next event) rather than on a
+//	wall-clock ticker — correct for a single-partition ordered stream.
 //
 // Consumer group:
-//   We use a named consumer group ("nexusbench-consumer") so that on restart
-//   the consumer resumes from where it left off (committed offset) rather
-//   than re-reading from the start. This is what makes WriteWindow's
-//   ON CONFLICT DO NOTHING meaningful — it's a last-resort guard.
+//
+//	We use a named consumer group ("nexusbench-consumer") so that on restart
+//	the consumer resumes from where it left off (committed offset) rather
+//	than re-reading from the start. This is what makes WriteWindow's
+//	ON CONFLICT DO NOTHING meaningful — it's a last-resort guard.
 //
 // The zero value is NOT valid. Use NewConsumer.
 type Consumer struct {
@@ -113,7 +115,7 @@ func NewConsumer(cfg Config, store Store) (*Consumer, error) {
 	}, nil
 }
 
-// Run starts the consume loop. It blocks until ctx is cancelled.
+// Run starts the consume loop. It blocks until ctx is canceled.
 // On cancellation it flushes all open windows before returning.
 //
 // Typical usage:
@@ -131,14 +133,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 	for {
 		// PollFetches blocks until at least one record is available or ctx
-		// is cancelled. It never returns nil.
+		// is canceled. It never returns nil.
 		fetches := c.client.PollFetches(ctx)
 
-		// ctx cancelled — flush open windows and exit cleanly.
+		// ctx canceled — flush open windows and exit cleanly.
 		if ctx.Err() != nil {
-			slog.Info("consumer: context cancelled, flushing open windows")
+			slog.Info("consumer: context canceled, flushing open windows")
 			c.flushAll(context.Background())
-			return nil
+			return ctx.Err()
 		}
 
 		// Log fetch-level errors (partition errors, broker disconnects) but
@@ -161,7 +163,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				)
 				// Don't stop the consumer on a single bad record.
 				// The record is still marked — it will be committed and
-				// not retried, which is the correct behaviour for a
+				// not retried, which is the correct behavior for a
 				// malformed event.
 			}
 			// Mark this record's offset as ready to commit.
