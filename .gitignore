@@ -38,3 +38,6 @@ graphify-out/
 .env
 .env.*
 !.env.example
+
+# Temporary files
+_roadmap_tmp.md

@@ -1,488 +1,1150 @@
-# TASK.md — Phase 4: Terraform & Infrastructure Automation
+# TASK.md — Phase 5: Advanced Benchmarking
 
-> **Status: ✅ Complete**
-> Phase 3 is ✅ complete. Phase 4 is ✅ complete. All four stages passed their gates.
+> **Status: ⏳ In Progress**
+> Phase 4 is ✅ complete. Begin Phase 5 only after `make ci` passes clean on
+> the Phase 4 codebase.
 
 ---
 
 ## Goal
 
-Provision all NexusBench infrastructure with Terraform, deploy every service to
-Kubernetes, autoscale the worker fleet based on Redpanda queue depth, and
-establish a repeatable CI/CD pipeline — all while enforcing the security model
-mandated by PROGRESS.md (disposable worker nodes, strict NetworkPolicies,
-read-only code mounts).
+Evolve NexusBench from a single-run benchmark tool into a timed competitive
+contest platform with:
+
+- A **contest lifecycle** (one active contest, admin control, auto-close)
+- **Three sequential volatility runs** per submission (Low / Medium / High)
+- **Volatility-aware composite scoring** with correctness as a multiplier
+- **One-active-submission guard** per team per contest
+- **Dry-run validator** for pre-submission engine verification
+- **SSE live leaderboard** (push, not poll)
+- **WebSocket bot transport** alongside the existing REST transport
+
+**Zero existing tests may break.** Every stage gate requires `go test ./... -race`
+to pass before proceeding to the next stage.
 
 ---
 
-## Architectural Constraints (non-negotiable)
+## Architectural Constraints (carried from Phase 4, non-negotiable)
 
-These come directly from the PROGRESS.md architectural decision record:
-
-1. **No gVisor** — capability-dropping Docker is the isolation mechanism.
-2. **Disposable Workers** — worker pods are ephemeral; recycled after every job.
-3. **NetworkPolicies** — workers have no outbound internet; isolated from the
-   control plane's internal DB/Redpanda APIs.
-4. **Read-Only code volumes** — contestant archives are mounted `readOnly: true`.
-5. **Spot/Preemptible nodes** — worker node pool uses spot pricing to keep costs
-   low and reinforce the ephemeral contract.
+1. **Deep modules.** Each new package owns its domain. Narrow interfaces at
+   boundaries. No package exists only to re-export another's types.
+2. **No import cycles.** `models` imports nothing internal. `correctness` and
+   `botfleet` import nothing from `worker`, `submission`, or `contest`.
+   `validator` imports `botfleet` and `correctness` only.
+3. **No logic in `models`.** `models` is pure data — structs, constants, zero
+   methods with business logic.
+4. **Interfaces only when needed.** New interfaces require either multiple
+   implementations or a test double. Don't wrap a single concrete type in an
+   interface for its own sake.
+5. **Backward compatibility.** All Phase 1–4 API endpoints must continue to
+   work identically. New endpoints are additive only.
+6. **`make test -race` must pass after every stage.** This is the gate, not
+   a suggestion.
 
 ---
 
-## Incremental Stage Plan
-
-Phase 4 is split into four stages. Each stage has a clear gate: all gate tests
-must pass before moving to the next stage.
+## Stage Overview
 
 ```
-Stage 4.1  Terraform Cloud Provisioning    (infrastructure as code, no K8s yet)
-Stage 4.2  Kubernetes Manifests            (deploy all services, NetworkPolicies)
-Stage 4.3  Autoscaling                     (HPA on Redpanda queue depth)
-Stage 4.4  CI/CD Pipeline                  (GitHub Actions end-to-end)
+Stage 5.1  models + ContestStore               ✅ COMPLETE
+Stage 5.2  ContestService + admin endpoints    (data layer, no behaviour)
+Stage 5.3  One-active-submission guard         (lifecycle logic + HTTP)
+Stage 5.4  Volatility-aware scoring            (Ingest gate, 10 lines)
+Stage 5.5  Sequential three-job dispatch       (replace hardcoded buildResults)
+Stage 5.6  Dry-run Validator                   (job chaining, no new packages)
+Stage 5.7  SSE live leaderboard                (new internal/validator package)
+Stage 5.8  WebSocket BotTransport              (leaderboardBus + stream endpoint)
+Stage 5.9  PostgreSQL ContestStore             (new transport, BotTransport.Close)
+Stage 5.10 Integration smoke test              (replace MemoryContestStore in prod)
 ```
+
+Each stage is independently testable. Each stage gate is a `make test -race`
+pass plus the specific checks listed at the bottom of the stage.
 
 ---
 
-## Stage 4.1 — Terraform Cloud Provisioning
+## Stage 5.1 — Data Model Additions ✅ COMPLETE
 
-> **Status: ✅ Complete**
+> **Completed.** Gate passed: `go build ./...` clean, `go test ./internal/models/... ./internal/queue/... -v -race` green, all pre-existing tests still pass.
+
+### What was delivered
+
+**`internal/models/models.go`**
+- `ContestStatus` type + `draft` / `active` / `closed` constants
+- `VolatilityProfile` struct (13 fields: bot count, duration, order ratios, price params, scoring targets and weights)
+- `Contest` struct with three embedded `VolatilityProfile` fields, aggregate weights, timestamps
+- `Contest.ProfileByLabel(label)` method
+- `Submission` extended: `ContestID`, `AllResults []*BenchmarkResults`, `FinalScore`; legacy `Results` field kept
+- `Submission.ResultByLabel(label)` method
+- `BenchmarkResults` extended: `VolatilityLabel`, `RunScore`; legacy `CompositeScore` kept
+- `LeaderboardEntry` extended: `LowScore`, `MediumScore`, `HighScore`, `FinalScore`, `BestP99Ms`, `PeakSustainedTPS`, `AvgCorrectness`; legacy fields kept
+- `SubmissionStatus.IsTerminal()` method
+- Sentinel errors: `ErrNoActiveContest`, `ErrSubmissionInProgress`, `ErrContestNotActive`
+
+**`internal/queue/job.go`**
+- `Job` extended: `ContestID`, `VolatilityLabel`, `RemainingProfiles []string`
+- `NewProfileJob(sub, contestID, label, remaining)` — defensive-copies `remaining`
+- `Job.IsLastProfile()` predicate
+- `NewJob` untouched (Phase 1–4 backward compat)
+
+**`internal/config/config.go`**
+- `AdminAPIKey string` (from `ADMIN_API_KEY` env var)
+- `PostgresDSN string` (from `POSTGRES_DSN` env var)
+
+**New test files**
+- `internal/models/models_phase5_test.go` — 9 tests
+- `internal/queue/job_phase5_test.go` — 6 tests
+
+### Design decisions
+- `models` still imports nothing from other internal packages (enforced by `go build`).
+- Defensive copy in `NewProfileJob` prevents caller slice mutations corrupting in-flight job state.
+- `IsTerminal()` is the single authoritative terminal-status check; Stage 5.3 calls it rather than repeating the switch.
+- Sentinel errors in `models` (not `submission` or `contest`) so any package can use `errors.Is` without introducing an import cycle.
+- `CompositeScore`, `Results`, `P99LatencyMs`, `MaxTPS`, `CorrectnessScore` all preserved on existing types — Phase 1–4 leaderboard handler compiles and runs unchanged.
+
+---
+
+## Stage 5.2 — ContestService and Admin Endpoints
+
+> **Touches:** new `internal/contest/` package, `internal/api/router.go`,
+>   `internal/config/config.go`, `cmd/server/main.go`.
+> **New packages:** `internal/contest`.
+> **Tests required:** 8 unit tests (see below), all using `MemoryContestStore`.
 
 ### Goal
 
-Write Terraform that provisions a production-grade cloud environment from
-scratch: VPC, managed Kubernetes cluster, two node pools (control-plane +
-disposable workers), container registry, and a shared persistent-volume claim
-for submission data.
+Implement the contest lifecycle (create / activate / close / auto-close) behind
+a `ContestService` with a `ContestStore` interface. Wire admin HTTP endpoints.
+The `MemoryContestStore` is the only implementation in this stage — PostgreSQL
+comes in Stage 5.9.
 
-All infrastructure is parameterised; no hard-coded cloud credentials, regions,
-or resource sizes appear in the code.
-
-### Directory layout
+### Package design: `internal/contest`
 
 ```
-terraform/
-├── main.tf              # provider + terraform block
-├── variables.tf         # all input variables with descriptions + defaults
-├── outputs.tf           # kubeconfig, registry URL, cluster endpoint
-├── versions.tf          # required_providers with exact version pins
-├── modules/
-│   ├── cluster/         # managed K8s cluster (GKE or EKS)
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── node-pools/      # control-plane pool + disposable worker pool
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── registry/        # container registry (GCR / ECR)
-│       ├── main.tf
-│       ├── variables.tf
-│       └── outputs.tf
-└── envs/
-    ├── dev.tfvars        # small sizes, 1 worker node, spot OK
-    └── prod.tfvars       # production sizes, min 2 worker nodes, spot OK
+internal/contest/
+├── store.go       // ContestStore interface + MemoryContestStore
+├── service.go     // ContestService: Create, Activate, Close, GetActive
+├── defaults.go    // DefaultLowProfile(), DefaultMediumProfile(), DefaultHighProfile()
+└── service_test.go
 ```
+
+**`store.go`** defines:
+
+```go
+// ContestStore is the persistence interface for contests.
+// Implementations: MemoryContestStore (tests/dev), PostgresContestStore (prod).
+type ContestStore interface {
+    Save(c *models.Contest) error
+    Get(id string) (*models.Contest, error)
+    // GetActive returns the single Contest with Status=active.
+    // Returns models.ErrNoActiveContest if none exists.
+    GetActive() (*models.Contest, error)
+    List() ([]*models.Contest, error)
+    Update(c *models.Contest) error
+    // SnapshotLeaderboard archives the final ranked entries for a closed contest.
+    // Called exactly once per contest, when it closes.
+    SnapshotLeaderboard(contestID string, entries []*models.LeaderboardEntry) error
+    GetLeaderboardSnapshot(contestID string) ([]*models.LeaderboardEntry, error)
+}
+```
+
+`MemoryContestStore` uses a `sync.RWMutex` and two maps:
+`map[string]*models.Contest` and `map[string][]*models.LeaderboardEntry`.
+
+**`service.go`** defines `ContestService`:
+
+```go
+type ContestService struct {
+    store ContestStore
+    // bus is used to broadcast leaderboard events. Injected; may be nil
+    // in tests that do not test SSE behaviour.
+    bus LeaderboardBroadcaster
+}
+
+// LeaderboardBroadcaster is satisfied by the leaderboardBus in internal/api.
+// Defined here so internal/contest does not import internal/api.
+type LeaderboardBroadcaster interface {
+    Broadcast(event LeaderboardEvent)
+}
+
+// LeaderboardEvent mirrors the type in internal/api but is defined here to
+// avoid an import cycle. The api layer converts between the two.
+type LeaderboardEvent struct {
+    Type      string                    // "update" | "frozen"
+    ContestID string
+    Entries   []*models.LeaderboardEntry
+}
+
+func NewContestService(store ContestStore, bus LeaderboardBroadcaster) *ContestService
+
+// Create persists a new Contest in draft status.
+// Returns an error if a contest with Status=active already exists.
+func (s *ContestService) Create(ctx context.Context, req CreateContestRequest) (*models.Contest, error)
+
+// Activate transitions a draft contest to active.
+// Returns an error if another contest is already active.
+func (s *ContestService) Activate(ctx context.Context, id string) (*models.Contest, error)
+
+// Close transitions an active contest to closed.
+// Computes the final leaderboard from completed submissions, snapshots it,
+// and broadcasts a "frozen" event. Idempotent: closing an already-closed
+// contest is a no-op.
+func (s *ContestService) Close(ctx context.Context, id string, entries []*models.LeaderboardEntry) error
+
+// GetActive returns the current active contest or models.ErrNoActiveContest.
+func (s *ContestService) GetActive(ctx context.Context) (*models.Contest, error)
+
+// ListPast returns all closed contests.
+func (s *ContestService) ListPast(ctx context.Context) ([]*models.Contest, error)
+
+// GetLeaderboardSnapshot returns the archived leaderboard for a closed contest.
+func (s *ContestService) GetLeaderboardSnapshot(ctx context.Context, contestID string) ([]*models.LeaderboardEntry, error)
+```
+
+**`defaults.go`** exports three functions returning the default
+`VolatilityProfile` for each level. Values match the table in PROGRESS.md.
+
+#### 5.2.1 — Add `ADMIN_API_KEY` to config
+
+In `internal/config/config.go`, add:
+```go
+AdminAPIKey string // required for admin endpoints; loaded from ADMIN_API_KEY env var
+```
+
+In `internal/api/router.go`, add `adminAuthMiddleware`:
+```go
+// adminAuthMiddleware checks Authorization: Bearer <ADMIN_API_KEY>.
+// Returns 401 if the header is missing or the key does not match.
+// Returns 403 if the key matches but the request does not have admin scope
+// (reserved for future role expansion).
+func adminAuthMiddleware(apiKey string) mux.MiddlewareFunc
+```
+
+Apply the middleware to a new `/api/v1/admin` subrouter. All existing routes
+remain unmodified.
+
+#### 5.2.2 — Admin endpoints
+
+Register on the `/api/v1/admin` subrouter:
+
+```
+POST /api/v1/admin/contests                      → contestHandler.Create
+POST /api/v1/admin/contests/{id}/activate        → contestHandler.Activate
+POST /api/v1/admin/contests/{id}/close           → contestHandler.Close
+GET  /api/v1/admin/contests                      → contestHandler.ListPast
+GET  /api/v1/admin/contests/{id}/leaderboard     → contestHandler.GetLeaderboardSnapshot
+```
+
+`contestHandler` is a new unexported struct in `internal/api` that holds a
+`*contest.ContestService`. No business logic in the handler — validation,
+status transitions, and snapshot logic all live in `ContestService`.
+
+#### 5.2.3 — Auto-close goroutine
+
+In `cmd/server/main.go`, start:
+
+```go
+go runContestAutoClose(ctx, contestService, submissionService, tickInterval)
+```
+
+`runContestAutoClose` ticks every 30 seconds. On each tick:
+1. Calls `contestService.GetActive()`. If `ErrNoActiveContest`, skip.
+2. If `contest.EndsAt != nil && time.Now().After(*contest.EndsAt)`:
+   a. Calls `submissionService.List()`, filters for completed submissions
+      in this contest, computes leaderboard entries.
+   b. Calls `contestService.Close(ctx, contest.ID, entries)`.
+
+#### 5.2.4 — Unit tests (`internal/contest/service_test.go`)
+
+| Test | What it verifies |
+|---|---|
+| `TestCreate_Draft` | Created contest has `Status=draft` |
+| `TestActivate_Transitions` | `draft → active`; `GetActive` returns it |
+| `TestActivate_RejectsIfAlreadyActive` | second `Activate` on a different draft returns error |
+| `TestClose_Snapshots` | `Close` writes leaderboard snapshot; `GetLeaderboardSnapshot` returns it |
+| `TestClose_Idempotent` | Closing an already-closed contest is a no-op |
+| `TestGetActive_ErrWhenNone` | Returns `ErrNoActiveContest` when no contest is active |
+| `TestGetActive_ErrAfterClose` | Returns `ErrNoActiveContest` after the active contest closes |
+| `TestAdminMiddleware_RejectsWrongKey` | `adminAuthMiddleware` returns 401 for wrong key |
+
+### Gate — Stage 5.2
+
+```bash
+make test -race                     # all tests pass including 8 new ones
+go vet ./internal/contest/...       # zero warnings
+curl -X POST localhost:8080/api/v1/admin/contests \
+  -H "Authorization: Bearer testkey" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"test","use_defaults":true}'
+# → 201 Created with contest JSON
+curl -X POST localhost:8080/api/v1/admin/contests/{id}/activate \
+  -H "Authorization: Bearer testkey"
+# → 200 OK, status=active
+curl localhost:8080/api/v1/admin/contests/{id}/activate  # no auth header
+# → 401 Unauthorized
+```
+
+---
+
+## Stage 5.3 — One-Active-Submission Guard
+
+> **Touches:** `internal/submission/service.go` only.
+> **New packages:** none.
+> **Tests required:** 2 new unit tests added to existing submission test file.
+
+### Goal
+
+Prevent a team from flooding the queue by submitting while their previous
+submission is still being evaluated. This is a single check in `Ingest`.
 
 ### Tasks
 
-#### 4.1.1 — Terraform scaffolding
+#### 5.3.1 — Gate in `Service.Ingest`
 
-- [x] Create `terraform/versions.tf` — pin `hashicorp/google` (or `hashicorp/aws`) and `kubernetes` providers to exact versions
-- [x] Create `terraform/variables.tf` — variables: `project_id`, `region`, `cluster_name`, `worker_node_machine_type`, `worker_node_min`, `worker_node_max`, `control_plane_machine_type`, `registry_location`
-- [x] Create `terraform/outputs.tf` — export `cluster_endpoint`, `kubeconfig_raw`, `registry_url`
-- [x] Create `terraform/main.tf` — wire modules together; no resource blocks at root level (keep root thin)
+After validating language and protocol, and before calling `s.store.Save`,
+add:
 
-#### 4.1.2 — Cluster module
+```go
+// One-active-submission guard: reject if this team already has an
+// in-progress submission in the same contest.
+if err := s.checkNoActiveSubmission(req.TeamName, contestID); err != nil {
+    return nil, err
+}
+```
 
-- [x] Create `terraform/modules/cluster/main.tf`
-  - Managed K8s cluster (GKE `google_container_cluster` or EKS `aws_eks_cluster`)
-  - VPC-native networking enabled
-  - Workload Identity / IRSA enabled (so pods can authenticate to cloud APIs without static keys)
-  - Private cluster endpoint (no public API server)
-- [x] Create `terraform/modules/cluster/variables.tf` + `outputs.tf`
+`checkNoActiveSubmission` calls `s.store.List()`, iterates, and returns
+`models.ErrSubmissionInProgress` if any submission from the same `TeamName`
+and `ContestID` has a non-terminal status:
+(`StatusPending`, `StatusBuilding`, `StatusDeploying`, `StatusRunning`,
+`StatusBenchmarking`).
 
-#### 4.1.3 — Node pool module (two pools)
+Terminal statuses (`StatusCompleted`, `StatusFailed`) are allowed — a team
+may resubmit after their previous run finishes.
 
-- [x] **Control-plane pool** — standard on-demand nodes, min=1 max=3, taints none
-- [x] **Worker pool** — spot/preemptible nodes, min=0 max=10, taint `role=benchmark-worker:NoSchedule`
-  - Taint enforces that only benchmark worker pods land on spot nodes
-  - Auto-repair and auto-upgrade enabled
-  - Surge upgrade strategy (one node upgraded at a time)
-- [x] Expose `worker_pool_id` in outputs (referenced by HPA in Stage 4.3)
+`contestID` is sourced from the active contest. If no contest is active,
+`Ingest` returns `models.ErrContestNotActive` before reaching this check.
 
-#### 4.1.4 — Registry module
+#### 5.3.2 — Gate for submissions-closed
 
-- [x] Create `terraform/modules/registry/main.tf` — private container registry
-- [x] Grant the K8s node service account pull access (Workload Identity binding)
+In `Ingest`, after the one-active-submission check:
 
-#### 4.1.5 — Environment var files
+```go
+if contest.SubmissionsClosedAt != nil && time.Now().After(*contest.SubmissionsClosedAt) {
+    return nil, models.ErrContestNotActive
+}
+```
 
-- [x] Create `terraform/envs/dev.tfvars` — `e2-standard-2` nodes, worker min=0 max=3
-- [x] Create `terraform/envs/prod.tfvars` — `c2-standard-8` nodes, worker min=1 max=10
+#### 5.3.3 — Unit tests
 
-#### 4.1.6 — Validation
+Add to the existing submission service test file:
 
-- [x] `terraform fmt -recursive` — zero diff
-- [x] `terraform validate` — no errors
-- [x] `terraform plan -var-file=envs/dev.tfvars` — plan output reviewed, no unexpected destroys
-- [x] Add `make tf-validate` target to Makefile
+| Test | What it verifies |
+|---|---|
+| `TestIngest_RejectsIfSubmissionInProgress` | Returns `ErrSubmissionInProgress` when team has a pending submission |
+| `TestIngest_AllowsAfterPreviousCompleted` | Returns no error when team's previous submission is `StatusCompleted` |
 
-### Gate — Stage 4.1
+### Gate — Stage 5.3
 
 ```bash
-make tf-validate   # terraform fmt + validate pass
-# Reviewer manually checks: plan shows cluster + 2 node pools + registry
-# No credentials or project IDs are hard-coded anywhere
+make test -race    # all tests pass including 2 new ones
+# Manual: submit twice from the same team during an active contest
+# → second submit returns HTTP 409 with code="SUBMISSION_IN_PROGRESS"
 ```
 
 ---
 
-## Stage 4.2 — Kubernetes Manifests
+## Stage 5.4 — Volatility-Aware Scoring
 
-> **Status: ✅ Complete**
+> **Touches:** `internal/worker/executor.go` only.
+> **New packages:** none.
+> **Tests required:** 4 new unit tests replacing/extending existing `buildResults` tests.
 
 ### Goal
 
-Deploy all seven NexusBench services to Kubernetes using raw manifests (no
-Helm yet). Every security control from the architectural constraints is
-enforced at the manifest level: NetworkPolicies, read-only mounts, pod
-disruption budgets, resource requests/limits.
-
-### Directory layout
-
-```
-k8s/
-├── namespace.yaml
-├── configmaps/
-│   └── nexusbench-config.yaml
-├── secrets/
-│   └── .gitkeep              # secrets are managed by Terraform / Sealed Secrets
-├── control-plane/
-│   ├── deployment.yaml
-│   ├── service.yaml
-│   └── ingress.yaml
-├── worker/
-│   ├── deployment.yaml       # disposable pod spec — key security surface
-│   └── pdb.yaml              # PodDisruptionBudget: maxUnavailable=1
-├── consumer/
-│   └── deployment.yaml
-├── redpanda/
-│   ├── statefulset.yaml
-│   └── service.yaml
-├── timescaledb/
-│   ├── statefulset.yaml
-│   ├── service.yaml
-│   └── pvc.yaml
-├── network-policies/
-│   ├── default-deny-all.yaml
-│   ├── allow-control-plane.yaml         # control-plane ingress + egress
-│   ├── allow-worker-egress-redpanda.yaml # workers → Redpanda + control-plane only
-│   ├── allow-consumer-egress.yaml        # consumer → Redpanda + TimescaleDB only
-│   ├── allow-ingress-external.yaml       # NGINX → control-plane
-│   ├── allow-redpanda-ingress.yaml       # added during live debugging (issue 8)
-│   └── allow-timescaledb-ingress.yaml    # added during live debugging (issue 8)
-└── rbac/
-    ├── worker-serviceaccount.yaml
-    └── worker-role.yaml                    # minimal: list pods only
-```
+Replace the hardcoded scoring constants in `buildResults` with profile-aware
+normalization. The scoring formula is unchanged in structure but now reads
+targets from the `VolatilityProfile` carried in the `Job`.
 
 ### Tasks
 
-#### 4.2.1 — Namespace + base config
+#### 5.4.1 — `buildResults` signature change
 
-- [x] Create `k8s/namespace.yaml` — namespace `nexusbench`, labels for NetworkPolicy selector
-- [x] Create `k8s/configmaps/nexusbench-config.yaml` — all non-secret env vars (broker address, image names, bot fleet defaults)
-- [x] Add `.gitkeep` to `k8s/secrets/` with a comment explaining secrets are injected by CI/CD
+Change:
+```go
+func buildResults(fr *botfleet.FleetResult, cr *correctness.CorrectnessResult) *models.BenchmarkResults
+```
+To:
+```go
+func buildResults(
+    fr     *botfleet.FleetResult,
+    cr     *correctness.CorrectnessResult,
+    profile models.VolatilityProfile,
+    label  string,
+) *models.BenchmarkResults
+```
 
-#### 4.2.2 — Control-plane Deployment
+Remove all `const` blocks (`targetP99Ns`, `worstP99Ns`, `targetMaxTPS`) from
+`buildResults`. Replace with values from `profile`.
 
-- [x] Create `k8s/control-plane/deployment.yaml`
-  - `replicas: 1`, image from registry
-  - `resources.requests`: cpu=250m memory=256Mi; `limits`: cpu=500m memory=512Mi
-  - `livenessProbe` + `readinessProbe` on `/health`
-  - `securityContext`: `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `runAsNonRoot: true`
-  - Mount `submissions-pvc` at `/data/submissions`
-- [x] Create `k8s/control-plane/service.yaml` — ClusterIP on port 8080
-- [x] Create `k8s/control-plane/ingress.yaml` — NGINX ingress, TLS termination
-- [x] Create `k8s/control-plane/pvc.yaml` — 50Gi ReadWriteOnce PVC for contestant archives
+#### 5.4.2 — Per-run score formula
 
-#### 4.2.3 — Worker Deployment (security-critical)
+```go
+// normP99: 1.0 at or below target, 0.0 at or above 10×target, linear between.
+worstP99Ns := profile.TargetP99Ns * 10
+normP99 := 0.0
+if stats.P99Ns <= profile.TargetP99Ns {
+    normP99 = 1.0
+} else if stats.P99Ns < worstP99Ns {
+    normP99 = 1.0 - float64(stats.P99Ns-profile.TargetP99Ns)/float64(worstP99Ns-profile.TargetP99Ns)
+}
 
-- [x] Create `k8s/worker/deployment.yaml`
-  - Node selector + toleration for `role=benchmark-worker` spot pool
-  - `securityContext`: `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, capabilities `drop: [ALL]`
-  - `terminationGracePeriodSeconds: 60` — allow in-flight job to finish
-  - `resources.limits`: cpu=2000m memory=1Gi (hard ceiling per worker)
-  - Env vars from ConfigMap; NODE_IP + SANDBOX_HOST injected via Downward API
-- [x] Create `k8s/worker/pdb.yaml` — `maxUnavailable: 1` so upgrade drains don't evict all workers at once
+// normTPS: uses SustainedTPS (full-run average), not MaxTPS (100ms burst).
+normTPS := stats.SustainedTPS / profile.TargetSustainTPS
+if normTPS > 1.0 { normTPS = 1.0 }
 
-#### 4.2.4 — Consumer + StatefulSets
+// Correctness multiplier: bad correctness penalises latency and throughput too.
+runScore := correctnessScore *
+    (profile.LatencyWeight*normP99 + profile.ThroughputWeight*normTPS) +
+    profile.CorrectnessWeight*correctnessScore
+```
 
-- [x] Create `k8s/consumer/deployment.yaml` — single replica, same security context pattern
-- [x] Create `k8s/redpanda/statefulset.yaml` + `service.yaml` — 1 replica (dev), 3 replicas (prod); PVC for data
-- [x] Create `k8s/timescaledb/statefulset.yaml` + `service.yaml` + `pvc.yaml` — 1 replica; `storageClassName: standard`
+Set `BenchmarkResults.RunScore = runScore` and
+`BenchmarkResults.VolatilityLabel = label`.
 
-#### 4.2.5 — NetworkPolicies (zero-trust)
+The `CompositeScore` field on `BenchmarkResults` is **removed** in this stage
+(it was the old single-run score). The final `FinalScore` on
+`LeaderboardEntry` replaces it and is computed in Stage 5.5 after all three
+runs complete.
 
-- [x] `default-deny-all.yaml` — deny all ingress and egress for every pod in namespace by default
-- [x] `allow-control-plane.yaml` — control-plane ingress from NGINX + workers + Prometheus; egress to Redpanda + TimescaleDB + DNS
-- [x] `allow-worker-egress-redpanda.yaml` — workers can reach **only** Redpanda (port 9092) and the control-plane heartbeat endpoint; no other egress
-- [x] `allow-consumer-egress.yaml` — consumer can reach Redpanda + TimescaleDB only
-- [x] `allow-ingress-external.yaml` — NGINX ingress pod can forward to control-plane
+#### 5.4.3 — `buildFleetConfig` change
 
-#### 4.2.6 — RBAC
+Change `buildFleetConfig` to accept a `models.VolatilityProfile` and return a
+`botfleet.FleetConfig` populated from it. Remove the call to
+`botfleet.DefaultFleetConfig`.
 
-- [x] `worker-serviceaccount.yaml` — dedicated ServiceAccount for worker pods; `automountServiceAccountToken: false`
-- [x] `worker-role.yaml` — namespace-scoped Role: `get`, `list` on `pods` only; bound to worker ServiceAccount
+```go
+func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) botfleet.FleetConfig {
+    return botfleet.FleetConfig{
+        TargetURL:    targetURL,
+        BotCount:     p.BotCount,
+        TestDuration: p.TestDuration,
+        GeneratorConfig: botfleet.RandomGeneratorConfig{
+            Ratios: botfleet.OrderRatios{
+                Limit:  p.LimitRatio,
+                Market: p.MarketRatio,
+                Cancel: p.CancelRatio,
+            },
+            Price:    botfleet.PriceConfig{MidPrice: 10_000, Spread: p.PriceSpreadCents},
+            Quantity: botfleet.QuantityConfig{Min: 1, Max: p.MaxQuantity},
+        },
+    }
+}
+```
 
-#### 4.2.7 — Validation
+#### 5.4.4 — Unit tests
 
-- [x] `make k8s-validate` — offline validation passes with zero errors
-- [x] Add `make k8s-validate` target to Makefile (done in Stage 4.1)
-- [x] Add `scripts/smoke_test_phase4_stage2.sh` — dry-run and live modes
+| Test | What it verifies |
+|---|---|
+| `TestBuildResults_LowProfile_PerfectScore` | P99=target, TPS=target, correctness=1.0 → RunScore=1.0 |
+| `TestBuildResults_HighProfile_WorstLatency` | P99>>target → normP99≈0, RunScore driven by TPS+correctness only |
+| `TestBuildResults_ZeroCorrectness_ZerosAll` | correctness=0.0 → RunScore=0.0 regardless of TPS/P99 |
+| `TestBuildResults_LabelPropagated` | VolatilityLabel is set correctly from the profile |
 
-### Gate — Stage 4.2
+### Gate — Stage 5.4
 
 ```bash
-make k8s-validate
-# make k8s-validate passes for all manifests
-# NetworkPolicy audit: worker pods have no path to TimescaleDB or internet
+make test -race    # all tests pass including 4 new ones
+# Verify: go vet ./internal/worker/... returns zero warnings
+# Verify: CompositeScore field is gone from BenchmarkResults JSON
 ```
 
 ---
 
-## Stage 4.3 — Autoscaling (HPA on Queue Depth)
+## Stage 5.5 — Sequential Three-Job Dispatch
 
-> **Status: ✅ Complete**
+> **Touches:** `internal/submission/service.go`, `internal/worker/executor.go`,
+>   `internal/queue/job.go`.
+> **New packages:** none.
+> **Tests required:** 3 new unit tests.
 
 ### Goal
 
-Scale the worker `Deployment` automatically based on the number of pending jobs
-in the Redpanda `jobs.benchmark` topic. The HPA uses a custom external metric
-(consumer lag) exposed via KEDA (Kubernetes Event-Driven Autoscaling), which
-natively understands Kafka/Redpanda consumer group lag.
+Each submission triggers three sequential benchmark jobs — one per volatility
+profile. "Sequential" means job[1] is only enqueued after job[0] is committed
+by a worker. The `FinalScore` is computed once all three `BenchmarkResults`
+are written for a submission.
 
 ### Design
 
-```
-Redpanda jobs.benchmark topic
-        │  consumer-group lag
-        ▼
-   KEDA ScaledObject
-        │  external metric: jobs_pending
-        ▼
-   HPA (managed by KEDA)
-        │  scale worker Deployment
-        ▼
-   worker Deployment   min=1  max=10
-```
+The `Job` type already has `RemainingProfiles []string` (added in Stage 5.1).
+The dispatch chain works as follows:
 
-Target: 1 worker replica per 5 pending jobs, with a 30-second stabilisation
-window on scale-down (so a brief burst doesn't cause flapping).
+1. `Service.Ingest` enqueues **one** job for the first profile (`"low"`), with
+   `RemainingProfiles: ["medium", "high"]`.
+2. `SandboxExecutor.Execute`, after writing `BenchmarkResults` for `"low"`,
+   calls `s.enqueueNext(ctx, j)`. This pops `RemainingProfiles[0]` ("medium"),
+   constructs a new job with the popped label and the remainder
+   (`["high"]`), and enqueues it.
+3. This repeats until `RemainingProfiles` is empty (the "high" job).
+4. After the "high" job commits, `Execute` calls `s.computeFinalScore(ctx, j.SubmissionID)`.
 
 ### Tasks
 
-#### 4.3.1 — KEDA installation
+#### 5.5.1 — Ingest dispatches first job only
 
-- [x] Add KEDA to Terraform: `helm_release` resource for `kedacore/keda` chart, pinned version
-- [x] Alternatively, add `k8s/keda/` manifest install as a pre-step in CI
+In `Service.Ingest`, replace the single job creation with:
 
-#### 4.3.2 — KEDA ScaledObject
+```go
+j := queue.NewProfileJob(sub, contest, "low", []string{"medium", "high"})
+```
 
-- [x] Create `k8s/worker/scaledobject.yaml`
-  - `scaleTargetRef`: worker Deployment
-  - `minReplicaCount: 1`, `maxReplicaCount: 10`
-  - `cooldownPeriod: 30` (seconds before scale-down after queue drains)
-  - Trigger type: `kafka`
-    - `bootstrapServers`: Redpanda ClusterIP service
-    - `consumerGroup`: `nexusbench-workers`
-    - `topic`: `jobs.benchmark`
-    - `lagThreshold: "5"` (1 extra worker per 5 unprocessed messages)
-  - `advanced.restoreToOriginalReplicaCount: false` (don't snap to original)
-  - `advanced.horizontalPodAutoscalerConfig.behavior` — scale-up immediately (5 pods/15s), scale-down slowly (1 pod/30s)
-  - `pollingInterval: 15` — matches Prometheus scrape interval
+`queue.NewProfileJob` is a new constructor that sets `ContestID`,
+`VolatilityLabel`, and `RemainingProfiles`.
 
-#### 4.3.3 — Internal metric for `internal/queue`
+#### 5.5.2 — Worker re-enqueues next profile
 
-- [x] Add `QueueDepth(ctx) (int64, error)` method to the `Queue` interface in `internal/queue`
-- [x] Implement on `RedpandaQueue` using `kadm.Client.ListEndOffsets` + `kadm.Client.FetchOffsets` — compute lag as sum(end - committed) across all partitions
-- [x] Implement on `MemoryQueue` (returns `int64(len(ch))`, non-blocking)
-- [x] Expose queue depth on a new Prometheus gauge `nexusbench_queue_depth` in `internal/metrics` with `SetQueueDepth(int64)` helper (negative values clamped to 0)
-- [x] Wire into control plane: `runQueueDepthScraper` goroutine fires immediately on startup then every 15s; uses a 5s per-poll context timeout; distributed mode only
+In `SandboxExecutor.Execute`, after successfully writing `BenchmarkResults`:
 
-#### 4.3.4 — Tests
+```go
+if len(j.RemainingProfiles) > 0 {
+    next := queue.NewProfileJob(sub, contest, j.RemainingProfiles[0], j.RemainingProfiles[1:])
+    if err := s.queue.Enqueue(ctx, next); err != nil {
+        // Log and mark submission failed — do not panic.
+        log.Error("executor: failed to enqueue next profile", "err", err)
+        s.markFailed(sub, fmt.Sprintf("failed to enqueue %s profile: %v", next.VolatilityLabel, err))
+        return nil, err
+    }
+} else {
+    // All three runs complete. Compute and persist FinalScore.
+    s.computeAndWriteFinalScore(ctx, j.SubmissionID, contest)
+}
+```
 
-- [x] `TestMemoryQueue_QueueDepth_Empty` — depth is 0 on empty queue
-- [x] `TestMemoryQueue_QueueDepth_AfterEnqueue` — depth tracks enqueued count step-by-step
-- [x] `TestMemoryQueue_QueueDepth_AfterDequeue` — depth decrements correctly after each Dequeue
-- [x] `TestMemoryQueue_QueueDepth_Unbuffered` — always 0 for cap=0 queue
-- [x] `TestMemoryQueue_QueueDepth_CancelledCtx` — non-blocking even with cancelled context
-- [x] `TestMemoryQueue_QueueDepth_SatisfiesInterface` — compile-time check *MemoryQueue implements Queue
-- [x] `TestSetQueueDepth_InitiallyZero` — gauge reads 0 before any call
-- [x] `TestSetQueueDepth_UpdatesGauge` — overwrites (not accumulates) on each call
-- [x] `TestSetQueueDepth_Zero` — resets gauge to 0
-- [x] `TestSetQueueDepth_NegativeClamped` — negative values clamped to 0
-- [x] `TestSetQueueDepth_MetricNamePresent` — descriptor appears in /metrics output
-- [x] `TestSetQueueDepth_IsolatedFromOtherRegistries` — two registries are independent
+#### 5.5.3 — `computeAndWriteFinalScore`
 
-#### 4.3.6 — Post-smoke-test fixes (applied during live run)
+```go
+func (e *SandboxExecutor) computeAndWriteFinalScore(
+    ctx context.Context,
+    submissionID string,
+    contest *models.Contest,
+) {
+    sub, _ := e.store.Get(submissionID)
+    // Collect the three BenchmarkResults from sub.AllResults (see below).
+    low    := sub.ResultByLabel("low")
+    medium := sub.ResultByLabel("medium")
+    high   := sub.ResultByLabel("high")
 
-- [x] `scripts/smoke_test_phase4_stage3.sh` — python stub detection (Windows Store alias guard), pass file path via `sys.argv[1]` so Git Bash path translation works, `--server-side` in KEDA failure hint, removed `tee /dev/stderr` pipeline hang
-- [x] `k8s/keda/keda-install.yaml` — both install commands updated to `kubectl apply --server-side` to bypass 256KB CRD annotation limit
-- [x] `k8s/network-policies/allow-redpanda-ingress.yaml` — added `namespaceSelector: kubernetes.io/metadata.name: keda` ingress rule on port 9092 so KEDA operator can read consumer-group lag from Redpanda across namespaces
+    finalScore := contest.LowWeight*safeScore(low) +
+                  contest.MediumWeight*safeScore(medium) +
+                  contest.HighWeight*safeScore(high)
+    finalScore *= 100.0
 
-**Known operational gotchas documented (no code change needed):**
-- Docker Desktop restart wipes node labels — re-apply with `kubectl label node docker-desktop role=control-plane --overwrite`
-- Wait for pod `Ready` before starting `kubectl port-forward` to avoid race condition on port 8080
-- KEDA uses exponential backoff on broker failures — allow 2-3 minutes for recovery after Redpanda restarts
+    sub.FinalScore = finalScore
+    sub.Status = models.StatusCompleted
+    // ... persist and broadcast leaderboard event
+}
+```
 
-- [x] Script `scripts/smoke_test_phase4_stage3.sh`
-  - `--dry-run` mode (default/CI): validates ScaledObject YAML fields, KEDA install reference, runs Go unit tests
-  - `--live` mode: checks KEDA operator running, applies ScaledObject, enqueues 20 jobs, asserts scale-up within 60s, drains queue, asserts scale-down within 90s
+`Submission` gains `AllResults []*BenchmarkResults` (all profile runs) and
+`FinalScore float64`. The existing `Results *BenchmarkResults` field is
+deprecated and removed — callers use `AllResults` indexed by
+`VolatilityLabel`.
 
-### Gate — Stage 4.3
+`ResultByLabel` is a method on `*Submission`:
+```go
+func (s *Submission) ResultByLabel(label string) *BenchmarkResults {
+    for _, r := range s.AllResults {
+        if r.VolatilityLabel == label { return r }
+    }
+    return nil
+}
+```
+
+#### 5.5.4 — Unit tests
+
+| Test | What it verifies |
+|---|---|
+| `TestNewProfileJob_SetsLabelsCorrectly` | First job has label="low", remaining=["medium","high"] |
+| `TestNewProfileJob_LastJob_EmptyRemaining` | Last job has `RemainingProfiles` empty |
+| `TestResultByLabel_ReturnsCorrectResult` | `ResultByLabel("medium")` returns the medium result |
+
+### Gate — Stage 5.5
 
 ```bash
-go test ./internal/queue/... -race -v       # QueueDepth unit tests pass
-go test ./internal/metrics/... -race -v     # gauge tests pass
-# KEDA ScaledObject dry-run: make k8s-validate passes
+make test -race    # all tests pass including 3 new ones
+# Manual (docker compose up): submit a binary, observe in logs:
+#   "executor: running profile low"
+#   "executor: enqueueing next profile medium"
+#   "executor: running profile medium"
+#   "executor: enqueueing next profile high"
+#   "executor: running profile high"
+#   "executor: final score computed"
 ```
 
 ---
 
-## Stage 4.4 — CI/CD Pipeline
+## Stage 5.6 — Dry-Run Validator
 
-> **Status: ✅ Complete**
+> **Touches:** new `internal/validator/` package, `internal/api/router.go`,
+>   `cmd/server/main.go`.
+> **New packages:** `internal/validator`.
+> **Tests required:** 5 unit tests using `httptest.Server`.
 
 ### Goal
 
-A single GitHub Actions workflow that — on every push to `main` and on every
-pull request — runs all tests, builds and pushes Docker images, validates
-Terraform and Kubernetes manifests, and (on `main` only) deploys to the dev
-cluster.
+Give contestants a safe pre-submission smoke test that exercises five
+deterministic scenarios and returns per-scenario pass/fail with human-readable
+reasons. No leaderboard impact. No status changes.
 
-No secrets are hard-coded in workflow files. All cloud credentials flow through
-GitHub Environments with Workload Identity Federation (no long-lived keys).
-
-### Directory layout
+### Package design: `internal/validator`
 
 ```
-.github/
-├── workflows/
-│   ├── ci.yml           # PR gate: test + lint + validate
-│   └── deploy.yml       # main branch: build + push + deploy
-└── actions/
-    └── setup-go/        # composite action: Go toolchain + module cache
+internal/validator/
+├── validator.go
+├── scenarios.go       // the fixed 20-order sequence, unexported
+└── validator_test.go
 ```
 
-### Tasks
+**`validator.go`:**
 
-#### 4.4.1 — CI workflow (`ci.yml`)
+```go
+// Package validator runs a deterministic smoke test against a deployed
+// contestant engine. It has no side effects: it does not modify submission
+// status, write BenchmarkResults, or touch the leaderboard.
+//
+// Dependencies: botfleet.BotTransport, correctness.GoldenOrderbook.
+// Imports nothing from submission, worker, or contest.
+package validator
 
-Triggers: `pull_request` targeting `main`, `push` to `main`.
+type ScenarioResult struct {
+    Name   string `json:"name"`
+    Passed bool   `json:"passed"`
+    Reason string `json:"reason,omitempty"`
+}
 
-Jobs (run in parallel where possible):
+type ValidationResult struct {
+    SubmissionID string           `json:"submission_id"`
+    Scenarios    []ScenarioResult `json:"scenarios"`
+    AllPassed    bool             `json:"all_passed"`
+    TestedAt     time.Time        `json:"tested_at"`
+}
 
-- [x] **lint** — `golangci-lint run ./...` with config file `.golangci.yml`
-- [x] **unit-tests** — `go test $(GO_PKGS) -race -timeout 60s -coverprofile=coverage.out`; upload coverage artifact
-- [x] **tf-validate** — `terraform fmt -check -recursive && terraform validate`
-- [x] **k8s-validate** — `make k8s-validate`
+type Validator struct {
+    transport botfleet.BotTransport
+}
 
-Create `.golangci.yml`:
-- [x] Enable: `errcheck`, `govet`, `staticcheck`, `gosimple`, `ineffassign`, `unused`
-- [x] Also enable: `gosec`, `bodyclose`, `nilerr`, `gofmt`, `misspell`
-- [x] Disable: `gochecknoglobals` (Prometheus vars are package-level by convention)
-- [x] `timeout: 5m`
+func New(transport botfleet.BotTransport) *Validator
 
-#### 4.4.2 — Build + push job (deploy.yml, `main` only)
+// Run executes all scenarios against the engine reachable via v.transport.
+// It is safe to call concurrently for different submissions.
+// Each call creates its own GoldenOrderbook — there is no shared state.
+func (v *Validator) Run(ctx context.Context, submissionID string) (*ValidationResult, error)
+```
 
-- [x] Authenticate to registry via Workload Identity Federation (no static JSON key)
-- [x] Build `Dockerfile.server` → push `control-plane:$SHA`, `control-plane:latest`
-- [x] Build each `docker/sandbox/Dockerfile.*` → push `sandbox-{lang}:$SHA`
-- [x] Matrix strategy over languages to parallelise sandbox image builds
-- [x] BuildKit inline cache: `cache-from/cache-to: type=inline` for fast incremental builds
+**`scenarios.go`** (unexported):
 
-#### 4.4.3 — Deploy job (deploy.yml, `main` only, after build passes)
+Defines a `[]scenario` slice. Each `scenario` has a `name string`, an
+`orders []botfleet.Order` (hand-crafted, deterministic — no RNG), and
+`expectedFills []correctness.GoldenFill`. The `Validator.Run` method iterates
+scenarios, sends orders via `transport`, compares fills against expected, and
+produces a `ScenarioResult`.
 
-- [x] Authenticate to cluster via Workload Identity
-- [x] `kubectl set image deployment/control-plane control-plane=$REGISTRY/control-plane:$SHA`
-- [x] `kubectl set image deployment/worker worker=$REGISTRY/server:$SHA`
-- [x] `kubectl rollout status deployment/control-plane --timeout=120s`
-- [x] `kubectl rollout status deployment/worker --timeout=120s`
-- [x] Run smoke test against the dev cluster endpoint
-- [x] Print deployment summary to GitHub Step Summary (pod list + image tags)
+The 20-order fixed sequence covers:
+1. Limit buy rests (no fill yet)
+2. Limit sell crosses and fills
+3. Market buy sweeps remaining sell side
+4. Cancel of known resting order
+5. Cancel of unknown IDs → all `accepted: false`
+6. Zero-quantity order rejection
+7. Partial fill produces correct `executed_qty`
 
-#### 4.4.4 — Composite action (`setup-go`)
+#### 5.6.1 — Rate limiter
 
-- [x] Create `.github/actions/setup-go/action.yml`
-  - Steps: `actions/setup-go@v5` (version from input), module cache via `cache: true` built into setup-go
-  - `go-version` input defaults to `"file"` (reads from `go.mod` automatically)
-  - Used by all jobs that need Go — avoids repetition
+In `internal/api/router.go`, add an unexported
+`validationRateLimiter` using a `sync.Map[string, time.Time]`:
+one validation per submission per 2 minutes. The validation endpoint
+checks this before calling `Validator.Run`.
 
-#### 4.4.5 — Makefile additions
+#### 5.6.2 — Endpoint
 
-- [x] `make lint` — runs `golangci-lint`
-- [x] `make ci` — runs `make lint test tf-validate k8s-validate` (mirrors CI locally)
-- [x] `make build-push` — builds + tags all images (local use with `REGISTRY` override)
-- [x] `make test` updated to emit `-coverprofile=coverage.out -covermode=atomic` and print summary line
-- [x] `coverage.out` added to `.gitignore`
+```
+POST /api/v1/submissions/{id}/validate
+```
 
-#### 4.4.6 — Validation (offline)
+Handler checks:
+1. Submission exists (404 if not).
+2. Submission is not `StatusBenchmarking` (409 if so).
+3. Rate limit (429 if too recent).
+4. Submission has `ExposedPort > 0` (the container is running).
+5. Constructs `RESTTransport` targeting `http://sandboxHost:{port}`.
+6. Constructs `Validator`, calls `Run`.
+7. Returns `ValidationResult` as JSON.
 
-- [x] All workflow YAML files are syntactically valid (no cloud credentials required to verify)
-- [x] All new Makefile targets documented in the Makefile header comment block
-- [x] `.golangci.yml` present at repo root
-- [x] `make ci` target chains lint + test + tf-validate + k8s-validate
+#### 5.6.3 — Unit tests
 
-#### 4.4.7 — Post-local-testing fixes (applied during `make ci` run)
+| Test | What it verifies |
+|---|---|
+| `TestValidator_AllPass` | httptest.Server returns correct fills → all scenarios pass |
+| `TestValidator_FailOnWrongExecutedPrice` | Server returns wrong price → scenario 2 fails with reason |
+| `TestValidator_FailOnCancelAccepted` | Server accepts an unknown cancel → scenario 5 fails |
+| `TestValidator_ContextCancellation` | Cancelling ctx mid-run returns error, no panic |
+| `TestValidator_RateLimiter` | Second call within 2 minutes returns 429 |
 
-- [x] **`nilerr` fix** — `internal/consumer/consumer.go`: on context cancellation, returned `nil` instead of `ctx.Err()`, silently reporting success to the caller; changed to `return ctx.Err()`
-- [x] **`ineffassign` fix** — `internal/worker/executor.go`: `compositeScore` was calculated on line 464 then immediately recalculated on line 467, making the first calculation dead code; removed the dead assignment
-- [x] **`govet/shadow` fixes** — four files had inner-scope `err :=` declarations shadowing an outer `err` variable, a common source of swallowed errors in Go:
-  - `cmd/worker/main.go` — refactored to `=` or renamed shadow variable
-  - `cmd/consumer/main.go` — refactored to `=` or renamed shadow variable
-  - `internal/sandbox/docker.go` — renamed to `errClose` / `errInspect` to prevent collision
-  - `internal/worker/executor.go` — refactored inner `err :=` blocks
-- [x] **`gofmt` fixes** — ran `gofmt -w ./...` across entire codebase; corrected indentation and alignment throughout
-- [x] **`misspell` fixes** — corrected British/Commonwealth spellings to American English throughout codebase: `serialise` → `serialize`, `cancelled` → `canceled`, `behaviour` → `behavior`
-- [x] **`coverage` directory untracked** — `git rm --cached -r coverage` removed an accidentally tracked `coverage/` directory; `coverage` (directory) added to `.gitignore` alongside `coverage.out`
-- [x] **PowerShell `=` in args** — `Makefile` test command reformatted from `-coverprofile=coverage.out` to `-coverprofile coverage.out` so PowerShell does not mangle the argument
-- [x] **golangci-lint version** — pinned version `v1.59.1` was incompatible with local Go 1.26; changed `make lint` to use `@latest` to let the installer resolve a compatible version automatically
-
-### Gate — Stage 4.4
+### Gate — Stage 5.6
 
 ```bash
-make ci              # lint + test + tf-validate + k8s-validate all pass locally
-# Open a PR → CI workflow triggers → all jobs green
-# Merge to main → deploy workflow triggers → dev cluster updated
+make test -race    # all tests pass including 5 new ones
+# Manual:
+curl -X POST localhost:8080/api/v1/submissions/{id}/validate
+# → 200 with ValidationResult, scenarios array, all_passed field
+curl -X POST localhost:8080/api/v1/submissions/{id}/validate  # immediately again
+# → 429 Too Many Requests
+curl -X POST localhost:8080/api/v1/submissions/{id}/validate  # while benchmarking
+# → 409 Conflict
 ```
 
 ---
 
-## Full Phase 4 Gate Checklist
+## Stage 5.7 — SSE Live Leaderboard
 
-Before PROGRESS.md is updated to mark Phase 4 complete, every item below must be checked:
+> **Touches:** `internal/api/router.go`, `internal/api/` (new `bus.go`),
+>   `cmd/server/main.go`.
+> **New packages:** none (bus lives in `internal/api`).
+> **Tests required:** 3 unit tests.
+
+### Goal
+
+Replace the polling-only leaderboard with a push-based SSE stream. The existing
+`GET /api/v1/leaderboard` poll endpoint is **not removed** — it remains for
+backward compatibility and for clients that prefer polling.
+
+### Implementation
+
+#### 5.7.1 — `leaderboardBus` in `internal/api/bus.go`
+
+```go
+// leaderboardBus is a fan-out broadcaster for leaderboard events.
+// It is the concrete implementation of contest.LeaderboardBroadcaster.
+// All methods are safe for concurrent use.
+type leaderboardBus struct {
+    mu   sync.RWMutex
+    subs map[string]chan LeaderboardEvent // key = UUID per subscriber
+}
+
+type LeaderboardEvent struct {
+    Type      string                     `json:"type"`       // "update" | "frozen"
+    ContestID string                     `json:"contest_id"`
+    Entries   []*models.LeaderboardEntry `json:"entries"`
+}
+
+func newLeaderboardBus() *leaderboardBus
+func (b *leaderboardBus) Broadcast(event contest.LeaderboardEvent)
+func (b *leaderboardBus) subscribe() (id string, ch <-chan LeaderboardEvent)
+func (b *leaderboardBus) unsubscribe(id string)
+```
+
+`Broadcast` converts `contest.LeaderboardEvent` → `LeaderboardEvent` and sends
+to all subscriber channels. Channels are buffered (size 4). A full channel
+is dropped silently (slow clients do not block the broadcaster).
+
+#### 5.7.2 — SSE endpoint
+
+```
+GET /api/v1/leaderboard/stream
+```
+
+```go
+func (h *leaderboardHandler) Stream(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+
+    id, ch := h.bus.subscribe()
+    defer h.bus.unsubscribe(id)
+
+    // Send current leaderboard immediately on connect.
+    current := h.buildLeaderboard()
+    writeSSEEvent(w, LeaderboardEvent{Type: "update", Entries: current})
+
+    for {
+        select {
+        case <-r.Context().Done():
+            return
+        case event := <-ch:
+            writeSSEEvent(w, event)
+            if event.Type == "frozen" {
+                return // contest over; close stream
+            }
+        }
+    }
+}
+
+func writeSSEEvent(w http.ResponseWriter, event LeaderboardEvent) {
+    data, _ := json.Marshal(event)
+    fmt.Fprintf(w, "data: %s\n\n", data)
+    if f, ok := w.(http.Flusher); ok { f.Flush() }
+}
+```
+
+#### 5.7.3 — Wire bus into ContestService
+
+In `cmd/server/main.go`, create `bus := api.NewLeaderboardBus()` and pass it
+to both `NewRouter(bus)` and `contest.NewContestService(store, bus)`.
+
+`ContestService.Close` calls `bus.Broadcast(contest.LeaderboardEvent{Type: "frozen", ...})`.
+
+The worker's `computeAndWriteFinalScore` calls `bus.Broadcast(contest.LeaderboardEvent{Type: "update", ...})`.
+
+#### 5.7.4 — Unit tests
+
+| Test | What it verifies |
+|---|---|
+| `TestLeaderboardBus_Broadcast` | Two subscribers both receive the event |
+| `TestLeaderboardBus_SlowSubscriberDropped` | Full channel does not block Broadcast |
+| `TestLeaderboardBus_UnsubscribeCleans` | Unsubscribed channel receives no further events |
+
+### Gate — Stage 5.7
+
+```bash
+make test -race    # all tests pass including 3 new ones
+# Manual:
+curl -N localhost:8080/api/v1/leaderboard/stream
+# → stays connected, prints "data: {...}" on each submission completion
+# After contest close:
+# → prints "data: {"type":"frozen",...}" and closes
+```
+
+---
+
+## Stage 5.8 — WebSocket Bot Transport
+
+> **Touches:** `internal/botfleet/bot.go`, `internal/botfleet/fleet.go`,
+>   new `internal/botfleet/websocket.go`.
+> **New packages:** none (stays in `internal/botfleet`).
+> **Tests required:** 4 unit tests using `httptest.Server` upgraded to WebSocket.
+
+### Goal
+
+Add a `WebSocketTransport` implementing `BotTransport`. Add `Close() error` to
+the `BotTransport` interface (required for WebSocket connection teardown).
+The `Fleet` calls `Close()` on each transport after `Run` returns.
+
+`RESTTransport.Close()` is a no-op — HTTP clients have no persistent connection
+to close.
+
+### Tasks
+
+#### 5.8.1 — Extend `BotTransport` interface
+
+```go
+type BotTransport interface {
+    Send(ctx context.Context, o Order) (Fill, error)
+    // Close releases any persistent transport resources (e.g. WebSocket connection).
+    // Safe to call multiple times. REST implementations return nil immediately.
+    Close() error
+}
+```
+
+Add `Close() error { return nil }` to `RESTTransport`. This is a non-breaking
+change — existing tests compile without modification because `RESTTransport`
+already satisfies the extended interface.
+
+#### 5.8.2 — `WebSocketTransport` in `internal/botfleet/websocket.go`
+
+```go
+// WebSocketTransport implements BotTransport over a persistent WebSocket
+// connection. One instance per Bot — each bot owns its own connection.
+// The connection is established in NewWebSocketTransport and reused for the
+// lifetime of the fleet run.
+//
+// Wire protocol (JSON, same field names as REST):
+//   send:    {"order_id":"...","kind":"...","side":"...","price":0,"quantity":0}
+//   receive: {"order_id":"...","accepted":true,"executed_price":0,"executed_qty":0}
+//
+// Uses golang.org/x/net/websocket (stdlib-adjacent, no CGO).
+type WebSocketTransport struct { /* unexported */ }
+
+func NewWebSocketTransport(url string) (*WebSocketTransport, error)
+func (t *WebSocketTransport) Send(ctx context.Context, o Order) (Fill, error)
+func (t *WebSocketTransport) Close() error
+```
+
+`Send` writes a JSON order and reads a JSON fill on the same connection.
+Respects `ctx` cancellation via a deadline set on the underlying connection.
+
+#### 5.8.3 — Fleet selects transport by protocol
+
+In `fleet.go`, `Fleet.Run` (or `Fleet.newBot`) checks `cfg.Protocol`:
+```go
+switch cfg.Protocol {
+case string(models.ProtocolWebSocket):
+    transport, err = botfleet.NewWebSocketTransport(cfg.TargetURL)
+default: // REST
+    transport = botfleet.NewRESTTransport(cfg.TargetURL, nil)
+}
+```
+
+After `Fleet.Run` returns, call `transport.Close()` for each bot (already
+tracked in the `Bot` struct).
+
+#### 5.8.4 — Unit tests
+
+| Test | What it verifies |
+|---|---|
+| `TestWebSocketTransport_SendReceive` | Send limit order, server echoes correct fill → Fill parsed correctly |
+| `TestWebSocketTransport_ContextCancellation` | Cancelled ctx causes Send to return ctx.Err() |
+| `TestWebSocketTransport_Close_Idempotent` | Calling Close() twice does not panic |
+| `TestRESTTransport_CloseIsNoop` | RESTTransport.Close() returns nil without error |
+
+### Gate — Stage 5.8
+
+```bash
+make test -race    # all tests pass including 4 new ones
+# Verify: go vet ./internal/botfleet/... returns zero warnings
+# Verify: BotTransport interface has Close() in interface definition
+```
+
+---
+
+## Stage 5.9 — PostgreSQL ContestStore
+
+> **Touches:** new `internal/contest/postgres.go`, `cmd/server/main.go`,
+>   `docker-compose.yml`, `k8s/` (new StatefulSet for PostgreSQL).
+> **New packages:** none (implementation lives in `internal/contest`).
+> **Tests required:** none new (PostgresContestStore is integration-tested via
+>   the existing docker-compose stack; unit tests use MemoryContestStore).
+
+### Goal
+
+Replace `MemoryContestStore` with `PostgresContestStore` in production.
+`MemoryContestStore` stays in place for unit tests — no test changes needed.
+
+### Tasks
+
+#### 5.9.1 — Schema
+
+Two tables, created on startup via `internal/contest/postgres.go`
+`(*PostgresContestStore).migrate()`:
+
+```sql
+CREATE TABLE IF NOT EXISTS contests (
+    id                    TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    low_profile           JSONB NOT NULL,
+    medium_profile        JSONB NOT NULL,
+    high_profile          JSONB NOT NULL,
+    low_weight            DOUBLE PRECISION NOT NULL DEFAULT 0.20,
+    medium_weight         DOUBLE PRECISION NOT NULL DEFAULT 0.35,
+    high_weight           DOUBLE PRECISION NOT NULL DEFAULT 0.45,
+    submissions_closed_at TIMESTAMPTZ,
+    contest_closed_at     TIMESTAMPTZ,
+    ends_at               TIMESTAMPTZ,
+    created_at            TIMESTAMPTZ NOT NULL,
+    updated_at            TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contest_leaderboard_snapshots (
+    contest_id  TEXT PRIMARY KEY REFERENCES contests(id),
+    entries     JSONB NOT NULL,
+    snapshotted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+#### 5.9.2 — `PostgresContestStore`
+
+Implement `ContestStore` using `pgxpool.Pool`. All methods use context-scoped
+queries. `migrate()` is called once from `NewPostgresContestStore`.
+
+```go
+func NewPostgresContestStore(ctx context.Context, dsn string) (*PostgresContestStore, error)
+```
+
+#### 5.9.3 — Wire into `cmd/server/main.go`
+
+In distributed mode (`cfg.DistributedMode`), create `PostgresContestStore`
+using `cfg.PostgresDSN`. In local mode, use `MemoryContestStore`.
+
+#### 5.9.4 — Docker Compose and K8s
+
+Add PostgreSQL to `docker-compose.yml`:
+```yaml
+postgres:
+  image: postgres:16-alpine
+  environment:
+    POSTGRES_DB: nexusbench
+    POSTGRES_USER: nexusbench
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  volumes:
+    - postgres-data:/var/lib/postgresql/data
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U nexusbench"]
+    interval: 5s
+    timeout: 5s
+    retries: 5
+```
+
+Add `k8s/postgres/statefulset.yaml` and `k8s/postgres/service.yaml` and
+`k8s/postgres/pvc.yaml` following the same security patterns as the
+TimescaleDB StatefulSet in Phase 4.
+
+Add NetworkPolicy: `k8s/network-policies/allow-postgres-ingress.yaml`
+(control-plane only; workers excluded).
+
+### Gate — Stage 5.9
+
+```bash
+make test -race    # all tests still pass (unit tests use MemoryContestStore)
+docker compose up -d postgres
+POSTGRES_DSN="postgres://nexusbench:testpw@localhost:5432/nexusbench" \
+    go run ./cmd/server --distributed
+# → server starts, migrations run, no errors in logs
+curl -X POST localhost:8080/api/v1/admin/contests \
+  -H "Authorization: Bearer testkey" \
+  -d '{"name":"integration-test","use_defaults":true}'
+# → 201 Created, contest persisted in PostgreSQL
+```
+
+---
+
+## Stage 5.10 — Integration Smoke Test
+
+> **Touches:** new `scripts/smoke_test_phase5.sh`.
+> **New packages:** none.
+> **Tests required:** the smoke test script itself.
+
+### Goal
+
+A single end-to-end smoke test that exercises the full Phase 5 flow:
+create contest → submit → dry-run → benchmark three profiles →
+check live leaderboard → close contest → check snapshot.
+
+The script has two modes, matching the Phase 4 pattern:
+- `--dry-run` (default): validates all new YAML, runs Go unit tests,
+  checks new endpoints are registered in the router.
+- `--live`: runs against a live `docker compose up` stack.
+
+### `--live` sequence
+
+```bash
+# 1. Create and activate a contest with default profiles
+CONTEST=$(curl -sf -X POST .../admin/contests -d '{"name":"smoke","use_defaults":true}')
+CONTEST_ID=$(echo $CONTEST | jq -r .id)
+curl -sf -X POST .../admin/contests/$CONTEST_ID/activate
+
+# 2. Subscribe to SSE stream in background
+curl -sN .../leaderboard/stream > /tmp/sse_output &
+SSE_PID=$!
+
+# 3. Submit a pre-built test binary (the existing smoke-test binary from Phase 3)
+curl -sf -X POST .../submissions -F team_name=smoketest -F language=binary \
+  -F protocol=rest -F archive=@scripts/testdata/smoke_engine.tar.gz
+
+# 4. Wait for ValidationResult
+sleep 5
+curl -sf -X POST .../submissions/$SUB_ID/validate | jq .all_passed
+
+# 5. Wait for all three profile runs to complete (up to 10 minutes)
+# Poll GET /submissions/$SUB_ID until status=completed
+
+# 6. Check leaderboard
+curl -sf .../leaderboard | jq '.[0].final_score'
+# → non-zero
+
+# 7. Check SSE received at least one update event
+grep '"type":"update"' /tmp/sse_output
+
+# 8. Close contest
+curl -sf -X POST .../admin/contests/$CONTEST_ID/close
+# → 200 OK
+
+# 9. Check snapshot
+curl -sf .../admin/contests/$CONTEST_ID/leaderboard | jq length
+# → >= 1
+
+# 10. Verify SSE received frozen event
+grep '"type":"frozen"' /tmp/sse_output
+
+kill $SSE_PID
+```
+
+### Gate — Stage 5.10 (Full Phase 5 Gate)
+
+```bash
+make test -race                             # all unit tests pass
+bash scripts/smoke_test_phase5.sh           # dry-run passes
+bash scripts/smoke_test_phase5.sh --live    # live passes against docker compose
+make ci                                     # lint + test + tf-validate + k8s-validate
+```
+
+---
+
+## Full Phase 5 Gate Checklist
+
+Before PROGRESS.md is updated to mark Phase 5 complete:
 
 | Check | Command / Evidence |
 |---|---|
-| All unit tests pass with race detector | `make test` — ✅ passing |
-| golangci-lint clean | `make lint` — ✅ passing (nilerr, ineffassign, govet/shadow, gofmt, misspell all fixed) |
-| Terraform fmt + validate | `make tf-validate` — ✅ passing |
-| K8s manifests dry-run | `make k8s-validate` — ✅ passing |
-| No hard-coded secrets anywhere | `git grep -E "(password\|secret\|key)\s*=" terraform/ k8s/ .github/` returns nothing sensitive — ✅ verified |
-| Worker pods tolerate only spot node pool | manifest review — ✅ nodeSelector + toleration both present |
-| NetworkPolicy blocks worker → TimescaleDB | manifest review — ✅ allow-timescaledb-ingress.yaml excludes worker podSelector |
-| KEDA ScaledObject parseable | `make k8s-validate` — ✅ passing |
-| CI workflow green on PR | GitHub Actions — ⏳ requires first PR push to GitHub |
-| Deploy workflow green on merge to main | GitHub Actions — ⏳ requires registry + cluster secrets configured in GitHub Environments |
+| All unit tests pass with race detector | `make test -race` |
+| No new golangci-lint warnings | `make lint` |
+| All new packages have zero import cycles | `go build ./...` |
+| No existing API endpoints broken | Manual curl of Phase 1–4 endpoints |
+| Contest create + activate + close works | Stage 5.2 manual gate |
+| Submission guard rejects double-submit | Stage 5.3 manual gate |
+| Three-profile scoring produces non-zero FinalScore | Stage 5.5 manual gate |
+| Dry-run returns per-scenario results | Stage 5.6 manual gate |
+| SSE stream delivers events and frozen signal | Stage 5.7 manual gate |
+| WebSocket transport sends and receives fills | Stage 5.8 unit test gate |
+| PostgreSQL persists contests across restart | Stage 5.9 manual gate |
+| Full smoke test passes live | Stage 5.10 live gate |
+| `make ci` clean | `make ci` |
 
 ---
 
 ## Key Design Decisions
 
-- **Thin Terraform root** — all resource blocks live in modules; `main.tf` only wires modules together. This keeps the root plan readable and modules reusable across envs.
-- **KEDA over custom HPA adapter** — KEDA has first-class Kafka/Redpanda support via consumer group lag; building a custom metrics adapter would duplicate that for no benefit.
-- **Workload Identity, no static keys** — long-lived cloud credentials in CI are a supply-chain risk. WIF lets GitHub's OIDC token authenticate to GCP/AWS without any secret stored in GitHub.
-- **PodDisruptionBudget on workers** — prevents cluster upgrades from simultaneously evicting all workers during an active benchmark run.
-- **`QueueDepth` on the Queue interface** — keeps the metric computation inside the `queue` package (deep module principle); callers never need to know Kafka offset math.
-- **Matrix sandbox image builds** — parallelises five independent Docker builds; total CI time drops from ~15 min sequential to ~4 min.
+**Why `MemoryContestStore` first (Stage 5.2) then `PostgresContestStore` (Stage 5.9)?**
+Starting with the in-memory implementation lets us write and pass all unit tests
+without a running database. The interface is stable by Stage 5.2; Stage 5.9
+only adds an implementation. This is the deep-module principle: callers depend
+on `ContestStore`, not on PostgreSQL.
+
+**Why is correctness a multiplier, not an additive term?**
+An engine with 0% correctness is not a matching engine — it is a random
+number generator with low latency. Treating correctness as a multiplier ensures
+such an engine scores zero on every axis, not just the 20% correctness slice.
+This incentivises contestants to fix correctness bugs before optimising latency.
+
+**Why SustainedTPS and not MaxTPS for scoring?**
+`MaxTPS` measures the busiest 100ms window. An engine can produce a brief spike
+and then collapse. `SustainedTPS` (total successful orders / elapsed run time)
+is the honest throughput number over the full test duration. `MaxTPS` is still
+recorded and displayed — it is useful diagnostic information — but it does not
+determine rank.
+
+**Why sequential (not parallel) profile jobs?**
+All three profiles run against the same sandbox container. Parallel jobs would
+share container resources, making p99 and TPS measurements from each profile
+contaminated by the others. Sequential execution gives each profile a clean,
+dedicated benchmark window.
+
+**Why `BotTransport.Close()` added to the interface?**
+WebSocket connections are persistent — the transport must be closed after the
+fleet run or the server accumulates stale connections. Adding `Close()` to the
+interface ensures both transports are handled uniformly by `Fleet`, and the
+REST no-op implementation keeps existing code unchanged.
+
+**Why no Pause/Resume control?**
+A paused benchmark holds a sandbox container, a set of bot goroutines blocked
+in `Select`, and a Redpanda partition assignment — none of which are free. On
+a shared Kubernetes cluster with spot workers, a paused benchmark prevents
+other contestants' jobs from being scheduled. The observability stack already
+streams metrics in real time to Grafana; there is no diagnostic value a pause
+would add that isn't already visible live.
+
+**Why no FIX transport in Phase 5?**
+FIX requires a stateful session manager (sequence numbers, heartbeats,
+logon/logoff, async execution reports). This does not map onto the synchronous
+`BotTransport.Send` contract. Implementing FIX correctly would require
+redesigning the `BotTransport` interface and adding a session lifecycle to
+`Bot.Run`. Deferred to a future phase when contestant demand justifies it.

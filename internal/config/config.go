@@ -97,6 +97,20 @@ type Config struct {
 	// BotPerRequestTimeout is the HTTP timeout for a single bot order round-trip.
 	// Default: 2s (tight enough to detect latency regressions).
 	BotPerRequestTimeout time.Duration
+
+	// ── Phase 5: Contest lifecycle ────────────────────────────────────────────
+
+	// AdminAPIKey is the bearer token required for all /api/v1/admin/* routes.
+	// If empty, admin routes return 401 for all requests.
+	// Set via ADMIN_API_KEY environment variable.
+	AdminAPIKey string
+
+	// PostgresDSN is the connection string for the PostgreSQL instance that
+	// stores contest records and leaderboard snapshots.
+	// Required when DistributedMode=true.
+	// Example: "postgres://nexusbench:secret@localhost:5432/nexusbench"
+	// Set via POSTGRES_DSN environment variable.
+	PostgresDSN string
 }
 
 // Load reads configuration from environment variables with sane defaults.
@@ -136,6 +150,10 @@ func Load() *Config {
 		BotOrderRatioMarket:  getEnvFloat64("BOT_ORDER_RATIO_MARKET", 0.30),
 		BotOrderRatioCancel:  getEnvFloat64("BOT_ORDER_RATIO_CANCEL", 0.10),
 		BotPerRequestTimeout: getEnvDuration("BOT_PER_REQUEST_TIMEOUT", 2*time.Second),
+
+		// Phase 5: Contest lifecycle
+		AdminAPIKey: getEnv("ADMIN_API_KEY", ""),
+		PostgresDSN: getEnv("POSTGRES_DSN", ""),
 	}
 }
 
