@@ -21,7 +21,7 @@ import (
 // The api package provides the concrete implementation; cmd/server wires them
 // together at startup.
 //
-// Tests that do not care about SSE behaviour pass a nil bus to
+// Tests that do not care about SSE behavior pass a nil bus to
 // NewContestService — all Broadcast calls are no-ops when bus is nil.
 type LeaderboardBroadcaster interface {
 	Broadcast(event LeaderboardEvent)
@@ -34,7 +34,7 @@ type LeaderboardBroadcaster interface {
 //   - "update"  — one or more scores changed; Entries is the full ranked list.
 //   - "frozen"  — the contest just closed; Entries is the final snapshot.
 type LeaderboardEvent struct {
-	Type      string                     // "update" | "frozen"
+	Type      string // "update" | "frozen"
 	ContestID string
 	Entries   []*models.LeaderboardEntry
 }
@@ -51,14 +51,14 @@ type LeaderboardEvent struct {
 // an admin say "use defaults but change BotCount on high to 500" without
 // spelling out every field.
 type CreateContestRequest struct {
-	Name        string                  `json:"name"`
-	UseDefaults bool                    `json:"use_defaults"`
-	LowProfile  *models.VolatilityProfile `json:"low_profile,omitempty"`
+	Name          string                    `json:"name"`
+	UseDefaults   bool                      `json:"use_defaults"`
+	LowProfile    *models.VolatilityProfile `json:"low_profile,omitempty"`
 	MediumProfile *models.VolatilityProfile `json:"medium_profile,omitempty"`
 	HighProfile   *models.VolatilityProfile `json:"high_profile,omitempty"`
-	LowWeight     float64                 `json:"low_weight"`
-	MediumWeight  float64                 `json:"medium_weight"`
-	HighWeight    float64                 `json:"high_weight"`
+	LowWeight     float64                   `json:"low_weight"`
+	MediumWeight  float64                   `json:"medium_weight"`
+	HighWeight    float64                   `json:"high_weight"`
 	// EndsAt, when set, triggers automatic closing. Nil = manual close only.
 	EndsAt *time.Time `json:"ends_at,omitempty"`
 }
@@ -92,7 +92,7 @@ var (
 // The cmd/server wiring layer connects those.
 type ContestService struct {
 	store ContestStore
-	// bus may be nil in tests that do not exercise SSE behaviour.
+	// bus may be nil in tests that do not exercise SSE behavior.
 	// All broadcast calls are guarded by a nil check.
 	bus LeaderboardBroadcaster
 

@@ -129,7 +129,7 @@ func TestAdminMiddleware_RejectsMissing(t *testing.T) {
 	t.Parallel()
 	router := newTestRouter(t)
 
-	rr := adminDo(t, router, http.MethodPost, "/api/v1/admin/contests", "" /* no key */,
+	rr := adminDo(t, router, http.MethodPost, "/api/v1/admin/contests", "", /* no key */
 		contest.CreateContestRequest{Name: "x", UseDefaults: true})
 
 	if rr.Code != http.StatusUnauthorized {
@@ -355,7 +355,7 @@ func TestGetContestLeaderboard_ReturnsSnapshot(t *testing.T) {
 	}
 
 	var resp struct {
-		Count   int                       `json:"count"`
+		Count   int                        `json:"count"`
 		Entries []*models.LeaderboardEntry `json:"entries"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {

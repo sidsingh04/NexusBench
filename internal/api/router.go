@@ -54,7 +54,7 @@ type contestHandler struct {
 //   - reg         — Prometheus registry (required)
 //   - orchHandler — orchestrator HTTP handler; nil = local mode, routes not mounted
 //   - contestSvc  — contest service; nil = admin + team-history routes not mounted
-//     (Phase 1–4 backward compat: passing nil keeps old behaviour exactly)
+//     (Phase 1–4 backward compat: passing nil keeps old behavior exactly)
 //
 // Backward compatibility guarantee: all Phase 1–4 routes (/health, /metrics,
 // /api/v1/submissions/*, /api/v1/leaderboard, /api/v1/images,
@@ -92,7 +92,7 @@ func NewRouter(
 
 	// ── Leaderboard (Phase 1, extended in Phase 5 with deduplication) ─────────
 	// GET /api/v1/leaderboard returns one row per team (best score wins).
-	// Phase 1–4 behaviour is fully preserved: the response shape is identical;
+	// Phase 1–4 behavior is fully preserved: the response shape is identical;
 	// deduplication is an additive filter that only matters when a team has
 	// multiple completed submissions.
 	v1.HandleFunc("/leaderboard", h.leaderboard).Methods(http.MethodGet)

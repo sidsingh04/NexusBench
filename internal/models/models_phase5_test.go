@@ -74,7 +74,7 @@ func TestSubmission_ResultByLabel_MissingLabel(t *testing.T) {
 	t.Parallel()
 
 	sub := &models.Submission{
-		ID:         "sub-missing-label",
+		ID: "sub-missing-label",
 		AllResults: []*models.BenchmarkResults{
 			{VolatilityLabel: "low"},
 		},
@@ -118,8 +118,8 @@ func TestContest_ProfileByLabel(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		label    string
-		wantBot  int
+		label     string
+		wantBot   int
 		wantFound bool
 	}{
 		{"low", 10, true},

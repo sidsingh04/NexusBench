@@ -157,8 +157,8 @@ type VolatilityProfile struct {
 // All submissions, benchmark jobs, and leaderboard entries are scoped to a
 // Contest via ContestID.
 type Contest struct {
-	ID   string        `json:"id"`
-	Name string        `json:"name"`
+	ID     string        `json:"id"`
+	Name   string        `json:"name"`
 	Status ContestStatus `json:"status"`
 
 	// Volatility profiles — one per benchmark run, executed sequentially.

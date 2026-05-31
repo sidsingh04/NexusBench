@@ -26,11 +26,11 @@ func DefaultLowProfile() models.VolatilityProfile {
 		MarketRatio: 0.10,
 		CancelRatio: 0.10,
 
-		PriceSpreadCents: 100,  // ±$1.00 from mid
+		PriceSpreadCents: 100, // ±$1.00 from mid
 		MaxQuantity:      10,
 
-		TargetP99Ns:      10_000_000,  // 10 ms — achievable by any correct engine
-		TargetSustainTPS: 5_000,       // 5k orders/s — baseline throughput
+		TargetP99Ns:      10_000_000, // 10 ms — achievable by any correct engine
+		TargetSustainTPS: 5_000,      // 5k orders/s — baseline throughput
 
 		LatencyWeight:     0.20,
 		ThroughputWeight:  0.30,
@@ -45,7 +45,7 @@ func DefaultLowProfile() models.VolatilityProfile {
 //   - 100 bots — real concurrency pressure starts here.
 //   - More market orders (30%) and cancels (10%) create aggressive order-book
 //     churn that stresses lock contention in naive implementations.
-//   - Tighter p99 target (5ms) rewards optimised hot paths.
+//   - Tighter p99 target (5ms) rewards optimized hot paths.
 //   - Equal latency/throughput weights (0.35 each) with correctness backing
 //     off to 0.30 — the engine is assumed correct; now rank on speed.
 func DefaultMediumProfile() models.VolatilityProfile {
@@ -58,11 +58,11 @@ func DefaultMediumProfile() models.VolatilityProfile {
 		MarketRatio: 0.30,
 		CancelRatio: 0.10,
 
-		PriceSpreadCents: 500,  // ±$5.00 — moderate volatility
+		PriceSpreadCents: 500, // ±$5.00 — moderate volatility
 		MaxQuantity:      100,
 
-		TargetP99Ns:      5_000_000,   // 5 ms
-		TargetSustainTPS: 20_000,      // 20k orders/s
+		TargetP99Ns:      5_000_000, // 5 ms
+		TargetSustainTPS: 20_000,    // 20k orders/s
 
 		LatencyWeight:     0.35,
 		ThroughputWeight:  0.35,
@@ -77,7 +77,7 @@ func DefaultMediumProfile() models.VolatilityProfile {
 //   - 1000 bots — extreme concurrency mimicking peak exchange load.
 //   - Balanced order mix with significant cancels (20%) churns the resting
 //     book aggressively and stresses cancel-path correctness.
-//   - Very tight p99 target (1ms) — only lock-free or highly optimised engines
+//   - Very tight p99 target (1ms) — only lock-free or highly optimized engines
 //     will achieve normP99 ≈ 1.0.
 //   - Throughput weighted highest (0.50) — at this tier raw TPS separates
 //     the top of the leaderboard. Correctness still acts as a multiplier.
@@ -94,8 +94,8 @@ func DefaultHighProfile() models.VolatilityProfile {
 		PriceSpreadCents: 2_000, // ±$20.00 — extreme volatility
 		MaxQuantity:      1_000,
 
-		TargetP99Ns:      1_000_000,   // 1 ms
-		TargetSustainTPS: 50_000,      // 50k orders/s
+		TargetP99Ns:      1_000_000, // 1 ms
+		TargetSustainTPS: 50_000,    // 50k orders/s
 
 		LatencyWeight:     0.20,
 		ThroughputWeight:  0.50,

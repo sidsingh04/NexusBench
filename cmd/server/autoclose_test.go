@@ -14,11 +14,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/nexusbench/nexusbench/internal/contest"
 	"github.com/nexusbench/nexusbench/internal/models"
+	"github.com/nexusbench/nexusbench/internal/orchestrator"
+	"github.com/nexusbench/nexusbench/internal/queue"
 )
 
 // ── Stubs ─────────────────────────────────────────────────────────────────────
@@ -30,11 +33,11 @@ type stubQueue struct {
 	err   error
 }
 
-func (q *stubQueue) QueueDepth(_ context.Context) (int64, error) { return q.depth, q.err }
-func (q *stubQueue) Enqueue(_ context.Context, _ interface{}) error { panic("not implemented") }
-func (q *stubQueue) Dequeue(_ context.Context) (interface{}, error) { panic("not implemented") }
-func (q *stubQueue) CommitJob(_ context.Context) error               { panic("not implemented") }
-func (q *stubQueue) Close() error                                     { return nil }
+func (q *stubQueue) QueueDepth(_ context.Context) (int64, error)  { return q.depth, q.err }
+func (q *stubQueue) Enqueue(_ context.Context, _ queue.Job) error { panic("not implemented") }
+func (q *stubQueue) Dequeue(_ context.Context) (queue.Job, error) { panic("not implemented") }
+func (q *stubQueue) CommitJob(_ context.Context) error            { panic("not implemented") }
+func (q *stubQueue) Close() error                                 { return nil }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -168,10 +171,10 @@ type stubSubStore struct{}
 
 func newStubSubStore() *stubSubStore { return &stubSubStore{} }
 
-func (s *stubSubStore) Save(_ *models.Submission) error               { return nil }
-func (s *stubSubStore) Get(_ string) (*models.Submission, error)       { return nil, fmt.Errorf("not found") }
-func (s *stubSubStore) Update(_ *models.Submission) error              { return nil }
-func (s *stubSubStore) List() ([]*models.Submission, error)            { return nil, nil }
+func (s *stubSubStore) Save(_ *models.Submission) error          { return nil }
+func (s *stubSubStore) Get(_ string) (*models.Submission, error) { return nil, fmt.Errorf("not found") }
+func (s *stubSubStore) Update(_ *models.Submission) error        { return nil }
+func (s *stubSubStore) List() ([]*models.Submission, error)      { return nil, nil }
 
 // newStubRegistry returns a real WorkerRegistry pre-populated with n busy workers.
 // We use the real registry because workersAreStillBusy calls registry.Stats().
@@ -179,7 +182,7 @@ func newStubRegistry(busyCount int) *orchestrator.WorkerRegistry {
 	reg := orchestrator.NewWorkerRegistry()
 	for i := range busyCount {
 		id := fmt.Sprintf("worker-%d", i)
-		reg.Register(id) //nolint:errcheck
+		reg.Register(id)                                //nolint:errcheck
 		reg.Heartbeat(id, orchestrator.HeartbeatUpdate{ //nolint:errcheck
 			Status:       orchestrator.WorkerStatusBusy,
 			CurrentJobID: fmt.Sprintf("job-%d", i),

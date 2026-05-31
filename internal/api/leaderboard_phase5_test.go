@@ -40,7 +40,7 @@ func seedSubmission(t *testing.T, dir string, sub *models.Submission) {
 	if err != nil {
 		t.Fatalf("seedSubmission: create: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if err := json.NewEncoder(f).Encode(sub); err != nil {
 		t.Fatalf("seedSubmission: encode: %v", err)
 	}
@@ -107,12 +107,12 @@ func TestLeaderboard_DeduplicatesPerTeam(t *testing.T) {
 
 	// beta submits once (score: 70) — rank 2 behind alpha's best of 80.
 	betaSub := &models.Submission{
-		ID:       "beta-0",
-		TeamName: "beta",
-		Language: models.LangRust,
-		Protocol: models.ProtocolREST,
-		Status:   models.StatusCompleted,
-		Results:  &models.BenchmarkResults{CompositeScore: 70},
+		ID:          "beta-0",
+		TeamName:    "beta",
+		Language:    models.LangRust,
+		Protocol:    models.ProtocolREST,
+		Status:      models.StatusCompleted,
+		Results:     &models.BenchmarkResults{CompositeScore: 70},
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		CompletedAt: &now,
@@ -148,12 +148,12 @@ func TestLeaderboard_BestScoreWins(t *testing.T) {
 	// gamma submits twice: first poor (30), then improved (95).
 	for i, score := range []float64{30, 95} {
 		sub := &models.Submission{
-			ID:       fmt.Sprintf("gamma-%d", i),
-			TeamName: "gamma",
-			Language: models.LangGo,
-			Protocol: models.ProtocolREST,
-			Status:   models.StatusCompleted,
-			Results:  &models.BenchmarkResults{CompositeScore: score},
+			ID:          fmt.Sprintf("gamma-%d", i),
+			TeamName:    "gamma",
+			Language:    models.LangGo,
+			Protocol:    models.ProtocolREST,
+			Status:      models.StatusCompleted,
+			Results:     &models.BenchmarkResults{CompositeScore: score},
 			CreatedAt:   now,
 			UpdatedAt:   now,
 			CompletedAt: &now,
