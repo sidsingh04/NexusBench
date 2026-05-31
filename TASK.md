@@ -106,6 +106,7 @@ pass plus the specific checks listed at the bottom of the stage.
 
 ## Stage 5.2 — ContestService and Admin Endpoints
 
+> **Status: ✅ COMPLETE**
 > **Touches:** new `internal/contest/` package, `internal/api/router.go`,
 >   `internal/config/config.go`, `cmd/server/main.go`.
 > **New packages:** `internal/contest`.
@@ -204,7 +205,7 @@ func (s *ContestService) GetLeaderboardSnapshot(ctx context.Context, contestID s
 **`defaults.go`** exports three functions returning the default
 `VolatilityProfile` for each level. Values match the table in PROGRESS.md.
 
-#### 5.2.1 — Add `ADMIN_API_KEY` to config
+#### 5.2.1 — Add `ADMIN_API_KEY` to config ✅ COMPLETE
 
 In `internal/config/config.go`, add:
 ```go
@@ -223,7 +224,7 @@ func adminAuthMiddleware(apiKey string) mux.MiddlewareFunc
 Apply the middleware to a new `/api/v1/admin` subrouter. All existing routes
 remain unmodified.
 
-#### 5.2.2 — Admin endpoints
+#### 5.2.2 — Admin endpoints ✅ COMPLETE
 
 Register on the `/api/v1/admin` subrouter:
 
@@ -239,7 +240,7 @@ GET  /api/v1/admin/contests/{id}/leaderboard     → contestHandler.GetLeaderboa
 `*contest.ContestService`. No business logic in the handler — validation,
 status transitions, and snapshot logic all live in `ContestService`.
 
-#### 5.2.3 — Auto-close goroutine
+#### 5.2.3 — Auto-close goroutine ✅ COMPLETE
 
 In `cmd/server/main.go`, start:
 
@@ -254,7 +255,7 @@ go runContestAutoClose(ctx, contestService, submissionService, tickInterval)
       in this contest, computes leaderboard entries.
    b. Calls `contestService.Close(ctx, contest.ID, entries)`.
 
-#### 5.2.4 — Unit tests (`internal/contest/service_test.go`)
+#### 5.2.4 — Unit tests (`internal/contest/service_test.go`) ✅ COMPLETE
 
 | Test | What it verifies |
 |---|---|
@@ -266,6 +267,136 @@ go runContestAutoClose(ctx, contestService, submissionService, tickInterval)
 | `TestGetActive_ErrWhenNone` | Returns `ErrNoActiveContest` when no contest is active |
 | `TestGetActive_ErrAfterClose` | Returns `ErrNoActiveContest` after the active contest closes |
 | `TestAdminMiddleware_RejectsWrongKey` | `adminAuthMiddleware` returns 401 for wrong key |
+
+#### 5.2.5 — Leaderboard Deduplication (AD-1) ✅ COMPLETE
+
+Modify `leaderboard()` in `internal/api/router.go`. Replace the current
+linear append with a best-score-per-team grouping:
+
+```go
+// bestByTeam keeps only the highest-scoring submission per team.
+bestByTeam := make(map[string]models.LeaderboardEntry)
+for _, sub := range subs {
+    if sub.Status != models.StatusCompleted {
+        continue
+    }
+    // Phase 5+: use FinalScore. Phase 1–4: use Results.CompositeScore.
+    score := sub.FinalScore
+    if score == 0 && sub.Results != nil {
+        score = sub.Results.CompositeScore
+    }
+    existing, seen := bestByTeam[sub.TeamName]
+    if !seen || score > existing.CompositeScore {
+        bestByTeam[sub.TeamName] = buildLeaderboardEntry(sub, score)
+    }
+}
+// Sort descending by score, assign 1-based ranks.
+entries := sortAndRank(bestByTeam)
+```
+
+Extract the entry-building and sort-and-rank logic into unexported helpers
+(`buildLeaderboardEntry`, `sortAndRank`) so the handler body stays readable.
+
+New test: `TestLeaderboard_DeduplicatesPerTeam` — three submissions from
+two teams; asserts exactly two leaderboard entries with correct ranks.
+
+#### 5.2.6 — Team History View (AD-2) ✅ COMPLETE
+
+Add to `internal/api/router.go`:
+
+```
+GET /api/v1/teams/{name}/submissions
+```
+
+```go
+func (h *handler) teamHistory(w http.ResponseWriter, r *http.Request) {
+    name := mux.Vars(r)["name"]
+    all, err := h.svc.List()
+    if err != nil {
+        writeError(w, http.StatusInternalServerError, "LIST_ERROR", err.Error())
+        return
+    }
+    var team []*models.Submission
+    for _, s := range all {
+        if s.TeamName == name {
+            team = append(team, s)
+        }
+    }
+    // List() already returns newest-first; no re-sort needed.
+    writeJSON(w, http.StatusOK, map[string]any{
+        "team_name":   name,
+        "count":       len(team),
+        "submissions": team,
+    })
+}
+```
+
+New test: `TestTeamHistory_ReturnsAllSubmissions` — two teams with two
+submissions each; asserts the endpoint returns only the queried team's two.
+
+#### 5.2.7 — Hybrid Drain-and-Wait Auto-Close (AD-3) ✅ COMPLETE
+
+Replace the ticker body in `runContestAutoClose` (in `cmd/server/main.go`).
+Expand the function signature:
+
+```go
+func runContestAutoClose(
+    ctx      context.Context,
+    svc      *contest.ContestService,
+    subStore submission.Store,
+    jobQueue queue.Queue,           // nil in local mode — drain check skipped
+    registry *orchestrator.WorkerRegistry, // nil in local mode — busy check skipped
+)
+```
+
+New ticker logic (every 30s):
+
+```go
+active, err := svc.GetActive(ctx)
+if err != nil { continue } // ErrNoActiveContest is normal
+
+now := time.Now().UTC()
+
+// Phase 1: check if intake should close.
+if active.SubmissionsClosedAt == nil && active.EndsAt != nil &&
+    now.After(active.EndsAt.Add(-5*time.Minute)) {
+    // Seal intake 5 minutes before EndsAt (operator configurable via EndsAt).
+    // Stage 5.3 will use this field in Ingest to reject new uploads.
+    // For now we just note it — ContestService.SetSubmissionsClosed is a
+    // Stage 5.3 addition.
+}
+
+// Phase 2: natural drain — trigger once submissions are closed.
+if active.SubmissionsClosedAt != nil && now.After(*active.SubmissionsClosedAt) {
+    drained := true
+    if jobQueue != nil {
+        depth, err := jobQueue.QueueDepth(ctx)
+        if err == nil && depth > 0 { drained = false }
+    }
+    if registry != nil {
+        if registry.Stats().Busy > 0 { drained = false }
+    }
+    if drained {
+        entries := buildLeaderboardEntries(ctx, subStore, active.ID)
+        svc.Close(ctx, active.ID, entries) //nolint:errcheck
+        continue
+    }
+}
+
+// Phase 3: hard failsafe — force-close at EndsAt regardless of drain state.
+if active.EndsAt != nil && now.After(*active.EndsAt) {
+    entries := buildLeaderboardEntries(ctx, subStore, active.ID)
+    svc.Close(ctx, active.ID, entries) //nolint:errcheck
+}
+```
+
+`buildLeaderboardEntries` is an unexported helper in `cmd/server/main.go` that
+calls `subStore.List()`, filters for `ContestID==active.ID &&
+Status==StatusCompleted`, and converts to `[]*models.LeaderboardEntry` sorted
+by `FinalScore` descending.
+
+Update the call site in `main()` to pass `store` (already constructed),
+`jobQueue` (nil in local mode), and `workerRegistry`.
 
 ### Gate — Stage 5.2
 
@@ -1098,6 +1229,132 @@ Before PROGRESS.md is updated to mark Phase 5 complete:
 | PostgreSQL persists contests across restart | Stage 5.9 manual gate |
 | Full smoke test passes live | Stage 5.10 live gate |
 | `make ci` clean | `make ci` |
+
+---
+
+## Architectural Decisions Log (AD)
+
+These decisions were reviewed against the live codebase after Stages 5.1 and
+5.2 were implemented. Each entry records the verdict, the precise insertion
+point, and whether any rework of completed stages is required.
+
+---
+
+### AD-1 — Leaderboard Deduplication (Best Score per Team)
+
+**Status:** Accepted. Inserted as Stage 5.2 sub-task 5.2.5.
+**Rework of 5.1/5.2:** None.
+
+**Problem:** Every completed submission gets its own leaderboard row. An active
+team submitting ten times monopolises the top ten spots.
+
+**Solution:** Modify the `leaderboard` handler in `internal/api/router.go` to
+build a `map[string]models.LeaderboardEntry` keyed by `TeamName`, replacing the
+entry only when `FinalScore` (Phase 5+) or `CompositeScore` (Phase 1–4) is
+higher. Sort the resulting map values by score descending and assign 1-based
+ranks before responding.
+
+**Why no rework:** `LeaderboardEntry` already has `TeamName`, `FinalScore`, and
+`CompositeScore` from Stage 5.1. The handler logic is additive — the JSON shape
+does not change.
+
+**Engineering cost:** ~12 lines inside the existing `leaderboard()` function.
+One new test: `TestLeaderboard_DeduplicatesPerTeam`.
+
+**Stage where implemented:** Stage 5.2 (sub-task 5.2.5 below).
+
+---
+
+### AD-2 — Team History View
+
+**Status:** Accepted. Inserted as Stage 5.2 sub-task 5.2.6.
+**Rework of 5.1/5.2:** None.
+
+**Problem:** Deduplication hides a team's alternative approaches from their own
+view.
+
+**Solution:** New endpoint `GET /api/v1/teams/{name}/submissions`. Calls
+`svc.List()`, filters by `TeamName`, sorts by `CreatedAt` descending, returns
+the full `[]*models.Submission` slice — no new store methods, no new packages.
+
+**Engineering cost:** ~15 lines. One new route registration, one handler method.
+One new test: `TestTeamHistory_ReturnsAllSubmissions`.
+
+**Stage where implemented:** Stage 5.2 (sub-task 5.2.6 below).
+
+---
+
+### AD-3 — Hybrid Drain-and-Wait Contest Closing
+
+**Status:** Accepted. Replaces the wall-clock-only `runContestAutoClose` in
+`cmd/server/main.go`. Inserted as Stage 5.2 sub-task 5.2.7.
+**Rework of 5.1/5.2:** None.
+
+**Problem:** A hard `EndsAt` wall-clock cut unfairly kills valid on-time
+submissions when the Redpanda queue is backed up due to platform capacity.
+
+**Two-timestamp protocol:**
+- `SubmissionsClosedAt` (already on `Contest` from Stage 5.1): intake gate.
+  `Ingest` checks this field and returns `ErrContestNotActive` once crossed.
+  Set by the admin 5–60 minutes before `EndsAt`.
+- `EndsAt`: hard failsafe only. The goroutine only forces close at `EndsAt` if
+  the queue has not drained naturally by then.
+
+**Drain condition (checked every 30s after `SubmissionsClosedAt`):**
+```go
+queueDepth, _ := jobQueue.QueueDepth(ctx)   // queue.Queue already has this
+stats := registry.Stats()                   // orchestrator.WorkerRegistry already has this
+if queueDepth == 0 && stats.Busy == 0 {
+    // all in-flight work is done — safe to close
+}
+```
+
+**`runContestAutoClose` new signature:**
+```go
+func runContestAutoClose(
+    ctx      context.Context,
+    svc      *contest.ContestService,
+    subStore submission.Store,       // to build leaderboard entries on close
+    jobQueue queue.Queue,
+    registry *orchestrator.WorkerRegistry,
+)
+```
+
+**Why no rework:** `SubmissionsClosedAt` is already on `Contest` (Stage 5.1).
+`queue.QueueDepth()` and `registry.Stats()` are both already implemented.
+`jobQueue` and `workerRegistry` are already in scope in `cmd/server/main.go`.
+The function is package-internal — signature change is free.
+
+**Engineering cost:** ~25 lines replacing the ticker body. No new interfaces.
+
+**Stage where implemented:** Stage 5.2 (sub-task 5.2.7 below).
+
+---
+
+### AD-4 — NTP Clock Drift Resilience
+
+**Status:** Partially already correct; one note added to Stage 5.9.
+**Rework of 5.1/5.2:** None.
+
+**Sub-item A — Timeouts (monotonic clocks):**
+All timeout paths already use `context.WithTimeout` (which uses the monotonic
+clock internally) and `time.Since()`. `waitHealthy` uses
+`time.Now().Add(e.healthTimeout)` then `time.Now().After(deadline)` — both
+calls are on the same runtime monotonic source, immune to NTP wall-clock jumps.
+**Already correct. No action needed.**
+
+**Sub-item B — `CompletedAt` timestamp authority:**
+In `worker.go`, `now := time.Now().UTC()` then `sub.CompletedAt = &now` stamps
+the worker's local clock. With `DiskStore` (Stages 5.1–5.8) the worker is the
+*only* writer, so its clock is authoritative by definition — there is no
+"control plane receives results" moment to stamp instead.
+
+With `PostgresContestStore` (Stage 5.9), the leaderboard snapshot INSERT should
+use `snapshotted_at TIMESTAMPTZ NOT NULL DEFAULT now()` (DB server clock) for
+the snapshot timestamp. The `CompletedAt` on individual submissions remains the
+worker's stamp — acceptable because contest fairness depends on *relative*
+orderings within the same contest, where all workers share the same NTP source.
+**Action: one schema note added to Stage 5.9. No code changes to 5.1–5.8.**
 
 ---
 

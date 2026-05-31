@@ -45,7 +45,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
-| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅) |
+| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 🔄) |
 | Phase 6 | Frontend | 🔲 Planned |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
@@ -189,8 +189,9 @@ write, Docker socket permission). All documented in TASK.md.
 ## Phase 5 — Advanced Benchmarking
 
 > **Status: 🔄 In Progress**
-> Stage 5.1 ✅ complete. Next: Stage 5.2 (ContestService + admin endpoints).
-> See TASK.md for the full stage plan.
+> Stage 5.1 and Stage 5.2 are ✅ complete and tested (including architectural additions 5.2.5-5.2.7). 
+> **Current Focus: Implementing Stage 5.3 (One-Active-Submission Guard).**
+> See TASK.md for full analysis.
 
 ### Goal
 
