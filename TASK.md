@@ -49,7 +49,7 @@ to pass before proceeding to the next stage.
 Stage 5.1  models + ContestStore               ✅ COMPLETE
 Stage 5.2  ContestService + admin endpoints    ✅ COMPLETE
 Stage 5.3  One-active-submission guard         ✅ COMPLETE
-Stage 5.4  Volatility-aware scoring            (Ingest gate, 10 lines)
+Stage 5.4  Volatility-aware scoring            ✅ COMPLETE
 Stage 5.5  Sequential three-job dispatch       (replace hardcoded buildResults)
 Stage 5.6  Dry-run Validator                   (job chaining, no new packages)
 Stage 5.7  SSE live leaderboard                (new internal/validator package)
@@ -485,8 +485,9 @@ make test -race    # all tests pass including 2 new ones
 
 ---
 
-## Stage 5.4 — Volatility-Aware Scoring
+## Stage 5.4 — Volatility-Aware Scoring ✅
 
+> **Status: ✅ COMPLETE**
 > **Touches:** `internal/worker/executor.go` only.
 > **New packages:** none.
 > **Tests required:** 4 new unit tests replacing/extending existing `buildResults` tests.

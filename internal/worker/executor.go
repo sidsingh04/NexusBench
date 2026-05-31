@@ -215,14 +215,34 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 	}
 
 	// ── 7. Build BenchmarkResults ─────────────────────────────────────────────
-	results := buildResults(fleetResult, correctnessResult)
-	log.Info("executor: benchmark complete",
-		"p50_ms", results.P50LatencyMs,
-		"p99_ms", results.P99LatencyMs,
-		"max_tps", results.MaxTPS,
-		"correctness", results.CorrectnessScore,
-		"composite_score", results.CompositeScore,
-	)
+	// Phase 5: the job carries VolatilityLabel when dispatched by the contest
+	// service (Stage 5.3+). buildResults uses the label to select Phase 5
+	// profile-aware scoring vs the Phase 1-4 legacy path.
+	//
+	// NOTE: profile is the zero value here until Stage 5.5 wires the
+	// ContestStore into the executor. The Phase 5 scoring path handles this
+	// gracefully; unit tests inject explicit profiles for TestBuildResults_*.
+	var profile models.VolatilityProfile
+	results := buildResults(fleetResult, correctnessResult, profile, j.VolatilityLabel)
+
+	if j.VolatilityLabel != "" {
+		log.Info("executor: benchmark complete",
+			"volatility_label", results.VolatilityLabel,
+			"p50_ms", results.P50LatencyMs,
+			"p99_ms", results.P99LatencyMs,
+			"sustained_tps", results.SustainedTPS,
+			"correctness", results.CorrectnessScore,
+			"run_score", results.RunScore,
+		)
+	} else {
+		log.Info("executor: benchmark complete",
+			"p50_ms", results.P50LatencyMs,
+			"p99_ms", results.P99LatencyMs,
+			"max_tps", results.MaxTPS,
+			"correctness", results.CorrectnessScore,
+			"composite_score", results.CompositeScore,
+		)
+	}
 
 	return results, nil
 }
@@ -405,7 +425,13 @@ func (e *SandboxExecutor) emitFleetTelemetry(
 }
 
 // buildFleetConfig returns the fleet configuration for this run.
-// Uses e.fleetCfgOverride if set (tests / custom scenarios), otherwise defaults.
+//
+// Priority:
+//  1. fleetCfgOverride (set via WithFleetConfig) — used in tests and the
+//     dry-run validator to inject a fixed config regardless of job content.
+//  2. Phase 1–4 default — botfleet.DefaultFleetConfig.
+//
+// Phase 5 jobs use buildFleetConfigFromProfile instead of this method.
 func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfig {
 	if e.fleetCfgOverride != nil {
 		cfg := *e.fleetCfgOverride
@@ -415,43 +441,71 @@ func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfi
 	return botfleet.DefaultFleetConfig(targetURL)
 }
 
-// buildResults converts fleet + correctness data into the models.BenchmarkResults
-// that the store and leaderboard consume.
+// buildFleetConfigFromProfile translates a VolatilityProfile into the
+// botfleet.FleetConfig used for a Phase 5 benchmark run. All numeric
+// parameters come from the profile so the admin can tune per-contest load
+// characteristics without a code change.
 //
-// Composite score formula (from TASK.md):
+// Used by Stage 5.5+ when the executor receives a job with a VolatilityLabel
+// and the matching profile has been resolved from the ContestStore.
+func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) botfleet.FleetConfig {
+	return botfleet.FleetConfig{
+		BotCount:          p.BotCount,
+		RampUpDuration:    5 * time.Second,
+		TestDuration:      p.TestDuration,
+		TargetURL:         targetURL,
+		PerBotHTTPTimeout: 2 * time.Second,
+		GeneratorConfig: botfleet.RandomGeneratorConfig{
+			Ratios: botfleet.OrderRatios{
+				Limit:  p.LimitRatio,
+				Market: p.MarketRatio,
+				Cancel: p.CancelRatio,
+			},
+			Price: botfleet.PriceConfig{
+				MidPrice: 10_000,
+				Spread:   p.PriceSpreadCents,
+			},
+			Quantity: botfleet.QuantityConfig{
+				Min: 1,
+				Max: p.MaxQuantity,
+			},
+		},
+	}
+}
+
+// buildResults converts fleet + correctness data into models.BenchmarkResults.
 //
-//	0.5 * (1 - NormalisedP99) + 0.3 * NormalisedTPS + 0.2 * CorrectnessScore
+// Dispatch logic (keyed on label):
 //
-// NormalisedP99: we target a p99 of 1ms (1_000_000 ns). Anything at or below
-// scores 1.0; anything above decays linearly toward 0 at 100ms.
-// NormalisedTPS: we target a peak TPS of 50_000. Anything at or above scores
-// 1.0; lower values scale proportionally.
+//   - label == "" (Phase 1–4 jobs): uses the legacy hardcoded constants and
+//     formula. CompositeScore is set; RunScore remains zero. No existing test
+//     changes needed.
+//
+//   - label != "" (Phase 5 jobs): uses profile-aware targets and weights.
+//     RunScore is set (0.0–1.0). CompositeScore = RunScore×100 so the legacy
+//     leaderboard handler still shows a meaningful value until Stage 5.5 wires
+//     FinalScore through the deduplicated handler.
+//
+// Phase 5 scoring formula:
+//
+//	normP99  = 1.0 at p99 ≤ TargetP99Ns, decays linearly to 0.0 at 10×TargetP99Ns
+//	normTPS  = SustainedTPS / TargetSustainTPS, capped at 1.0
+//	runScore = correctness × (LatencyWeight×normP99 + ThroughputWeight×normTPS)
+//	         + CorrectnessWeight×correctness
+//
+// Correctness is a multiplier: an engine with 0% correct fills scores 0
+// regardless of latency or throughput. This incentivises correctness first.
+//
+// normTPS uses SustainedTPS (full-run average), not MaxTPS (100ms burst).
+// MaxTPS is still recorded for diagnostics but does not affect ranking.
 func buildResults(
 	fr *botfleet.FleetResult,
 	cr *correctness.CorrectnessResult,
+	profile models.VolatilityProfile,
+	label string,
 ) *models.BenchmarkResults {
 
 	stats := fr.Stats
-
-	const (
-		targetP99Ns  = 1_000_000   // 1ms
-		worstP99Ns   = 100_000_000 // 100ms — floor for score
-		targetMaxTPS = float64(50_000)
-	)
-
-	// Normalised P99 (0.0 = worst, 1.0 = best)
-	normP99 := 0.0
-	if stats.P99Ns <= targetP99Ns {
-		normP99 = 1.0
-	} else if stats.P99Ns < worstP99Ns {
-		normP99 = 1.0 - (stats.P99Ns-targetP99Ns)/(worstP99Ns-targetP99Ns)
-	}
-
-	// Normalised TPS (0.0 – 1.0, capped at 1.0)
-	normTPS := stats.MaxTPS / targetMaxTPS
-	if normTPS > 1.0 {
-		normTPS = 1.0
-	}
 
 	correctnessScore := 0.0
 	var totalOrders, correctFills, incorrectFills int64
@@ -462,15 +516,10 @@ func buildResults(
 		incorrectFills = cr.IncorrectFills
 	}
 
-	// Invert: lower P99 → higher composite. Correct formula per spec:
-	// 0.5*(normP99) + 0.3*(normTPS) + 0.2*(correctness)
-	compositeScore := (0.5 * normP99) + (0.3 * normTPS) + (0.2 * correctnessScore)
-	// Scale to 0–100 for leaderboard readability.
-	compositeScore *= 100.0
-
 	duration := fr.FinishedAt.Sub(fr.StartedAt).String()
 
-	return &models.BenchmarkResults{
+	result := &models.BenchmarkResults{
+		VolatilityLabel:   label,
 		P50LatencyMs:      stats.P50Ms(),
 		P90LatencyMs:      stats.P90Ms(),
 		P99LatencyMs:      stats.P99Ms(),
@@ -480,10 +529,63 @@ func buildResults(
 		TotalOrders:       totalOrders,
 		CorrectFills:      correctFills,
 		IncorrectFills:    incorrectFills,
-		CompositeScore:    compositeScore,
 		BenchmarkDuration: duration,
 		CompletedAt:       fr.FinishedAt,
 	}
+
+	if label == "" {
+		// ── Phase 1–4 backward-compatible scoring ─────────────────────────────
+		// Original hardcoded constants and formula; keeps all pre-Phase-5
+		// tests passing without modification.
+		const (
+			legacyTargetP99Ns  = float64(1_000_000)   // 1 ms
+			legacyWorstP99Ns   = float64(100_000_000) // 100 ms
+			legacyTargetMaxTPS = float64(50_000)
+		)
+		normP99 := 0.0
+		p99 := stats.P99Ns
+		if p99 <= legacyTargetP99Ns {
+			normP99 = 1.0
+		} else if p99 < legacyWorstP99Ns {
+			normP99 = 1.0 - (p99-legacyTargetP99Ns)/(legacyWorstP99Ns-legacyTargetP99Ns)
+		}
+		normTPS := stats.MaxTPS / legacyTargetMaxTPS
+		if normTPS > 1.0 {
+			normTPS = 1.0
+		}
+		result.CompositeScore = (0.5*normP99 + 0.3*normTPS + 0.2*correctnessScore) * 100.0
+		return result
+	}
+
+	// ── Phase 5 profile-aware scoring ─────────────────────────────────────────
+	worstP99Ns := float64(profile.TargetP99Ns) * 10.0
+	normP99 := 0.0
+	p99 := stats.P99Ns
+	switch {
+	case p99 <= float64(profile.TargetP99Ns):
+		normP99 = 1.0
+	case p99 < worstP99Ns:
+		normP99 = 1.0 - (p99-float64(profile.TargetP99Ns))/(worstP99Ns-float64(profile.TargetP99Ns))
+		// p99 >= worstP99Ns: normP99 stays 0.0
+	}
+
+	normTPS := 0.0
+	if profile.TargetSustainTPS > 0 {
+		normTPS = stats.SustainedTPS / profile.TargetSustainTPS
+		if normTPS > 1.0 {
+			normTPS = 1.0
+		}
+	}
+
+	// Correctness multiplier: an engine with 0% correctness scores 0 on every
+	// axis, regardless of how fast it is.
+	runScore := correctnessScore*
+		(profile.LatencyWeight*normP99+profile.ThroughputWeight*normTPS) +
+		profile.CorrectnessWeight*correctnessScore
+
+	result.RunScore = runScore
+	result.CompositeScore = runScore * 100.0 // legacy field; Stage 5.5 uses FinalScore
+	return result
 }
 
 func (e *SandboxExecutor) waitHealthy(ctx context.Context, containerID string, log *slog.Logger) error {

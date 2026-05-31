@@ -45,7 +45,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
-| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 🔄) |
+| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 ✅, Stage 5.5 🔄) |
 | Phase 6 | Frontend | 🔲 Planned |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
@@ -189,8 +189,8 @@ write, Docker socket permission). All documented in TASK.md.
 ## Phase 5 — Advanced Benchmarking
 
 > **Status: 🔄 In Progress**
-> Stage 5.1, Stage 5.2, and Stage 5.3 are ✅ complete and tested.
-> **Current Focus: Implementing Stage 5.4 (Volatility-Aware Scoring).**
+> Stage 5.1 through Stage 5.4 are ✅ complete and tested.
+> **Current Focus: Implementing Stage 5.5 (Sequential Three-Job Dispatch).**
 > See TASK.md for full analysis.
 
 ### Goal
