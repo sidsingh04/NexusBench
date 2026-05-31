@@ -45,7 +45,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
-| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 🔄) |
+| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 🔄) |
 | Phase 6 | Frontend | 🔲 Planned |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
@@ -189,8 +189,8 @@ write, Docker socket permission). All documented in TASK.md.
 ## Phase 5 — Advanced Benchmarking
 
 > **Status: 🔄 In Progress**
-> Stage 5.1 and Stage 5.2 are ✅ complete and tested (including architectural additions 5.2.5-5.2.7). 
-> **Current Focus: Implementing Stage 5.3 (One-Active-Submission Guard).**
+> Stage 5.1, Stage 5.2, and Stage 5.3 are ✅ complete and tested.
+> **Current Focus: Implementing Stage 5.4 (Volatility-Aware Scoring).**
 > See TASK.md for full analysis.
 
 ### Goal
@@ -231,7 +231,25 @@ a safe pre-submission validation path."
 
 ---
 
-### 5.1 — Contest Model and Lifecycle (Specification Reference)
+### Stage 5.3 — One-Active-Submission Guard ✅
+
+**Gate passed:** `go test ./internal/submission/... -race` green, all pre-existing tests still pass.
+
+**What was built:**
+
+| File | Change |
+|---|---|
+| `internal/submission/service.go` | Added `ContestGetter` interface; added `contestGetter` field to `Service`; added `WithContestGetter` builder; rewrote `Ingest` to include Phase 5 contest checks (no-active-contest gate, submissions-closed gate, one-active-submission guard); extracted `checkNoActiveSubmission` helper |
+| `internal/submission/service_test.go` | Added `mockContestGetter`, `activeContest` helper, `TestIngest_RejectsIfSubmissionInProgress`, `TestIngest_AllowsAfterPreviousCompleted` |
+| `cmd/server/main.go` | Wired `contestSvc` into `submissionSvc` via `WithContestGetter` when `AdminAPIKey` is set |
+
+**Backward compatibility:** All Phase 1–4 tests unaffected. `contestGetter == nil` (default) skips all Phase 5 checks — no behavioural change for existing callers.
+
+**Design decisions enforced:**
+- `ContestGetter` interface defined in `internal/submission` (not `internal/contest`) to avoid an import cycle.
+- `checkNoActiveSubmission` uses `IsTerminal()` from Stage 5.1 as the single authoritative terminal-status check.
+- The guard is conservative on store error: blocks the submission rather than permitting a flood.
+- `WithContestGetter` follows the same immutable-copy pattern as `WithQueue` — original `Service` unmodified.
 
 #### What it is
 

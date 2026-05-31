@@ -125,11 +125,17 @@ func main() {
 	contestStore := contest.NewMemoryContestStore()
 	contestSvc := contest.NewContestService(contestStore, nil) // nil bus → Stage 5.7
 
+	// Wire the contest service into the submission service so that Ingest
+	// enforces contest-scoped checks (Stage 5.3):
+	//  - requires an active contest
+	//  - rejects uploads after SubmissionsClosedAt
+	//  - blocks duplicate in-flight submissions per team
 	if cfg.AdminAPIKey != "" {
+		submissionSvc = submissionSvc.WithContestGetter(contestSvc)
 		slog.Info("server: admin API enabled — contest lifecycle routes mounted",
 			"route_prefix", "/api/v1/admin")
 	} else {
-		slog.Warn("server: ADMIN_API_KEY not set — admin routes will not be mounted")
+		slog.Warn("server: ADMIN_API_KEY not set — admin routes will not be mounted; contest checks disabled")
 	}
 
 	// ── Auto-close goroutine (AD-3: hybrid drain-and-wait) ────────────────────

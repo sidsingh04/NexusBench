@@ -47,8 +47,8 @@ to pass before proceeding to the next stage.
 
 ```
 Stage 5.1  models + ContestStore               ✅ COMPLETE
-Stage 5.2  ContestService + admin endpoints    (data layer, no behaviour)
-Stage 5.3  One-active-submission guard         (lifecycle logic + HTTP)
+Stage 5.2  ContestService + admin endpoints    ✅ COMPLETE
+Stage 5.3  One-active-submission guard         ✅ COMPLETE
 Stage 5.4  Volatility-aware scoring            (Ingest gate, 10 lines)
 Stage 5.5  Sequential three-job dispatch       (replace hardcoded buildResults)
 Stage 5.6  Dry-run Validator                   (job chaining, no new packages)
@@ -417,8 +417,9 @@ curl localhost:8080/api/v1/admin/contests/{id}/activate  # no auth header
 
 ---
 
-## Stage 5.3 — One-Active-Submission Guard
+## Stage 5.3 — One-Active-Submission Guard ✅
 
+> **Status: ✅ COMPLETE**
 > **Touches:** `internal/submission/service.go` only.
 > **New packages:** none.
 > **Tests required:** 2 new unit tests added to existing submission test file.

@@ -2,10 +2,12 @@ package submission_test
 
 import (
 	"context"
+	"errors"
 	"mime/multipart"
 	"net/textproto"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/nexusbench/nexusbench/internal/config"
 	"github.com/nexusbench/nexusbench/internal/models"
@@ -123,5 +125,121 @@ func makeFakeFileHeader(filename string, content []byte) *multipart.FileHeader {
 		Header:   make(textproto.MIMEHeader),
 		// multipart.FileHeader.Open() reads from the file path via internal field.
 		// For tests we override by creating our own struct with a known temp path.
+	}
+}
+
+// ── Stage 5.3 — One-Active-Submission Guard tests ─────────────────────────────
+
+// mockContestGetter is a minimal ContestGetter for unit tests.
+// It returns the supplied contest (or error) on every GetActive call.
+type mockContestGetter struct {
+	contest *models.Contest
+	err     error
+}
+
+func (m *mockContestGetter) GetActive(_ context.Context) (*models.Contest, error) {
+	return m.contest, m.err
+}
+
+// activeContest returns a minimal active contest for use in guard tests.
+func activeContest(id string) *models.Contest {
+	return &models.Contest{
+		ID:     id,
+		Name:   "test-contest",
+		Status: models.ContestStatusActive,
+	}
+}
+
+// TestIngest_RejectsIfSubmissionInProgress verifies that Ingest returns
+// ErrSubmissionInProgress when the team already has a non-terminal submission
+// in the same contest.
+func TestIngest_RejectsIfSubmissionInProgress(t *testing.T) {
+	dir := t.TempDir()
+	store := submission.NewDiskStore(dir)
+	cfg := config.Load()
+	cfg.SubmissionDir = dir
+
+	const contestID = "contest-abc"
+	const teamName = "alpha-team"
+
+	// Seed an existing pending submission for the same team + contest.
+	existing := &models.Submission{
+		ID:        "existing-sub-001",
+		TeamName:  teamName,
+		ContestID: contestID,
+		Status:    models.StatusPending, // non-terminal — should block
+	}
+	if err := store.Save(existing); err != nil {
+		t.Fatalf("seed existing submission: %v", err)
+	}
+
+	getter := &mockContestGetter{contest: activeContest(contestID)}
+	svc := submission.NewService(store, nil, cfg).WithContestGetter(getter)
+
+	fh := makeFakeFileHeader("engine.tar.gz", []byte("fake"))
+	_, err := svc.Ingest(context.Background(), models.SubmitRequest{
+		TeamName: teamName,
+		Language: models.LangGo,
+		Protocol: models.ProtocolREST,
+	}, fh)
+
+	if err == nil {
+		t.Fatal("expected ErrSubmissionInProgress, got nil")
+	}
+	if !errors.Is(err, models.ErrSubmissionInProgress) {
+		t.Errorf("expected ErrSubmissionInProgress, got: %v", err)
+	}
+}
+
+// TestIngest_AllowsAfterPreviousCompleted verifies that a team may resubmit
+// once their previous submission has reached a terminal status.
+func TestIngest_AllowsAfterPreviousCompleted(t *testing.T) {
+	dir := t.TempDir()
+	store := submission.NewDiskStore(dir)
+	cfg := config.Load()
+	cfg.SubmissionDir = dir
+
+	const contestID = "contest-xyz"
+	const teamName = "beta-team"
+
+	// Seed a completed submission — terminal, so should not block.
+	now := time.Now().UTC()
+	previous := &models.Submission{
+		ID:          "prev-sub-001",
+		TeamName:    teamName,
+		ContestID:   contestID,
+		Status:      models.StatusCompleted, // terminal — should allow resubmit
+		CompletedAt: &now,
+	}
+	if err := store.Save(previous); err != nil {
+		t.Fatalf("seed previous submission: %v", err)
+	}
+
+	getter := &mockContestGetter{contest: activeContest(contestID)}
+	// nil docker — Ingest runs contest checks, then hits storeArchive.
+	// We verify the guard passes by checking the error is NOT ErrSubmissionInProgress.
+	svc := submission.NewService(store, nil, cfg).WithContestGetter(getter)
+
+	// Use a real temp file so storeArchive succeeds.
+	tmpFile, err := os.CreateTemp(t.TempDir(), "engine.tar.gz")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	_, _ = tmpFile.WriteString("fake archive content")
+	_ = tmpFile.Close()
+
+	fh := makeFakeFileHeader("engine.tar.gz", []byte("fake archive content"))
+	_, err = svc.Ingest(context.Background(), models.SubmitRequest{
+		TeamName: teamName,
+		Language: models.LangGo,
+		Protocol: models.ProtocolREST,
+	}, fh)
+
+	// The guard must NOT fire. Any other error (e.g. docker deploy) is fine —
+	// nil docker means deployAsync will be skipped entirely in local mode, and
+	// the submission is already persisted. But since we have no jobQueue wired,
+	// deployAsync is called in a goroutine, so Ingest itself returns nil.
+	if errors.Is(err, models.ErrSubmissionInProgress) {
+		t.Errorf("expected guard to pass for completed previous submission, got ErrSubmissionInProgress")
 	}
 }
