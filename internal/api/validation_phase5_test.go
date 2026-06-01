@@ -48,7 +48,7 @@ func setupValidationRouter(t *testing.T, runner api.ValidatorRunner) (http.Handl
 		return runner
 	}
 
-	router := api.NewRouter(svc, cfg, reg, nil, contestSvc, factory)
+	router := api.NewRouter(svc, cfg, reg, nil, contestSvc, factory, nil)
 	return router, store
 }
 

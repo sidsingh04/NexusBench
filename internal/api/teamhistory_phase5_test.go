@@ -42,7 +42,7 @@ func newTeamHistoryRouterNoContest(t *testing.T) http.Handler {
 	}
 	store := submission.NewDiskStore(dir)
 	svc := submission.NewService(store, nil, cfg)
-	return api.NewRouter(svc, cfg, metrics.New(), nil, nil, nil) // nil contestSvc, nil validator
+	return api.NewRouter(svc, cfg, metrics.New(), nil, nil, nil, nil) // nil contestSvc, nil validator, nil bus
 }
 
 func getTeamHistory(t *testing.T, router http.Handler, teamName string) (int, []models.Submission) {

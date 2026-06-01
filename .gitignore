@@ -41,3 +41,4 @@ graphify-out/
 
 # Temporary files
 _roadmap_tmp.md
+*.log

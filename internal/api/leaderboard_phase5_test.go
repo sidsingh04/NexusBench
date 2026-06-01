@@ -58,7 +58,7 @@ func newLeaderboardRouter(t *testing.T) (http.Handler, string) {
 	svc := submission.NewService(store, nil, cfg)
 	contestStore := contest.NewMemoryContestStore()
 	contestSvc := contest.NewContestService(contestStore, nil)
-	router := api.NewRouter(svc, cfg, metrics.New(), nil, contestSvc, nil)
+	router := api.NewRouter(svc, cfg, metrics.New(), nil, contestSvc, nil, nil)
 	return router, dir
 }
 

@@ -124,8 +124,9 @@ func main() {
 	// ── Contest service (Phase 5+) ────────────────────────────────────────────
 	// MemoryContestStore for all modes through Stage 5.8.
 	// Stage 5.9 switches to PostgresContestStore when DistributedMode=true.
+	bus := api.NewLeaderboardBus()
 	contestStore := contest.NewMemoryContestStore()
-	contestSvc := contest.NewContestService(contestStore, nil) // nil bus → Stage 5.7
+	contestSvc := contest.NewContestService(contestStore, bus)
 
 	// Wire the contest service into the submission service so that Ingest
 	// enforces contest-scoped checks (Stage 5.3):
@@ -157,7 +158,7 @@ func main() {
 		v := validator.New(transport)
 		return validatorAdapter{v}
 	}
-	router := api.NewRouter(submissionSvc, cfg, reg, orchHandler, contestSvc, factory)
+	router := api.NewRouter(submissionSvc, cfg, reg, orchHandler, contestSvc, factory, bus)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,

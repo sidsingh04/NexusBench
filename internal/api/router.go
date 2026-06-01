@@ -53,7 +53,6 @@ type contestHandler struct {
 
 // ValidatorResult mirrors validator.ValidationResult so that the api package
 // does not need to import internal/validator.
-// The concrete validator.Validator satisfies ValidatorRunner below.
 type ValidatorResult struct {
 	SubmissionID string           `json:"submission_id"`
 	Scenarios    []ScenarioResult `json:"scenarios"`
@@ -69,48 +68,25 @@ type ScenarioResult struct {
 }
 
 // ValidatorRunner is the narrow interface the validate endpoint depends on.
-// It is satisfied by *validator.Validator (wired externally) and by test
-// doubles in router_test.go.
+// It is satisfied by *validator.Validator (wired externally) and by test doubles.
 //
-// Defined here — not in internal/validator — so the api package has no
-// import on the validator package. This keeps the dependency arrow pointing
-// inward: api defines the contract; validator satisfies it.
-//
-// The ctx argument must be respected for graceful cancellation during request
-// termination.
+// Defined here so the api package has no import on internal/validator.
 type ValidatorRunner interface {
-	// Run executes the fixed smoke-test sequence against the engine reachable
-	// via the transport the runner was constructed with, and returns
-	// per-scenario pass/fail results.
-	//
-	// submissionID is embedded in the result for traceability. It must not
-	// be empty.
-	//
-	// Implementations must be safe for concurrent use.
 	Run(ctx context.Context, submissionID string) (*ValidatorResult, error)
 }
 
-// ValidatorFactory creates a ValidatorRunner that targets the given URL.
-// It is called once per validate request, constructing a fresh runner
-// pointed at the submission's live sandbox port.
-//
-// The factory abstraction keeps the api package free of all botfleet and
-// validator imports while allowing cmd/server/main.go to wire the real
-// validator.New + botfleet.NewRESTTransport implementation.
+// ValidatorFactory creates a ValidatorRunner targeting the given URL.
+// Called once per validate request.
 type ValidatorFactory func(targetURL string) ValidatorRunner
 
 // validationHandler handles POST /api/v1/submissions/{id}/validate.
-// It holds the factory and the per-submission rate limiter.
 type validationHandler struct {
 	svc         *submission.Service
-	sandboxHost string // hostname to reach sandbox containers (e.g. "localhost")
+	sandboxHost string
 	factory     ValidatorFactory
 	limiter     *validationRateLimiter
 }
 
-// newValidationHandler constructs a validationHandler.
-// sandboxHost is the host the control plane uses to reach sandbox containers;
-// in distributed mode this is "host.docker.internal" or the worker node IP.
 func newValidationHandler(svc *submission.Service, sandboxHost string, factory ValidatorFactory) *validationHandler {
 	return &validationHandler{
 		svc:         svc,
@@ -122,22 +98,11 @@ func newValidationHandler(svc *submission.Service, sandboxHost string, factory V
 
 // validate handles POST /api/v1/submissions/{id}/validate.
 //
-// Pre-conditions checked (in order):
-//  1. Submission exists          → 404 NOT_FOUND
-//  2. Not currently benchmarking → 409 VALIDATION_CONFLICT
-//  3. Rate limit (1 per 2 min)   → 429 TOO_MANY_REQUESTS
-//  4. Container port is known    → 409 CONTAINER_NOT_READY
-//
-// When all checks pass, a fresh ValidatorRunner is constructed pointing at
-// http://<sandboxHost>:<ExposedPort> and Run is called. The result is
-// returned as JSON with status 200.
-//
-// The validate call has no side effects on the submission: status, results,
-// leaderboard, and metrics are all unchanged.
+// Pre-conditions (in order): exists → not benchmarking → rate-limit → port known.
+// No side effects on submission state, results, or leaderboard.
 func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 
-	// 1. Submission must exist.
 	sub, err := vh.svc.Get(id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "NOT_FOUND",
@@ -145,16 +110,12 @@ func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Cannot validate while the benchmark fleet is actively running —
-	//    concurrent traffic would corrupt both the benchmark and the validation.
 	if sub.Status == models.StatusBenchmarking {
 		writeError(w, http.StatusConflict, "VALIDATION_CONFLICT",
 			"submission is currently being benchmarked; please wait until it completes")
 		return
 	}
 
-	// 3. Rate limit: one validation per submission per 2 minutes.
-	//    Prevents abuse (re-validating every second to probe the scoreboard).
 	if !vh.limiter.allow(id) {
 		retryAfter := vh.limiter.retryAfter(id)
 		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
@@ -164,28 +125,21 @@ func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Container must be running and have an exposed port.
-	//    ExposedPort > 0 means the sandbox is live and accepting connections.
 	if sub.ExposedPort <= 0 {
-		vh.limiter.revoke(id) // don't burn the slot — the container isn't up yet
+		vh.limiter.revoke(id)
 		writeError(w, http.StatusConflict, "CONTAINER_NOT_READY",
 			"sandbox container is not yet running; submit the engine first and wait for status=running")
 		return
 	}
 
-	// Construct a fresh runner pointing at the live sandbox container.
 	targetURL := fmt.Sprintf("http://%s:%d", vh.sandboxHost, sub.ExposedPort)
 	runner := vh.factory(targetURL)
 
 	slog.Info("api: dry-run validation started",
-		"submission_id", id,
-		"target_url", targetURL,
-		"team", sub.TeamName,
-	)
+		"submission_id", id, "target_url", targetURL, "team", sub.TeamName)
 
 	result, runErr := runner.Run(r.Context(), id)
 	if runErr != nil {
-		// Context cancellation (client disconnected) is not a server error.
 		if r.Context().Err() != nil {
 			writeError(w, http.StatusRequestTimeout, "VALIDATION_CANCELED",
 				"validation canceled by client")
@@ -197,58 +151,40 @@ func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("api: dry-run validation complete",
-		"submission_id", id,
-		"all_passed", result.AllPassed,
-	)
+		"submission_id", id, "all_passed", result.AllPassed)
 
 	writeJSON(w, http.StatusOK, result)
 }
 
 // ── Validation rate limiter ────────────────────────────────────────────────────
 
-// validationRateLimiter tracks the last validation time per submission ID.
-// It uses sync.Map for lock-free reads in the common (not-rate-limited) case.
-//
-// The limiter is intentionally simple: one request per submission per window.
-// A sliding-window or token-bucket implementation is unnecessary at this scale.
 type validationRateLimiter struct {
-	// lastAllowed maps submissionID → time.Time of the last allowed request.
 	lastAllowed sync.Map
 	window      time.Duration
 }
 
-// newValidationRateLimiter creates a rate limiter with the given window.
 func newValidationRateLimiter(window time.Duration) *validationRateLimiter {
 	return &validationRateLimiter{window: window}
 }
 
-// allow returns true if the submission may be validated now, and records the
-// current time as the last-allowed time. Returns false if a request was
-// allowed within the window.
 func (l *validationRateLimiter) allow(submissionID string) bool {
 	now := time.Now()
 	last, loaded := l.lastAllowed.LoadOrStore(submissionID, now)
 	if !loaded {
-		// First request for this submission — always allowed.
 		return true
 	}
 	lastTime, ok := last.(time.Time)
 	if !ok {
-		// Malformed entry — allow and reset.
 		l.lastAllowed.Store(submissionID, now)
 		return true
 	}
 	if now.Sub(lastTime) >= l.window {
-		// Window has elapsed — allow and update.
 		l.lastAllowed.Store(submissionID, now)
 		return true
 	}
-	// Within the window — deny.
 	return false
 }
 
-// retryAfter returns how long the caller must wait before the next request
-// is allowed. Returns 0 when no rate-limit record exists.
 func (l *validationRateLimiter) retryAfter(submissionID string) time.Duration {
 	v, ok := l.lastAllowed.Load(submissionID)
 	if !ok {
@@ -258,19 +194,111 @@ func (l *validationRateLimiter) retryAfter(submissionID string) time.Duration {
 	if !ok {
 		return 0
 	}
-	remaining := l.window - time.Since(last)
-	if remaining < 0 {
-		return 0
+	if remaining := l.window - time.Since(last); remaining > 0 {
+		return remaining
 	}
-	return remaining
+	return 0
 }
 
-// revoke removes the rate-limit record for a submission so that the next
-// request is treated as a first attempt. Called when a validation is rejected
-// for a reason other than rate-limiting (e.g. container not ready) so the
-// submission slot is not unnecessarily consumed.
 func (l *validationRateLimiter) revoke(submissionID string) {
 	l.lastAllowed.Delete(submissionID)
+}
+
+// ── SSE leaderboard stream (Stage 5.7) ───────────────────────────────────────
+
+// leaderboardStreamHandler serves GET /api/v1/leaderboard/stream.
+// It holds the submission service (for the initial snapshot on connect) and
+// the bus (for subsequent push events).
+type leaderboardStreamHandler struct {
+	svc *submission.Service
+	bus *LeaderboardBus
+}
+
+// stream is the SSE handler for GET /api/v1/leaderboard/stream.
+//
+// Protocol:
+//  1. Set SSE response headers (text/event-stream, no-cache, keep-alive).
+//  2. Subscribe to the bus before reading the current leaderboard snapshot so
+//     no events can be missed in the window between snapshot and subscription.
+//  3. Write the current leaderboard immediately as an "update" event so the
+//     client has a complete picture without waiting for the next score change.
+//  4. Forward bus events to the client as they arrive.
+//  5. On a "frozen" event: write it, then close the connection — the contest
+//     is over and the client should switch to the archived leaderboard.
+//  6. On client disconnect (ctx.Done): unsubscribe and return.
+//
+// The existing GET /api/v1/leaderboard poll endpoint is not modified; it
+// remains the backward-compatible polling path.
+func (lsh *leaderboardStreamHandler) stream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "SSE_UNSUPPORTED",
+			"streaming is not supported by this server")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Subscribe before reading the initial snapshot so we cannot miss an event
+	// that fires between the snapshot read and the subscription.
+	subID, ch := lsh.bus.subscribe()
+	defer lsh.bus.unsubscribe(subID)
+
+	slog.Info("api: SSE subscriber connected",
+		"subscriber_id", subID, "remote_addr", r.RemoteAddr)
+
+	// Send current leaderboard immediately on connect.
+	if subs, err := lsh.svc.List(); err == nil {
+		entries := buildDedupedLeaderboard(subs)
+		ptrs := make([]*models.LeaderboardEntry, len(entries))
+		for i := range entries {
+			e := entries[i]
+			ptrs[i] = &e
+		}
+		writeSSEEvent(w, LeaderboardEvent{Type: "update", Entries: ptrs})
+		flusher.Flush()
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			slog.Info("api: SSE subscriber disconnected", "subscriber_id", subID)
+			return
+
+		case event, ok := <-ch:
+			if !ok {
+				// Channel was closed externally (e.g. server shutdown).
+				return
+			}
+			writeSSEEvent(w, event)
+			flusher.Flush()
+
+			if event.Type == "frozen" {
+				// Contest is over. Close the connection cleanly so clients
+				// know to stop reconnecting and switch to the snapshot endpoint.
+				slog.Info("api: SSE stream frozen, closing connection",
+					"subscriber_id", subID)
+				return
+			}
+		}
+	}
+}
+
+// writeSSEEvent serializes event to the SSE wire format: "data: <json>\n\n".
+// The double newline is required by the SSE spec to delimit events.
+func writeSSEEvent(w http.ResponseWriter, event LeaderboardEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		slog.Error("api: SSE marshal error", "err", err)
+		return
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		// Broken pipe or similar — the context will cancel on next iteration.
+		slog.Debug("api: SSE write error (client likely disconnected)", "err", err)
+	}
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -278,20 +306,16 @@ func (l *validationRateLimiter) revoke(submissionID string) {
 // NewRouter wires up all routes and returns the root http.Handler.
 //
 // Parameters:
-//   - svc           — submission service (required)
-//   - cfg           — loaded config (required)
-//   - reg           — Prometheus registry (required)
-//   - orchHandler   — orchestrator HTTP handler; nil = local mode, routes not mounted
-//   - contestSvc    — contest service; nil = admin + team-history routes not mounted
-//     (Phase 1–4 backward compat: passing nil keeps old behavior exactly)
-//   - validatorFactory — factory for dry-run validators; nil = validate endpoint not
-//     mounted. This avoids the api package importing internal/validator or
-//     internal/botfleet.
+//   - svc              — submission service (required)
+//   - cfg              — loaded config (required)
+//   - reg              — Prometheus registry (required)
+//   - orchHandler      — orchestrator handler; nil = local mode, routes not mounted
+//   - contestSvc       — contest service; nil = admin + team-history routes not mounted
+//   - validatorFactory — dry-run factory; nil = /validate not mounted
+//   - bus              — leaderboard bus; nil = /leaderboard/stream not mounted
 //
-// Backward compatibility guarantee: all Phase 1–4 routes (/health, /metrics,
-// /api/v1/submissions/*, /api/v1/leaderboard, /api/v1/images,
-// /internal/workers/*) remain mounted and respond identically regardless of
-// whether contestSvc, orchHandler, or validatorFactory are nil.
+// Backward compatibility: all Phase 1–4 routes remain mounted and respond
+// identically regardless of which optional parameters are nil.
 func NewRouter(
 	svc *submission.Service,
 	cfg *config.Config,
@@ -299,6 +323,7 @@ func NewRouter(
 	orchHandler *orchestrator.Handler,
 	contestSvc *contest.ContestService,
 	validatorFactory ValidatorFactory,
+	bus *LeaderboardBus,
 ) http.Handler {
 	h := &handler{svc: svc, cfg: cfg, reg: reg}
 
@@ -307,8 +332,6 @@ func NewRouter(
 	r.Use(corsMiddleware)
 	r.Use(h.prometheusMiddleware)
 
-	// /metrics — served directly by the Prometheus handler.
-	// No auth, no JSON wrapper, not logged (would pollute access logs).
 	r.Handle("/metrics", reg.Handler()).Methods(http.MethodGet)
 	r.HandleFunc("/health", h.health).Methods(http.MethodGet)
 
@@ -324,14 +347,6 @@ func NewRouter(
 	v1.HandleFunc("/submissions/{id}/stop", h.stopSubmission).Methods(http.MethodPost)
 
 	// ── Dry-run Validator (Phase 5, Stage 5.6) ────────────────────────────────
-	// Only mounted when validatorFactory is non-nil. The factory is injected
-	// from cmd/server/main.go so this package has no import on botfleet or
-	// validator.
-	//
-	// POST /api/v1/submissions/{id}/validate
-	//   → runs the fixed 20-order smoke test against the live sandbox
-	//   → returns ValidationResult (per-scenario pass/fail, no score impact)
-	//   → rate-limited: one call per submission per 2 minutes
 	if validatorFactory != nil {
 		sandboxHost := cfg.SandboxHost
 		if sandboxHost == "" {
@@ -341,25 +356,28 @@ func NewRouter(
 		v1.HandleFunc("/submissions/{id}/validate", vh.validate).Methods(http.MethodPost)
 	}
 
-	// ── Leaderboard (Phase 1, extended in Phase 5 with deduplication) ─────────
-	// GET /api/v1/leaderboard returns one row per team (best score wins).
-	// Phase 1–4 behavior is fully preserved: the response shape is identical;
-	// deduplication is an additive filter that only matters when a team has
-	// multiple completed submissions.
+	// ── Leaderboard poll (Phase 1) + SSE stream (Phase 5, Stage 5.7) ──────────
+	// The poll endpoint is always mounted — it is the Phase 1–4 interface and
+	// must never be removed. The SSE stream is additive: only mounted when a
+	// bus is wired in. Both routes co-exist without interference.
 	v1.HandleFunc("/leaderboard", h.leaderboard).Methods(http.MethodGet)
 
+	if bus != nil {
+		lsh := &leaderboardStreamHandler{svc: svc, bus: bus}
+		// NOTE: gorilla/mux matches routes in registration order. Register the
+		// more-specific /leaderboard/stream BEFORE /leaderboard so mux does
+		// not greedily match the stream path against the poll route.
+		// In practice gorilla/mux uses exact matching, but this ordering makes
+		// the intent explicit and avoids any future ambiguity.
+		v1.HandleFunc("/leaderboard/stream", lsh.stream).Methods(http.MethodGet)
+	}
+
 	// ── Team history (Phase 5, AD-2) ──────────────────────────────────────────
-	// Only mounted when contestSvc is non-nil. No auth required — this is a
-	// public read endpoint for contestants to see their own submission history.
-	// We gate on contestSvc (not AdminAPIKey) because the route is meaningful
-	// only when contest-scoped submissions exist.
 	if contestSvc != nil {
 		v1.HandleFunc("/teams/{name}/submissions", h.teamHistory).Methods(http.MethodGet)
 	}
 
 	// ── Admin routes (Phase 5) ────────────────────────────────────────────────
-	// Only mounted when both contestSvc is non-nil AND AdminAPIKey is set.
-	// All routes are protected by adminAuthMiddleware (Bearer token).
 	if contestSvc != nil && cfg.AdminAPIKey != "" {
 		ch := &contestHandler{svc: contestSvc}
 		admin := v1.PathPrefix("/admin").Subrouter()
@@ -373,8 +391,6 @@ func NewRouter(
 	}
 
 	// ── Orchestrator (Phase 3+ distributed mode only) ─────────────────────────
-	// Worker registration and heartbeat routes. Only mounted when orchHandler
-	// is non-nil (DISTRIBUTED_MODE=true).
 	if orchHandler != nil {
 		internal := r.PathPrefix("/internal").Subrouter()
 		internal.HandleFunc("/workers/register", orchHandler.HTTPRegister).Methods(http.MethodPost)
@@ -402,14 +418,6 @@ func (h *handler) listImages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// createSubmission handles POST /api/v1/submissions.
-//
-// Multipart form fields:
-//
-//	team_name  string
-//	language   string   (go | rust | cpp | python | binary)
-//	protocol   string   (rest | websocket | fix)
-//	archive    file     (.tar.gz or .zip)
 func (h *handler) createSubmission(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes)
 	//nolint:gosec // bounded by MaxBytesReader above
@@ -478,28 +486,13 @@ func (h *handler) stopSubmission(w http.ResponseWriter, r *http.Request) {
 
 // ── Leaderboard (Phase 1 + Phase 5 deduplication, AD-1) ──────────────────────
 
-// leaderboard handles GET /api/v1/leaderboard.
-//
-// Phase 5 change (AD-1): only the highest-scoring submission per team is
-// shown. This prevents active teams from flooding the top-N spots with
-// minor variants of the same engine.
-//
-// Backward compatibility: the response envelope shape is unchanged
-// ({"count": N, "entries": [...]}). Each entry has identical fields to
-// before. The only observable difference is that teams with multiple
-// completed submissions now appear exactly once.
-//
-// Score source:
-//   - Phase 5 submissions (FinalScore > 0): FinalScore used as the ranking key.
-//   - Phase 1–4 submissions (FinalScore == 0, Results != nil):
-//     Results.CompositeScore used — identical to the old leaderboard logic.
+// leaderboard handles GET /api/v1/leaderboard (poll endpoint).
 func (h *handler) leaderboard(w http.ResponseWriter, r *http.Request) {
 	subs, err := h.svc.List()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "LEADERBOARD_ERROR", err.Error())
 		return
 	}
-
 	entries := buildDedupedLeaderboard(subs)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":   len(entries),
@@ -510,23 +503,16 @@ func (h *handler) leaderboard(w http.ResponseWriter, r *http.Request) {
 // buildDedupedLeaderboard converts a raw submission list into a ranked
 // leaderboard where each team appears at most once (best score wins).
 //
-// It is extracted as a pure function so it can be unit-tested without an HTTP
-// server and reused by the auto-close goroutine in cmd/server/main.go.
-//
-// Algorithm:
-//  1. Iterate submissions; skip non-completed and those with no score.
-//  2. For each team, keep only the submission with the higher effective score.
-//  3. Sort the winners descending by score.
-//  4. Assign 1-based ranks.
-//
-// The function allocates its own output slice; it does not mutate the input.
+// Extracted as a pure function so it can be unit-tested and reused by:
+//   - The poll handler (above)
+//   - The SSE stream handler (sends initial snapshot on connect)
+//   - The auto-close goroutine in cmd/server/main.go
 func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntry {
 	type candidate struct {
 		entry models.LeaderboardEntry
-		score float64 // effective score for ranking (FinalScore or CompositeScore)
+		score float64
 	}
 
-	// bestByTeam maps TeamName → the highest-scoring completed submission.
 	bestByTeam := make(map[string]candidate, len(subs))
 
 	for _, sub := range subs {
@@ -534,14 +520,12 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 			continue
 		}
 
-		// Determine the effective score. Phase 5 submissions use FinalScore;
-		// Phase 1–4 submissions use Results.CompositeScore.
 		effectiveScore := sub.FinalScore
 		if effectiveScore == 0 && sub.Results != nil {
 			effectiveScore = sub.Results.CompositeScore
 		}
 		if effectiveScore == 0 {
-			continue // no score yet (results not written)
+			continue
 		}
 
 		entry := buildLeaderboardEntry(sub, effectiveScore)
@@ -552,7 +536,6 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 		}
 	}
 
-	// Collect and sort descending by effective score.
 	ranked := make([]models.LeaderboardEntry, 0, len(bestByTeam))
 	for _, c := range bestByTeam {
 		ranked = append(ranked, c.entry)
@@ -560,23 +543,14 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 	sort.Slice(ranked, func(i, j int) bool {
 		return ranked[i].CompositeScore > ranked[j].CompositeScore
 	})
-
-	// Assign 1-based ranks after sorting.
 	for i := range ranked {
 		ranked[i].Rank = i + 1
 	}
 	return ranked
 }
 
-// buildLeaderboardEntry constructs a LeaderboardEntry from a completed
-// submission. effectiveScore is the value already computed by the caller
-// (either FinalScore or CompositeScore) and is placed into CompositeScore
-// for the Phase 1–4 backward-compatible field.
-//
-// Phase 5 fields (LowScore, MediumScore, HighScore, FinalScore, BestP99Ms,
-// PeakSustainedTPS, AvgCorrectness) are populated from AllResults when present.
-// For Phase 1–4 submissions these fields remain at their zero values and are
-// omitted from JSON output via omitempty.
+// buildLeaderboardEntry constructs a LeaderboardEntry from a completed submission.
+// effectiveScore is the ranking key (FinalScore for Phase 5, CompositeScore for P1–4).
 func buildLeaderboardEntry(sub *models.Submission, effectiveScore float64) models.LeaderboardEntry {
 	entry := models.LeaderboardEntry{
 		SubmissionID:   sub.ID,
@@ -584,19 +558,17 @@ func buildLeaderboardEntry(sub *models.Submission, effectiveScore float64) model
 		Language:       sub.Language,
 		Protocol:       sub.Protocol,
 		Status:         sub.Status,
-		CompositeScore: effectiveScore, // backward-compat field; equals FinalScore for P5
+		CompositeScore: effectiveScore,
 		FinalScore:     sub.FinalScore,
 		CompletedAt:    sub.CompletedAt,
 	}
 
-	// Populate Phase 1–4 diagnostic columns from the legacy Results field.
 	if sub.Results != nil {
 		entry.P99LatencyMs = sub.Results.P99LatencyMs
 		entry.MaxTPS = sub.Results.MaxTPS
 		entry.CorrectnessScore = sub.Results.CorrectnessScore
 	}
 
-	// Populate Phase 5 per-profile scores and aggregate diagnostics.
 	if len(sub.AllResults) > 0 {
 		var sumCorrectness float64
 		var countCorrectness int
@@ -630,25 +602,6 @@ func buildLeaderboardEntry(sub *models.Submission, effectiveScore float64) model
 
 // ── Team history (Phase 5, AD-2) ──────────────────────────────────────────────
 
-// teamHistory handles GET /api/v1/teams/{name}/submissions.
-//
-// Returns all submissions from the named team, sorted newest-first.
-// No authentication required — this is a public read endpoint. Teams can
-// see their own history; the frontend "Team Profile" page uses this to render
-// a table of all historical runs (Go engine vs. Rust engine, etc.).
-//
-// Response:
-//
-//	{
-//	  "team_name":   "alpha",
-//	  "count":       3,
-//	  "submissions": [ ...full Submission objects, newest first... ]
-//	}
-//
-// Returns an empty submissions array (not null) when the team has no
-// submissions. Returns 200 in all cases — a team name that does not exist
-// simply returns count=0. This avoids leaking information about which
-// team names are registered.
 func (h *handler) teamHistory(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	if name == "" {
@@ -662,8 +615,6 @@ func (h *handler) teamHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter to this team's submissions. List() already returns newest-first
-	// (sorted by CreatedAt descending in DiskStore.List), so no re-sort needed.
 	team := make([]*models.Submission, 0)
 	for _, s := range all {
 		if s.TeamName == name {
@@ -707,8 +658,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// prometheusMiddleware records HTTP request counts and durations.
-// Uses a normalised path to keep Prometheus label cardinality bounded.
 func (h *handler) prometheusMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
@@ -727,8 +676,6 @@ func (h *handler) prometheusMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// normalisePath replaces UUIDs and numeric IDs with {id} placeholders.
-// e.g. /api/v1/submissions/abc-123 → /api/v1/submissions/{id}
 func normalisePath(path string) string {
 	parts := strings.Split(path, "/")
 	for i, p := range parts {
@@ -758,6 +705,12 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func (rw *responseWriter) Flush() {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // ── JSON helpers ──────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -773,12 +726,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 
 // classifyError maps domain errors to HTTP status codes and API error codes.
-//
-// Design rule: always use errors.Is for sentinel errors. Never string-match
-// a sentinel — the message may change. String matching is reserved for
-// Phase 1–4 submission errors that pre-date the sentinel pattern.
 func classifyError(err error) (int, models.APIError) {
-	// Phase 5 contest-lifecycle sentinels.
 	switch {
 	case errors.Is(err, models.ErrSubmissionInProgress):
 		return http.StatusConflict,
@@ -800,7 +748,6 @@ func classifyError(err error) (int, models.APIError) {
 			models.APIError{Code: "NOT_FOUND", Message: err.Error()}
 	}
 
-	// Phase 1–4 submission validation errors (string-matched for compat).
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "required"),
@@ -817,11 +764,8 @@ func classifyError(err error) (int, models.APIError) {
 
 // ── Admin auth middleware ──────────────────────────────────────────────────────
 
-// adminAuthMiddleware enforces Authorization: Bearer <apiKey> on all routes
-// in the /api/v1/admin subrouter.
-//
-// Returns 401 when the header is absent or the token is wrong.
-// 403 is reserved for future role-based access control (e.g. read-only admin).
+// adminAuthMiddleware enforces Authorization: Bearer <apiKey>.
+// Returns 401 when the header is absent or the key is wrong.
 func adminAuthMiddleware(apiKey string) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -844,7 +788,6 @@ func adminAuthMiddleware(apiKey string) mux.MiddlewareFunc {
 
 // ── contestHandler methods ────────────────────────────────────────────────────
 
-// createContest handles POST /api/v1/admin/contests.
 func (h *contestHandler) createContest(w http.ResponseWriter, r *http.Request) {
 	var req contest.CreateContestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -861,8 +804,6 @@ func (h *contestHandler) createContest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, c)
 }
 
-// listContests handles GET /api/v1/admin/contests.
-// Returns all contests (draft, active, and closed).
 func (h *contestHandler) listContests(w http.ResponseWriter, r *http.Request) {
 	all, err := h.svc.ListAll(r.Context())
 	if err != nil {
@@ -875,7 +816,6 @@ func (h *contestHandler) listContests(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// activateContest handles POST /api/v1/admin/contests/{id}/activate.
 func (h *contestHandler) activateContest(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	c, err := h.svc.Activate(r.Context(), id)
@@ -887,11 +827,9 @@ func (h *contestHandler) activateContest(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, c)
 }
 
-// closeContest handles POST /api/v1/admin/contests/{id}/close.
-//
-// Entries are nil here — the handler has no access to the submission store.
-// The drain-and-wait goroutine (AD-3) is the primary closing path and passes
-// real entries. This endpoint is the manual override (force-close by admin).
+// closeContest is the manual admin override. The drain-and-wait goroutine is
+// the primary closing path and passes real leaderboard entries. This handler
+// passes nil entries — the service handles the nil case gracefully.
 func (h *contestHandler) closeContest(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	if err := h.svc.Close(r.Context(), id, nil); err != nil {
@@ -902,7 +840,6 @@ func (h *contestHandler) closeContest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed", "id": id})
 }
 
-// getContestLeaderboard handles GET /api/v1/admin/contests/{id}/leaderboard.
 func (h *contestHandler) getContestLeaderboard(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	entries, err := h.svc.GetLeaderboardSnapshot(r.Context(), id)

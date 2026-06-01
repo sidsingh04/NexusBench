@@ -48,7 +48,7 @@ func newTestRouter(t *testing.T) http.Handler {
 	contestStore := contest.NewMemoryContestStore()
 	contestSvc := contest.NewContestService(contestStore, nil)
 
-	return api.NewRouter(svc, cfg, reg, nil, contestSvc, nil)
+	return api.NewRouter(svc, cfg, reg, nil, contestSvc, nil, nil)
 }
 
 // newTestRouterNoAdminKey builds a router with no admin key → routes not mounted.
@@ -64,7 +64,7 @@ func newTestRouterNoAdminKey(t *testing.T) http.Handler {
 	reg := metrics.New()
 	contestStore := contest.NewMemoryContestStore()
 	contestSvc := contest.NewContestService(contestStore, nil)
-	return api.NewRouter(svc, cfg, reg, nil, contestSvc, nil)
+	return api.NewRouter(svc, cfg, reg, nil, contestSvc, nil, nil)
 }
 
 func adminDo(t *testing.T, router http.Handler, method, path, key string, body any) *httptest.ResponseRecorder {
@@ -345,7 +345,7 @@ func TestGetContestLeaderboard_ReturnsSnapshot(t *testing.T) {
 	}
 	store := submission.NewDiskStore(cfg.SubmissionDir)
 	svc := submission.NewService(store, nil, cfg)
-	router := api.NewRouter(svc, cfg, metrics.New(), nil, contestSvc, nil)
+	router := api.NewRouter(svc, cfg, metrics.New(), nil, contestSvc, nil, nil)
 
 	rr := adminDo(t, router, http.MethodGet,
 		"/api/v1/admin/contests/"+c.ID+"/leaderboard", testAdminKey, nil)

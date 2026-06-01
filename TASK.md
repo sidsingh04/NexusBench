@@ -52,7 +52,7 @@ Stage 5.3  One-active-submission guard         ✅ COMPLETE
 Stage 5.4  Volatility-aware scoring            ✅ COMPLETE
 Stage 5.5  Sequential three-job dispatch       ✅ COMPLETE
 Stage 5.6  Dry-run Validator                   ✅ COMPLETE
-Stage 5.7  SSE live leaderboard                (new internal/validator package)
+Stage 5.7  SSE live leaderboard                ✅ COMPLETE
 Stage 5.8  WebSocket BotTransport              (leaderboardBus + stream endpoint)
 Stage 5.9  PostgreSQL ContestStore             (new transport, BotTransport.Close)
 Stage 5.10 Integration smoke test              (replace MemoryContestStore in prod)
