@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexusbench/nexusbench/internal/api"
+	"github.com/nexusbench/nexusbench/internal/botfleet"
 	"github.com/nexusbench/nexusbench/internal/config"
 	"github.com/nexusbench/nexusbench/internal/contest"
 	"github.com/nexusbench/nexusbench/internal/metrics"
@@ -20,6 +21,7 @@ import (
 	"github.com/nexusbench/nexusbench/internal/queue"
 	"github.com/nexusbench/nexusbench/internal/sandbox"
 	"github.com/nexusbench/nexusbench/internal/submission"
+	"github.com/nexusbench/nexusbench/internal/validator"
 )
 
 // queueDepthScrapeInterval is how often the control plane polls Redpanda for
@@ -150,7 +152,12 @@ func main() {
 	defer autoCloseCancel()
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
-	router := api.NewRouter(submissionSvc, cfg, reg, orchHandler, contestSvc)
+	factory := func(targetURL string) api.ValidatorRunner {
+		transport := botfleet.NewRESTTransport(targetURL, &http.Client{Timeout: 5 * time.Second})
+		v := validator.New(transport)
+		return validatorAdapter{v}
+	}
+	router := api.NewRouter(submissionSvc, cfg, reg, orchHandler, contestSvc, factory)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
@@ -429,4 +436,35 @@ func pollAndSet(ctx context.Context, q queue.Queue, reg *metrics.Registry) {
 	}
 	reg.SetQueueDepth(depth)
 	slog.Debug("server: queue depth updated", "depth", depth)
+}
+
+// ── Validator Adapter (Stage 5.6) ─────────────────────────────────────────────
+
+// validatorAdapter wraps *validator.Validator to satisfy api.ValidatorRunner
+// without exposing the internal/validator package to the api package.
+type validatorAdapter struct {
+	v *validator.Validator
+}
+
+func (a validatorAdapter) Run(ctx context.Context, submissionID string) (*api.ValidatorResult, error) {
+	res, err := a.v.Run(ctx, submissionID)
+	if err != nil {
+		return nil, err
+	}
+
+	apiScenarios := make([]api.ScenarioResult, len(res.Scenarios))
+	for i, s := range res.Scenarios {
+		apiScenarios[i] = api.ScenarioResult{
+			Name:   s.Name,
+			Passed: s.Passed,
+			Reason: s.Reason,
+		}
+	}
+
+	return &api.ValidatorResult{
+		SubmissionID: res.SubmissionID,
+		Scenarios:    apiScenarios,
+		AllPassed:    res.AllPassed,
+		TestedAt:     res.TestedAt,
+	}, nil
 }

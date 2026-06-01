@@ -45,7 +45,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
-| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 ✅, Stage 5.5 ✅, Stage 5.6 🔄) |
+| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 ✅, Stage 5.5 ✅, Stage 5.6 ✅, Stage 5.7 🔄) |
 | Phase 6 | Frontend | 🔲 Planned |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
@@ -204,6 +204,12 @@ without breaking any existing functionality.
 The platform evolves from "run one benchmark and show a score" to "run a timed
 competitive contest with three volatility environments, a live leaderboard, and
 a safe pre-submission validation path."
+
+### ⚠️ Important Note for Future Phases: Strict Contest Mode
+
+Starting from Stage 5.5, `ADMIN_API_KEY: "testkey"` has been permanently injected into the local `docker-compose.yml` for the `control-plane` service. 
+- **What this means:** The local development stack now strictly enforces **Phase 5 Contest Mode**. Submissions to `/api/v1/submissions` will be rejected (`ErrContestNotActive`) unless an active contest is first created via the admin endpoints.
+- **Why this matters:** Future phases (e.g., Phase 5.6 Dry-run Validator, Phase 6 Frontend) must be aware that legacy scripts bypassing contests will no longer work locally. This is the intended architecture, but requires developers to simulate active contests when generating test traffic or developing the contestant UI.
 
 ---
 

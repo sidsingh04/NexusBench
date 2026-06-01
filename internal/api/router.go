@@ -4,12 +4,16 @@
 // Dependency rules (enforced by go build):
 //   - api may import models, config, metrics, submission, contest, orchestrator.
 //   - api must NOT import worker, sandbox, botfleet, or correctness.
+//   - api must NOT import validator directly — it depends on the ValidatorRunner
+//     interface so the validator package can be tested independently of the HTTP
+//     layer. The concrete *validator.Validator is wired in cmd/server/main.go.
 //   - No business logic lives here: handlers translate HTTP ↔ domain calls only.
 //     All invariants, status transitions, and scoring live in their respective
 //     service packages.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -44,28 +49,256 @@ type contestHandler struct {
 	svc *contest.ContestService
 }
 
+// ── Dry-run Validator (Stage 5.6) ─────────────────────────────────────────────
+
+// ValidatorResult mirrors validator.ValidationResult so that the api package
+// does not need to import internal/validator.
+// The concrete validator.Validator satisfies ValidatorRunner below.
+type ValidatorResult struct {
+	SubmissionID string           `json:"submission_id"`
+	Scenarios    []ScenarioResult `json:"scenarios"`
+	AllPassed    bool             `json:"all_passed"`
+	TestedAt     time.Time        `json:"tested_at"`
+}
+
+// ScenarioResult mirrors validator.ScenarioResult.
+type ScenarioResult struct {
+	Name   string `json:"name"`
+	Passed bool   `json:"passed"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// ValidatorRunner is the narrow interface the validate endpoint depends on.
+// It is satisfied by *validator.Validator (wired externally) and by test
+// doubles in router_test.go.
+//
+// Defined here — not in internal/validator — so the api package has no
+// import on the validator package. This keeps the dependency arrow pointing
+// inward: api defines the contract; validator satisfies it.
+//
+// The ctx argument must be respected for graceful cancellation during request
+// termination.
+type ValidatorRunner interface {
+	// Run executes the fixed smoke-test sequence against the engine reachable
+	// via the transport the runner was constructed with, and returns
+	// per-scenario pass/fail results.
+	//
+	// submissionID is embedded in the result for traceability. It must not
+	// be empty.
+	//
+	// Implementations must be safe for concurrent use.
+	Run(ctx context.Context, submissionID string) (*ValidatorResult, error)
+}
+
+// ValidatorFactory creates a ValidatorRunner that targets the given URL.
+// It is called once per validate request, constructing a fresh runner
+// pointed at the submission's live sandbox port.
+//
+// The factory abstraction keeps the api package free of all botfleet and
+// validator imports while allowing cmd/server/main.go to wire the real
+// validator.New + botfleet.NewRESTTransport implementation.
+type ValidatorFactory func(targetURL string) ValidatorRunner
+
+// validationHandler handles POST /api/v1/submissions/{id}/validate.
+// It holds the factory and the per-submission rate limiter.
+type validationHandler struct {
+	svc         *submission.Service
+	sandboxHost string // hostname to reach sandbox containers (e.g. "localhost")
+	factory     ValidatorFactory
+	limiter     *validationRateLimiter
+}
+
+// newValidationHandler constructs a validationHandler.
+// sandboxHost is the host the control plane uses to reach sandbox containers;
+// in distributed mode this is "host.docker.internal" or the worker node IP.
+func newValidationHandler(svc *submission.Service, sandboxHost string, factory ValidatorFactory) *validationHandler {
+	return &validationHandler{
+		svc:         svc,
+		sandboxHost: sandboxHost,
+		factory:     factory,
+		limiter:     newValidationRateLimiter(2 * time.Minute),
+	}
+}
+
+// validate handles POST /api/v1/submissions/{id}/validate.
+//
+// Pre-conditions checked (in order):
+//  1. Submission exists          → 404 NOT_FOUND
+//  2. Not currently benchmarking → 409 VALIDATION_CONFLICT
+//  3. Rate limit (1 per 2 min)   → 429 TOO_MANY_REQUESTS
+//  4. Container port is known    → 409 CONTAINER_NOT_READY
+//
+// When all checks pass, a fresh ValidatorRunner is constructed pointing at
+// http://<sandboxHost>:<ExposedPort> and Run is called. The result is
+// returned as JSON with status 200.
+//
+// The validate call has no side effects on the submission: status, results,
+// leaderboard, and metrics are all unchanged.
+func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+
+	// 1. Submission must exist.
+	sub, err := vh.svc.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND",
+			fmt.Sprintf("submission %s not found", id))
+		return
+	}
+
+	// 2. Cannot validate while the benchmark fleet is actively running —
+	//    concurrent traffic would corrupt both the benchmark and the validation.
+	if sub.Status == models.StatusBenchmarking {
+		writeError(w, http.StatusConflict, "VALIDATION_CONFLICT",
+			"submission is currently being benchmarked; please wait until it completes")
+		return
+	}
+
+	// 3. Rate limit: one validation per submission per 2 minutes.
+	//    Prevents abuse (re-validating every second to probe the scoreboard).
+	if !vh.limiter.allow(id) {
+		retryAfter := vh.limiter.retryAfter(id)
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "TOO_MANY_REQUESTS",
+			fmt.Sprintf("validation rate limit: one request per 2 minutes per submission; retry after %.0f seconds",
+				retryAfter.Seconds()))
+		return
+	}
+
+	// 4. Container must be running and have an exposed port.
+	//    ExposedPort > 0 means the sandbox is live and accepting connections.
+	if sub.ExposedPort <= 0 {
+		vh.limiter.revoke(id) // don't burn the slot — the container isn't up yet
+		writeError(w, http.StatusConflict, "CONTAINER_NOT_READY",
+			"sandbox container is not yet running; submit the engine first and wait for status=running")
+		return
+	}
+
+	// Construct a fresh runner pointing at the live sandbox container.
+	targetURL := fmt.Sprintf("http://%s:%d", vh.sandboxHost, sub.ExposedPort)
+	runner := vh.factory(targetURL)
+
+	slog.Info("api: dry-run validation started",
+		"submission_id", id,
+		"target_url", targetURL,
+		"team", sub.TeamName,
+	)
+
+	result, runErr := runner.Run(r.Context(), id)
+	if runErr != nil {
+		// Context cancellation (client disconnected) is not a server error.
+		if r.Context().Err() != nil {
+			writeError(w, http.StatusRequestTimeout, "VALIDATION_CANCELED",
+				"validation canceled by client")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "VALIDATION_ERROR",
+			fmt.Sprintf("validation run failed: %v", runErr))
+		return
+	}
+
+	slog.Info("api: dry-run validation complete",
+		"submission_id", id,
+		"all_passed", result.AllPassed,
+	)
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ── Validation rate limiter ────────────────────────────────────────────────────
+
+// validationRateLimiter tracks the last validation time per submission ID.
+// It uses sync.Map for lock-free reads in the common (not-rate-limited) case.
+//
+// The limiter is intentionally simple: one request per submission per window.
+// A sliding-window or token-bucket implementation is unnecessary at this scale.
+type validationRateLimiter struct {
+	// lastAllowed maps submissionID → time.Time of the last allowed request.
+	lastAllowed sync.Map
+	window      time.Duration
+}
+
+// newValidationRateLimiter creates a rate limiter with the given window.
+func newValidationRateLimiter(window time.Duration) *validationRateLimiter {
+	return &validationRateLimiter{window: window}
+}
+
+// allow returns true if the submission may be validated now, and records the
+// current time as the last-allowed time. Returns false if a request was
+// allowed within the window.
+func (l *validationRateLimiter) allow(submissionID string) bool {
+	now := time.Now()
+	last, loaded := l.lastAllowed.LoadOrStore(submissionID, now)
+	if !loaded {
+		// First request for this submission — always allowed.
+		return true
+	}
+	lastTime, ok := last.(time.Time)
+	if !ok {
+		// Malformed entry — allow and reset.
+		l.lastAllowed.Store(submissionID, now)
+		return true
+	}
+	if now.Sub(lastTime) >= l.window {
+		// Window has elapsed — allow and update.
+		l.lastAllowed.Store(submissionID, now)
+		return true
+	}
+	// Within the window — deny.
+	return false
+}
+
+// retryAfter returns how long the caller must wait before the next request
+// is allowed. Returns 0 when no rate-limit record exists.
+func (l *validationRateLimiter) retryAfter(submissionID string) time.Duration {
+	v, ok := l.lastAllowed.Load(submissionID)
+	if !ok {
+		return 0
+	}
+	last, ok := v.(time.Time)
+	if !ok {
+		return 0
+	}
+	remaining := l.window - time.Since(last)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// revoke removes the rate-limit record for a submission so that the next
+// request is treated as a first attempt. Called when a validation is rejected
+// for a reason other than rate-limiting (e.g. container not ready) so the
+// submission slot is not unnecessarily consumed.
+func (l *validationRateLimiter) revoke(submissionID string) {
+	l.lastAllowed.Delete(submissionID)
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 // NewRouter wires up all routes and returns the root http.Handler.
 //
 // Parameters:
-//   - svc         — submission service (required)
-//   - cfg         — loaded config (required)
-//   - reg         — Prometheus registry (required)
-//   - orchHandler — orchestrator HTTP handler; nil = local mode, routes not mounted
-//   - contestSvc  — contest service; nil = admin + team-history routes not mounted
+//   - svc           — submission service (required)
+//   - cfg           — loaded config (required)
+//   - reg           — Prometheus registry (required)
+//   - orchHandler   — orchestrator HTTP handler; nil = local mode, routes not mounted
+//   - contestSvc    — contest service; nil = admin + team-history routes not mounted
 //     (Phase 1–4 backward compat: passing nil keeps old behavior exactly)
+//   - validatorFactory — factory for dry-run validators; nil = validate endpoint not
+//     mounted. This avoids the api package importing internal/validator or
+//     internal/botfleet.
 //
 // Backward compatibility guarantee: all Phase 1–4 routes (/health, /metrics,
 // /api/v1/submissions/*, /api/v1/leaderboard, /api/v1/images,
 // /internal/workers/*) remain mounted and respond identically regardless of
-// whether contestSvc or orchHandler are nil.
+// whether contestSvc, orchHandler, or validatorFactory are nil.
 func NewRouter(
 	svc *submission.Service,
 	cfg *config.Config,
 	reg *metrics.Registry,
 	orchHandler *orchestrator.Handler,
 	contestSvc *contest.ContestService,
+	validatorFactory ValidatorFactory,
 ) http.Handler {
 	h := &handler{svc: svc, cfg: cfg, reg: reg}
 
@@ -89,6 +322,24 @@ func NewRouter(
 	v1.HandleFunc("/submissions", h.createSubmission).Methods(http.MethodPost)
 	v1.HandleFunc("/submissions/{id}", h.getSubmission).Methods(http.MethodGet)
 	v1.HandleFunc("/submissions/{id}/stop", h.stopSubmission).Methods(http.MethodPost)
+
+	// ── Dry-run Validator (Phase 5, Stage 5.6) ────────────────────────────────
+	// Only mounted when validatorFactory is non-nil. The factory is injected
+	// from cmd/server/main.go so this package has no import on botfleet or
+	// validator.
+	//
+	// POST /api/v1/submissions/{id}/validate
+	//   → runs the fixed 20-order smoke test against the live sandbox
+	//   → returns ValidationResult (per-scenario pass/fail, no score impact)
+	//   → rate-limited: one call per submission per 2 minutes
+	if validatorFactory != nil {
+		sandboxHost := cfg.SandboxHost
+		if sandboxHost == "" {
+			sandboxHost = "localhost"
+		}
+		vh := newValidationHandler(svc, sandboxHost, validatorFactory)
+		v1.HandleFunc("/submissions/{id}/validate", vh.validate).Methods(http.MethodPost)
+	}
 
 	// ── Leaderboard (Phase 1, extended in Phase 5 with deduplication) ─────────
 	// GET /api/v1/leaderboard returns one row per team (best score wins).

@@ -51,7 +51,7 @@ Stage 5.2  ContestService + admin endpoints    ✅ COMPLETE
 Stage 5.3  One-active-submission guard         ✅ COMPLETE
 Stage 5.4  Volatility-aware scoring            ✅ COMPLETE
 Stage 5.5  Sequential three-job dispatch       ✅ COMPLETE
-Stage 5.6  Dry-run Validator                   (job chaining, no new packages)
+Stage 5.6  Dry-run Validator                   ✅ COMPLETE
 Stage 5.7  SSE live leaderboard                (new internal/validator package)
 Stage 5.8  WebSocket BotTransport              (leaderboardBus + stream endpoint)
 Stage 5.9  PostgreSQL ContestStore             (new transport, BotTransport.Close)
@@ -606,6 +606,8 @@ Each submission triggers three sequential benchmark jobs — one per volatility
 profile. "Sequential" means job[1] is only enqueued after job[0] is committed
 by a worker. The `FinalScore` is computed once all three `BenchmarkResults`
 are written for a submission.
+
+> **⚠️ Local Development Note:** Starting from Stage 5.5, `ADMIN_API_KEY: "testkey"` is hardcoded in the local `docker-compose.yml` for `control-plane`. This forces local development into "Phase 5 Strict Contest Mode." Legacy endpoints hitting `/api/v1/submissions` will return `ErrContestNotActive` unless a contest is created first via the admin API.
 
 ### Design
 
