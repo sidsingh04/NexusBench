@@ -50,3 +50,10 @@ Rules:
 - Explain reasoning before major implementation
 - Mention risks and tradeoffs
 - Keep explanations concise and technical
+
+## File Editing Rules
+- Never use full-file rewrites for small, targeted changes
+- Always use targeted edits (e.g. `replace_file_content` / `multi_replace_file_content`) to prevent accidental truncation of large files
+- Verify the exact content variable you are about to pass before performing any destructive writes
+- When appending sections, read the file first to confirm the exact anchor text, then write only the addition
+- Keep edits small, verifiable, and non-destructive to the rest of the file

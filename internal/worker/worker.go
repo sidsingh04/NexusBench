@@ -182,9 +182,15 @@ func (w *Worker) processJob(ctx context.Context, j queue.Job) {
 	)
 
 	// ── Idempotent guard ──────────────────────────────────────────────────────
-	// Read the current submission status. If it's no longer Pending, a
-	// previous worker already processed (or is processing) this job.
-	// Commit the offset and move on — do not execute again.
+	// Read the current submission status before executing.
+	//
+	// Phase 1–4: only StatusPending passes through — any other status means
+	// a previous worker already handled this job; skip and commit.
+	//
+	// Phase 5 multi-profile: after the first profile run, processJob sets the
+	// submission to StatusRunning (below). Subsequent profile jobs therefore
+	// arrive with StatusRunning — they must be allowed through, not skipped.
+	// Terminal statuses (StatusCompleted, StatusFailed) are always skipped.
 	sub, err := w.store.Get(j.SubmissionID)
 	if err != nil {
 		log.Error("worker: cannot read submission; will not commit (job will be re-delivered)", "err", err)
@@ -193,11 +199,32 @@ func (w *Worker) processJob(ctx context.Context, j queue.Job) {
 		return
 	}
 
-	if sub.Status != models.StatusPending {
-		log.Info("worker: submission is not pending; skipping (already processed)",
+	if sub.Status.IsTerminal() {
+		log.Info("worker: submission is already terminal; skipping",
 			"current_status", sub.Status,
 		)
-		// Commit so the queue offset advances and this job is never re-delivered.
+		w.commitOrLog(ctx, log)
+		return
+	}
+	// For Phase 5 non-first profile jobs, StatusRunning is expected and valid.
+	// For Phase 1–4 jobs and the first profile job, StatusPending is expected.
+	// Any other non-terminal status (StatusBuilding, StatusDeploying,
+	// StatusBenchmarking) means another worker is already executing —
+	// skip and commit to avoid double-execution.
+	if j.VolatilityLabel == "" && sub.Status != models.StatusPending {
+		log.Info("worker: Phase 1-4 job submission is not pending; skipping",
+			"current_status", sub.Status,
+		)
+		w.commitOrLog(ctx, log)
+		return
+	}
+	if j.VolatilityLabel != "" &&
+		sub.Status != models.StatusPending &&
+		sub.Status != models.StatusRunning {
+		log.Info("worker: Phase 5 job submission is in unexpected status; skipping",
+			"current_status", sub.Status,
+			"volatility_label", j.VolatilityLabel,
+		)
 		w.commitOrLog(ctx, log)
 		return
 	}
@@ -219,20 +246,50 @@ func (w *Worker) processJob(ctx context.Context, j queue.Job) {
 		return
 	}
 
-	// Success path.
+	// ── Success path ────────────────────────────────────────────────────────
+	// Re-read the submission so we see AllResults and FinalScore written by
+	// Execute (appendProfileResult / computeAndWriteFinalScore both call
+	// store.Update before returning).
+	if fresh, rErr := w.store.Get(j.SubmissionID); rErr == nil {
+		sub = fresh
+	}
+
 	now := time.Now().UTC()
-	sub.Results = results
-	sub.CompletedAt = &now
-	w.setStatus(log, sub, models.StatusCompleted, "benchmark complete")
 
-	log.Info("worker: job completed",
-		"p99_latency_ms", results.P99LatencyMs,
-		"max_tps", results.MaxTPS,
-		"correctness", results.CorrectnessScore,
-		"composite_score", results.CompositeScore,
-	)
+	if j.IsLastProfile() {
+		// Final profile (or Phase 1–4 single-run): mark submission completed.
+		//
+		// Phase 1–4 backward compat: also write results to the legacy Results
+		// field so existing leaderboard/API consumers still work without change.
+		if j.VolatilityLabel == "" {
+			sub.Results = results
+		}
+		sub.CompletedAt = &now
+		w.setStatus(log, sub, models.StatusCompleted, "benchmark complete")
 
-	// Commit only after results are durably stored.
+		log.Info("worker: submission completed",
+			"submission_id", j.SubmissionID,
+			"final_score", sub.FinalScore,
+			"p99_latency_ms", results.P99LatencyMs,
+			"correctness", results.CorrectnessScore,
+		)
+	} else {
+		// Non-final profile: more profiles remain. Execute has already
+		// appended this result to AllResults and enqueued the next profile job.
+		// Mark StatusRunning so the idempotent guard above lets the next
+		// profile job through, and the API shows meaningful in-progress state.
+		w.setStatus(log, sub, models.StatusRunning,
+			fmt.Sprintf("profile %q done, %v remaining",
+				j.VolatilityLabel, j.RemainingProfiles))
+
+		log.Info("worker: profile run committed, next profile enqueued",
+			"completed_label", j.VolatilityLabel,
+			"remaining", j.RemainingProfiles,
+			"run_score", results.RunScore,
+		)
+	}
+
+	// Commit only after results are durably written.
 	w.commitOrLog(ctx, log)
 }
 

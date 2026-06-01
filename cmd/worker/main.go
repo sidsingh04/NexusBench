@@ -147,9 +147,18 @@ func main() {
 		jobsCompleted.Add(1)
 	}
 
+	// Stage 5.5: wire the job queue into the executor so it can re-enqueue
+	// the next profile job after each Phase 5 profile run completes.
+	//
+	// WithContestStore is deferred to Stage 5.9 (PostgresContestStore).
+	// The worker process cannot share the control plane's MemoryContestStore
+	// across process boundaries. Until Stage 5.9, the executor uses default
+	// aggregate weights (0.20/0.35/0.45) for FinalScore computation and falls
+	// back to DefaultFleetConfig for profile-specific load parameters.
 	executor := worker.NewSandboxExecutor(dockerMgr, store,
 		worker.WithJobCallbacks(jobStarted, jobFinished),
-		worker.WithSandboxHost(cfg.SandboxHost))
+		worker.WithSandboxHost(cfg.SandboxHost),
+		worker.WithJobQueue(jobQueue))
 
 	// ── Worker ────────────────────────────────────────────────────────────────
 	w, err := worker.NewWorker(jobQueue, store, executor, worker.Config{

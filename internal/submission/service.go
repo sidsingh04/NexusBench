@@ -281,16 +281,34 @@ func (s *Service) Ingest(
 
 	// ── dispatch ──────────────────────────────────────────────────────────────
 	if s.jobQueue != nil {
-		// Distributed mode: hand the job to the worker fleet via the queue.
+		// Distributed mode (Phase 3+): enqueue to the worker fleet.
 		// We enqueue synchronously so any broker failure surfaces immediately
 		// to the caller as a 500 rather than silently losing the job.
-		j := queue.NewJob(sub)
+		//
+		// Phase 5 (contest active): dispatch only the first profile job.
+		// The worker re-enqueues the next profile after each run completes,
+		// keeping all three runs sequential on the same sandbox container.
+		//
+		// Phase 1–4 (no contest): dispatch a single legacy job with no label.
+		var j queue.Job
+		if contestID != "" {
+			// Phase 5: first profile is "low"; remaining are ["medium","high"].
+			j = queue.NewProfileJob(sub, contestID, "low", []string{"medium", "high"})
+		} else {
+			// Phase 1–4: single-run job, backward compatible.
+			j = queue.NewJob(sub)
+		}
 		if err := s.jobQueue.Enqueue(ctx, j); err != nil {
 			// Roll back the submission to failed so the client knows to retry.
 			s.setStatus(sub, models.StatusFailed, fmt.Sprintf("enqueue error: %v", err))
 			return nil, fmt.Errorf("enqueue job: %w", err)
 		}
-		slog.Info("submission dispatched to worker queue", "id", id, "job_id", j.ID)
+		slog.Info("submission dispatched to worker queue",
+			"id", id,
+			"job_id", j.ID,
+			"volatility_label", j.VolatilityLabel,
+			"remaining_profiles", j.RemainingProfiles,
+		)
 	} else {
 		// Local mode (Phase 1/2): deploy in this process. Unchanged behavior.
 		go s.deployAsync(context.WithoutCancel(ctx), sub)

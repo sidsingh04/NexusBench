@@ -25,10 +25,28 @@ type sandboxDeployer interface {
 	ContainerHealthy(ctx context.Context, containerID string) (bool, error)
 }
 
+// ContestQuerier is satisfied by *contest.ContestService.
+//
+// Defined here (not in internal/contest) to keep the dependency arrow
+// pointing inward: worker defines what it needs; contest satisfies it
+// structurally. This avoids a worker→contest import and keeps the interface
+// narrow — the executor only needs one method.
+//
+// Injected via WithContestStore. When nil (Phase 1–4 compatibility mode or
+// tests that don't exercise contest lookups), profile-aware fleet config and
+// FinalScore computation are skipped.
+type ContestQuerier interface {
+	// GetActive returns the currently active contest.
+	// Returns models.ErrNoActiveContest when none is active.
+	GetActive(ctx context.Context) (*models.Contest, error)
+}
+
 // SandboxExecutor implements Executor using a sandboxDeployer.
 type SandboxExecutor struct {
 	docker             sandboxDeployer
 	store              Store
+	jobQueue           queue.Queue    // nil = local mode; non-nil = distributed (Phase 3+)
+	contestQuerier     ContestQuerier // nil = Phase 1–4 compat; non-nil = Phase 5
 	emitter            telemetry.Emitter
 	healthPollInterval time.Duration
 	healthTimeout      time.Duration
@@ -52,7 +70,7 @@ func NewSandboxExecutor(docker sandboxDeployer, store Store, opts ...ExecutorOpt
 		healthTimeout:      2 * time.Minute,
 		telemetryBatchSize: 100,
 		emitter:            telemetry.NoopEmitter{},
-		sandboxHost:        "localhost", // correct for non-containerised dev; override with WithSandboxHost
+		sandboxHost:        "localhost",
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -64,11 +82,8 @@ func NewSandboxExecutor(docker sandboxDeployer, store Store, opts ...ExecutorOpt
 type ExecutorOption func(*SandboxExecutor)
 
 // WithHealthPollInterval overrides the health-check poll interval.
-// Use in tests to avoid 2-second waits between polls.
 func WithHealthPollInterval(d time.Duration) ExecutorOption {
-	return func(e *SandboxExecutor) {
-		e.healthPollInterval = d
-	}
+	return func(e *SandboxExecutor) { e.healthPollInterval = d }
 }
 
 // WithSandboxHost sets the hostname the executor uses to build the bot fleet
@@ -76,15 +91,11 @@ func WithHealthPollInterval(d time.Duration) ExecutorOption {
 //
 // When the worker runs inside a Docker container, sandbox port bindings are
 // published on the HOST's network interface — not on localhost inside the
-// worker container. The correct value depends on the runtime environment:
+// worker container. Correct values:
 //
-//	"host-gateway"   — Docker Desktop (Windows/Mac). Docker resolves this
-//	                   special name to the host's internal bridge IP.
-//	"172.17.0.1"     — Linux Docker Engine default docker0 bridge IP.
-//	"localhost"       — Non-containerised local dev (worker and daemon share
-//	                   the same network namespace). This is the default.
-//
-// Set from config.Config.SandboxHost in cmd/worker/main.go.
+//	"host-gateway"  — Docker Desktop (Windows/Mac)
+//	"172.17.0.1"    — Linux Docker Engine default bridge
+//	"localhost"      — Non-containerised local dev (default)
 func WithSandboxHost(host string) ExecutorOption {
 	return func(e *SandboxExecutor) {
 		if host != "" {
@@ -93,31 +104,23 @@ func WithSandboxHost(host string) ExecutorOption {
 	}
 }
 
-// WithEmitter wires a telemetry.Emitter into the executor so fleet results
-// are streamed to Redpanda after each benchmark run.
-// Pass telemetry.NoopEmitter{} in tests that don't care about telemetry.
+// WithEmitter wires a telemetry.Emitter into the executor.
 func WithEmitter(e telemetry.Emitter) ExecutorOption {
-	return func(ex *SandboxExecutor) {
-		ex.emitter = e
-	}
+	return func(ex *SandboxExecutor) { ex.emitter = e }
 }
 
-// WithFleetConfig overrides the bot fleet configuration used for this executor.
-// Use in tests or for custom benchmark scenarios. When not set, the executor
-// derives defaults from the config package at job execution time.
+// WithFleetConfig overrides the bot fleet configuration.
+// Use in tests or custom benchmark scenarios.
 func WithFleetConfig(cfg botfleet.FleetConfig) ExecutorOption {
-	return func(e *SandboxExecutor) {
-		e.fleetCfgOverride = &cfg
-	}
+	return func(e *SandboxExecutor) { e.fleetCfgOverride = &cfg }
 }
 
-// WithJobCallbacks wires onStart and onFinish callbacks so cmd/worker can
-// keep its heartbeater status in sync with the executor's job lifecycle.
+// WithJobCallbacks wires onStart / onFinish callbacks for heartbeater sync.
 //
 //   - onStart(submissionID) is called just before Execute begins working.
 //   - onFinish() is called when Execute returns (success or failure).
 //
-// Both callbacks must be goroutine-safe and return quickly.
+// Both must be goroutine-safe and return quickly.
 func WithJobCallbacks(onStart func(string), onFinish func()) ExecutorOption {
 	return func(e *SandboxExecutor) {
 		e.onStart = onStart
@@ -125,28 +128,55 @@ func WithJobCallbacks(onStart func(string), onFinish func()) ExecutorOption {
 	}
 }
 
-// Execute runs the benchmark lifecycle for j:
+// WithJobQueue wires a queue.Queue into the executor so it can re-enqueue
+// the next profile job after each Phase 5 profile run completes.
+//
+// Must be set in distributed mode. In local mode (nil) re-enqueue is skipped
+// and all three profile jobs are treated as sequential in-process calls by
+// the worker (which is acceptable for local-only testing).
+func WithJobQueue(q queue.Queue) ExecutorOption {
+	return func(e *SandboxExecutor) { e.jobQueue = q }
+}
+
+// WithContestStore wires a ContestQuerier into the executor so it can look
+// up the active contest's VolatilityProfile for Phase 5 jobs.
+//
+// When nil (Phase 1–4 compat, or tests that don't exercise contest code),
+// Execute falls back to DefaultFleetConfig and the legacy scoring path.
+func WithContestStore(cq ContestQuerier) ExecutorOption {
+	return func(e *SandboxExecutor) { e.contestQuerier = cq }
+}
+
+// Execute runs one benchmark profile for j:
+//
 //  1. Load submission from store.
 //  2. Deploy sandbox container.
 //  3. Persist container metadata.
 //  4. Wait for container to become healthy.
-//  5. Run the distributed bot fleet against the sandbox endpoint.
-//  6. Compute correctness score against the golden orderbook.
-//  7. Build and return BenchmarkResults.
-//  8. Stop container (always, via defer).
+//  5. Run the bot fleet (profile-aware if Phase 5).
+//  6. Compute correctness score.
+//  7. Build BenchmarkResults (profile-aware scoring if Phase 5).
+//  8. Persist results to sub.AllResults (Phase 5) or sub.Results (Phase 1–4).
+//  9. If Phase 5 and more profiles remain, enqueue the next profile job.
+//     If Phase 5 and this is the last profile, compute FinalScore.
+//
+// 10. Stop container (always, via defer).
+//
+// The returned *BenchmarkResults is always the result for THIS profile run.
+// worker.processJob uses j.IsLastProfile() to decide whether to mark the
+// submission StatusCompleted.
 func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.BenchmarkResults, error) {
 	log := slog.With(
 		"executor", "sandbox",
 		"job_id", j.ID,
 		"submission_id", j.SubmissionID,
 		"language", j.Language,
+		"volatility_label", j.VolatilityLabel,
 	)
 
-	// Notify heartbeater: we are now busy with this job.
 	if e.onStart != nil {
 		e.onStart(j.SubmissionID)
 	}
-	// Notify heartbeater: we are idle again when Execute returns.
 	defer func() {
 		if e.onFinish != nil {
 			e.onFinish()
@@ -160,13 +190,17 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 	}
 
 	// ── 2. Deploy sandbox ─────────────────────────────────────────────────────
-	log.Info("executor: deploying sandbox")
+	if j.VolatilityLabel != "" {
+		log.Info("executor: deploying sandbox for profile run", "profile", j.VolatilityLabel)
+	} else {
+		log.Info("executor: deploying sandbox")
+	}
 	containerID, hostPort, err := e.docker.Deploy(ctx, sub)
 	if err != nil {
 		return nil, fmt.Errorf("executor: deploy sandbox for %s: %w", j.SubmissionID, err)
 	}
 
-	// ── 8. Cleanup — always stop the container when Execute returns ───────────
+	// ── 10. Cleanup — always stop the container when Execute returns ───────────
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -200,33 +234,40 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 	)
 
 	// ── 5. Run bot fleet ──────────────────────────────────────────────────────
-	// Set StatusBenchmarking so the API surfaces the in-progress state
-	// rather than the generic StatusDeploying while the fleet is running.
 	sub.Status = models.StatusBenchmarking
 	sub.StatusMsg = "bot fleet running"
 	if updateErr := e.store.Update(sub); updateErr != nil {
 		log.Warn("executor: failed to set StatusBenchmarking", "err", updateErr)
 	}
 
+	// Resolve the VolatilityProfile for this job (Phase 5 only).
+	// profile is the zero value for Phase 1–4 jobs (label == "").
+	var profile models.VolatilityProfile
+	if j.VolatilityLabel != "" && e.contestQuerier != nil {
+		if contest, cerr := e.contestQuerier.GetActive(ctx); cerr == nil {
+			if p, ok := contest.ProfileByLabel(j.VolatilityLabel); ok {
+				profile = p
+			} else {
+				log.Warn("executor: contest has no profile for label — using zero profile",
+					"label", j.VolatilityLabel)
+			}
+		} else {
+			log.Warn("executor: could not load active contest for profile lookup — using zero profile",
+				"label", j.VolatilityLabel, "err", cerr)
+		}
+	}
+
 	targetURL := fmt.Sprintf("http://%s:%d", e.sandboxHost, hostPort)
-	fleetResult, correctnessResult, err := e.runFleet(ctx, j, targetURL, log)
+	fleetResult, correctnessResult, err := e.runFleet(ctx, j, targetURL, profile, log)
 	if err != nil {
 		return nil, fmt.Errorf("executor: bot fleet: %w", err)
 	}
 
 	// ── 7. Build BenchmarkResults ─────────────────────────────────────────────
-	// Phase 5: the job carries VolatilityLabel when dispatched by the contest
-	// service (Stage 5.3+). buildResults uses the label to select Phase 5
-	// profile-aware scoring vs the Phase 1-4 legacy path.
-	//
-	// NOTE: profile is the zero value here until Stage 5.5 wires the
-	// ContestStore into the executor. The Phase 5 scoring path handles this
-	// gracefully; unit tests inject explicit profiles for TestBuildResults_*.
-	var profile models.VolatilityProfile
 	results := buildResults(fleetResult, correctnessResult, profile, j.VolatilityLabel)
 
 	if j.VolatilityLabel != "" {
-		log.Info("executor: benchmark complete",
+		log.Info("executor: profile run complete",
 			"volatility_label", results.VolatilityLabel,
 			"p50_ms", results.P50LatencyMs,
 			"p99_ms", results.P99LatencyMs,
@@ -244,19 +285,219 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 		)
 	}
 
+	// ── 8. Persist results ────────────────────────────────────────────────────
+	// Phase 5 jobs append to AllResults; Phase 1–4 jobs write to Results
+	// (the legacy field) for backward compatibility.
+	if j.VolatilityLabel != "" {
+		if err := e.appendProfileResult(sub, results, log); err != nil {
+			return nil, err
+		}
+	}
+	// Phase 1–4: worker.processJob writes sub.Results = results after Execute
+	// returns, so we do nothing here for that path.
+
+	// ── 9. Dispatch next profile job or compute FinalScore ────────────────────
+	if j.VolatilityLabel != "" {
+		if len(j.RemainingProfiles) > 0 {
+			if err := e.enqueueNextProfile(ctx, sub, j, log); err != nil {
+				return nil, err
+			}
+		} else {
+			// This was the last profile. Compute and persist the FinalScore.
+			e.computeAndWriteFinalScore(ctx, sub, j, log)
+		}
+	}
+
 	return results, nil
 }
 
-// runFleet constructs the fleet, runs it, and in parallel runs the golden
-// orderbook over the same order sequence to produce a correctness result.
+// appendProfileResult reloads the submission from the store (to pick up any
+// concurrent writes from previous profile jobs), appends the new result to
+// AllResults, and persists the updated submission.
+//
+// We reload before appending because in distributed mode another worker may
+// have written the previous profile's result between the time Execute loaded
+// sub at step 1 and now. A stale read would clobber that result.
+func (e *SandboxExecutor) appendProfileResult(
+	sub *models.Submission,
+	results *models.BenchmarkResults,
+	log *slog.Logger,
+) error {
+	// Re-read from store to get the latest AllResults slice.
+	fresh, err := e.store.Get(sub.ID)
+	if err != nil {
+		log.Warn("executor: could not re-read submission for AllResults append — using cached copy",
+			"submission_id", sub.ID, "err", err)
+		fresh = sub // fall back to the in-memory copy
+	}
+
+	fresh.AllResults = append(fresh.AllResults, results)
+
+	if updateErr := e.store.Update(fresh); updateErr != nil {
+		return fmt.Errorf("executor: persist AllResults for %s: %w", sub.ID, updateErr)
+	}
+	// Update the caller's pointer so step 9 can use the freshened copy.
+	*sub = *fresh
+	return nil
+}
+
+// enqueueNextProfile constructs and enqueues the job for the next volatility
+// profile in the chain. Called after each non-final profile run commits.
+//
+// If the queue is nil (local-only mode), the next job cannot be enqueued;
+// the submission is marked Failed and an error is returned so the caller
+// surfaces it as a terminal outcome.
+func (e *SandboxExecutor) enqueueNextProfile(
+	ctx context.Context,
+	sub *models.Submission,
+	j queue.Job,
+	log *slog.Logger,
+) error {
+	nextLabel := j.RemainingProfiles[0]
+	remaining := j.RemainingProfiles[1:]
+
+	log.Info("executor: enqueueing next profile job",
+		"current_label", j.VolatilityLabel,
+		"next_label", nextLabel,
+		"remaining_after_next", remaining,
+	)
+
+	nextJob := queue.NewProfileJob(sub, j.ContestID, nextLabel, remaining)
+
+	if e.jobQueue == nil {
+		// Local mode: no queue to enqueue into. Mark the submission failed so
+		// the team knows to resubmit. This path is only hit if a Phase 5 job
+		// somehow reaches a local-mode worker — which should not happen in a
+		// correctly configured deployment.
+		log.Error("executor: cannot enqueue next profile — no job queue configured (local mode?)",
+			"next_label", nextLabel)
+		e.markFailed(sub, fmt.Sprintf(
+			"cannot enqueue next profile %q: worker has no job queue (local mode)", nextLabel))
+		return fmt.Errorf("executor: no job queue to enqueue next profile %q", nextLabel)
+	}
+
+	if err := e.jobQueue.Enqueue(ctx, nextJob); err != nil {
+		log.Error("executor: failed to enqueue next profile job",
+			"next_label", nextLabel, "err", err)
+		e.markFailed(sub, fmt.Sprintf(
+			"failed to enqueue next profile %q: %v", nextLabel, err))
+		return fmt.Errorf("executor: enqueue next profile %q: %w", nextLabel, err)
+	}
+
+	log.Info("executor: next profile job enqueued",
+		"next_job_id", nextJob.ID,
+		"next_label", nextLabel,
+	)
+	return nil
+}
+
+// computeAndWriteFinalScore aggregates the three RunScores from AllResults
+// using the contest's aggregate weights and writes the result to the
+// submission store.
+//
+// If the active contest cannot be loaded (e.g. it was closed between the last
+// profile run starting and this call), default weights (0.20/0.35/0.45) are
+// used so the submission still receives a score rather than being silently
+// zeroed.
+//
+// This method does not return an error — a FinalScore computation failure is
+// non-fatal. The submission remains StatusCompleted and the partial/zero
+// FinalScore is visible to operators via the store.
+func (e *SandboxExecutor) computeAndWriteFinalScore(
+	ctx context.Context,
+	sub *models.Submission,
+	j queue.Job,
+	log *slog.Logger,
+) {
+	// Re-read so we have the complete AllResults slice (all three profiles).
+	fresh, err := e.store.Get(sub.ID)
+	if err != nil {
+		log.Error("executor: computeAndWriteFinalScore: cannot reload submission",
+			"submission_id", sub.ID, "err", err)
+		return
+	}
+
+	// Resolve aggregate weights from the contest if available.
+	lowW, medW, highW := 0.20, 0.35, 0.45 // sensible defaults
+	if e.contestQuerier != nil {
+		if contest, cerr := e.contestQuerier.GetActive(ctx); cerr == nil {
+			lowW = contest.LowWeight
+			medW = contest.MediumWeight
+			highW = contest.HighWeight
+		} else {
+			log.Warn("executor: computeAndWriteFinalScore: cannot load contest weights — using defaults",
+				"err", cerr)
+		}
+	}
+
+	// safeScore returns the RunScore for a label, or 0.0 if the result is
+	// missing (e.g. a prior profile job failed and wrote no result).
+	safeScore := func(label string) float64 {
+		if r := fresh.ResultByLabel(label); r != nil {
+			return r.RunScore
+		}
+		return 0.0
+	}
+
+	finalScore := (lowW*safeScore("low") +
+		medW*safeScore("medium") +
+		highW*safeScore("high")) * 100.0
+
+	log.Info("executor: FinalScore computed",
+		"submission_id", fresh.ID,
+		"low_score", safeScore("low"),
+		"medium_score", safeScore("medium"),
+		"high_score", safeScore("high"),
+		"low_weight", lowW,
+		"medium_weight", medW,
+		"high_weight", highW,
+		"final_score", finalScore,
+	)
+
+	fresh.FinalScore = finalScore
+	// AllResults is already set; we only update FinalScore here.
+	// Status is set to StatusCompleted by worker.processJob after Execute returns.
+	if updateErr := e.store.Update(fresh); updateErr != nil {
+		log.Error("executor: failed to persist FinalScore",
+			"submission_id", fresh.ID, "err", updateErr)
+	}
+}
+
+// markFailed writes StatusFailed to the submission store. Called on
+// non-recoverable errors in the Phase 5 dispatch chain (e.g. enqueue failure).
+// Errors from the store write are logged but not propagated — the caller
+// already has a terminal error to return.
+func (e *SandboxExecutor) markFailed(sub *models.Submission, msg string) {
+	sub.Status = models.StatusFailed
+	sub.StatusMsg = msg
+	if err := e.store.Update(sub); err != nil {
+		slog.Error("executor: markFailed: store.Update failed",
+			"submission_id", sub.ID, "err", err)
+	}
+}
+
+// runFleet constructs and runs the bot fleet with the correct configuration
+// for this job:
+//   - Phase 5 (label != "" and profile non-zero): uses buildFleetConfigFromProfile.
+//   - Phase 5 (label != "" but profile is zero due to contest unavailability):
+//     falls back to DefaultFleetConfig so the run still produces results.
+//   - Phase 1–4 (label == ""): uses fleetCfgOverride (tests) or DefaultFleetConfig.
 func (e *SandboxExecutor) runFleet(
 	ctx context.Context,
 	j queue.Job,
 	targetURL string,
+	profile models.VolatilityProfile,
 	log *slog.Logger,
 ) (*botfleet.FleetResult, *correctness.CorrectnessResult, error) {
 
-	cfg := e.buildFleetConfig(targetURL)
+	var cfg botfleet.FleetConfig
+	if j.VolatilityLabel != "" && profile.BotCount > 0 {
+		// Phase 5: profile successfully resolved — use profile-derived config.
+		cfg = buildFleetConfigFromProfile(targetURL, profile)
+	} else {
+		// Phase 1–4, or Phase 5 with unavailable profile: fall back.
+		cfg = e.buildFleetConfig(targetURL)
+	}
 
 	log.Info("executor: launching bot fleet",
 		"target_url", targetURL,
@@ -281,157 +522,18 @@ func (e *SandboxExecutor) runFleet(
 		"sustained_tps", fleetResult.Stats.SustainedTPS,
 	)
 
-	// ── 6. Correctness check ──────────────────────────────────────────────────
 	correctnessResult := e.checkCorrectness(fleetResult.Results, log)
-
-	// ── Emit per-order telemetry in batches ───────────────────────────────────
-	// We do this after correctness so a slow emitter never delays the score.
 	e.emitFleetTelemetry(ctx, j.SubmissionID, fleetResult.Results, log)
 
 	return fleetResult, &correctnessResult, nil
 }
 
-// checkCorrectness replays the order sequence through the GoldenOrderbook and
-// compares the canonical fills against what the contestant's engine returned.
-func (e *SandboxExecutor) checkCorrectness(
-	results []botfleet.OrderResult,
-	log *slog.Logger,
-) correctness.CorrectnessResult {
-
-	book := correctness.NewGoldenOrderbook()
-	checker := correctness.NewChecker()
-
-	var goldenFills []correctness.GoldenFill
-	var contestantFills []correctness.ContestantFill
-
-	for i := range results {
-		r := &results[i]
-		if r.Err != nil {
-			continue // transport error — exclude from correctness check
-		}
-
-		// Translate botfleet types to correctness types (no import cycle).
-		goldenOrder := correctness.GoldenOrder{
-			ID:       r.Order.ID,
-			Kind:     correctness.OrderKind(r.Order.Kind),
-			Side:     correctness.Side(r.Order.Side),
-			Price:    r.Order.Price,
-			Quantity: r.Order.Quantity,
-		}
-
-		gf, err := book.Apply(goldenOrder)
-		if err != nil {
-			log.Warn("correctness: golden orderbook rejected order",
-				"order_id", r.Order.ID, "err", err)
-			continue
-		}
-		goldenFills = append(goldenFills, gf)
-
-		contestantFills = append(contestantFills, correctness.ContestantFill{
-			OrderID:       r.Fill.OrderID,
-			ExecutedPrice: r.Fill.ExecutedPrice,
-			ExecutedQty:   r.Fill.ExecutedQty,
-			Accepted:      r.Fill.Accepted,
-		})
-	}
-
-	result := checker.Check(contestantFills, goldenFills)
-	log.Info("executor: correctness check complete",
-		"score", result.Score,
-		"total_fills", result.TotalFills,
-		"correct", result.CorrectFills,
-		"incorrect", result.IncorrectFills,
-	)
-	return result
-}
-
-// emitFleetTelemetry converts OrderResults to telemetry.Events and sends
-// them to the configured Emitter in batches of e.telemetryBatchSize.
-//
-// Design decisions:
-//   - Batching avoids per-event lock/network overhead on the emitter.
-//   - Errors are logged but NOT propagated — a telemetry failure must never
-//     prevent the benchmark result from being written to the store.
-//   - Only successful OrderResults (Err == nil) produce events. Transport
-//     errors are already reflected in Stats.ErrorOrders; emitting them as
-//     KindReject events would confuse latency percentiles with zero values.
-func (e *SandboxExecutor) emitFleetTelemetry(
-	ctx context.Context,
-	submissionID string,
-	results []botfleet.OrderResult,
-	log *slog.Logger,
-) {
-	if len(results) == 0 {
-		return
-	}
-
-	batch := make([]telemetry.Event, 0, e.telemetryBatchSize)
-	emitted := 0
-	errors := 0
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		if err := e.emitter.BatchEmit(ctx, batch); err != nil {
-			log.Warn("executor: telemetry batch emit error",
-				"batch_size", len(batch), "err", err)
-			errors++
-		} else {
-			emitted += len(batch)
-		}
-		batch = batch[:0]
-	}
-
-	for i := range results {
-		r := &results[i]
-		if r.Err != nil {
-			continue // skip transport-level errors
-		}
-
-		kind := telemetry.KindOrderAck
-		if !r.Fill.Accepted {
-			kind = telemetry.KindReject
-		} else if r.Fill.ExecutedQty > 0 {
-			kind = telemetry.KindFill
-		} else if r.Order.Kind == botfleet.KindCancel {
-			kind = telemetry.KindCancelAck
-		}
-
-		batch = append(batch, telemetry.Event{
-			Kind:         kind,
-			SubmissionID: submissionID,
-			Timestamp:    r.SentAt.UTC(),
-			OrderID:      r.Order.ID,
-			LatencyNs:    r.LatencyNs,
-			Meta: map[string]string{
-				"order_kind": string(r.Order.Kind),
-				"side":       string(r.Order.Side),
-				"accepted":   strconv.FormatBool(r.Fill.Accepted),
-			},
-		})
-
-		if len(batch) >= e.telemetryBatchSize {
-			flush()
-		}
-	}
-	flush() // final partial batch
-
-	log.Info("executor: telemetry emission complete",
-		"emitted", emitted,
-		"batch_errors", errors,
-		"total_results", len(results),
-	)
-}
-
-// buildFleetConfig returns the fleet configuration for this run.
+// buildFleetConfig returns the fleet configuration for Phase 1–4 jobs (or
+// Phase 5 jobs where the profile could not be resolved).
 //
 // Priority:
-//  1. fleetCfgOverride (set via WithFleetConfig) — used in tests and the
-//     dry-run validator to inject a fixed config regardless of job content.
-//  2. Phase 1–4 default — botfleet.DefaultFleetConfig.
-//
-// Phase 5 jobs use buildFleetConfigFromProfile instead of this method.
+//  1. fleetCfgOverride — set via WithFleetConfig; used in tests and dry-run.
+//  2. botfleet.DefaultFleetConfig.
 func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfig {
 	if e.fleetCfgOverride != nil {
 		cfg := *e.fleetCfgOverride
@@ -442,12 +544,7 @@ func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfi
 }
 
 // buildFleetConfigFromProfile translates a VolatilityProfile into the
-// botfleet.FleetConfig used for a Phase 5 benchmark run. All numeric
-// parameters come from the profile so the admin can tune per-contest load
-// characteristics without a code change.
-//
-// Used by Stage 5.5+ when the executor receives a job with a VolatilityLabel
-// and the matching profile has been resolved from the ContestStore.
+// botfleet.FleetConfig used for a Phase 5 benchmark run.
 func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) botfleet.FleetConfig {
 	return botfleet.FleetConfig{
 		BotCount:          p.BotCount,
@@ -477,27 +574,9 @@ func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) b
 //
 // Dispatch logic (keyed on label):
 //
-//   - label == "" (Phase 1–4 jobs): uses the legacy hardcoded constants and
-//     formula. CompositeScore is set; RunScore remains zero. No existing test
-//     changes needed.
-//
-//   - label != "" (Phase 5 jobs): uses profile-aware targets and weights.
-//     RunScore is set (0.0–1.0). CompositeScore = RunScore×100 so the legacy
-//     leaderboard handler still shows a meaningful value until Stage 5.5 wires
-//     FinalScore through the deduplicated handler.
-//
-// Phase 5 scoring formula:
-//
-//	normP99  = 1.0 at p99 ≤ TargetP99Ns, decays linearly to 0.0 at 10×TargetP99Ns
-//	normTPS  = SustainedTPS / TargetSustainTPS, capped at 1.0
-//	runScore = correctness × (LatencyWeight×normP99 + ThroughputWeight×normTPS)
-//	         + CorrectnessWeight×correctness
-//
-// Correctness is a multiplier: an engine with 0% correct fills scores 0
-// regardless of latency or throughput. This incentivises correctness first.
-//
-// normTPS uses SustainedTPS (full-run average), not MaxTPS (100ms burst).
-// MaxTPS is still recorded for diagnostics but does not affect ranking.
+//   - label == "" (Phase 1–4): legacy hardcoded constants; CompositeScore set.
+//   - label != "" (Phase 5): profile-aware targets; RunScore set (0.0–1.0).
+//     CompositeScore = RunScore×100 for legacy leaderboard handler compat.
 func buildResults(
 	fr *botfleet.FleetResult,
 	cr *correctness.CorrectnessResult,
@@ -535,8 +614,6 @@ func buildResults(
 
 	if label == "" {
 		// ── Phase 1–4 backward-compatible scoring ─────────────────────────────
-		// Original hardcoded constants and formula; keeps all pre-Phase-5
-		// tests passing without modification.
 		const (
 			legacyTargetP99Ns  = float64(1_000_000)   // 1 ms
 			legacyWorstP99Ns   = float64(100_000_000) // 100 ms
@@ -566,7 +643,6 @@ func buildResults(
 		normP99 = 1.0
 	case p99 < worstP99Ns:
 		normP99 = 1.0 - (p99-float64(profile.TargetP99Ns))/(worstP99Ns-float64(profile.TargetP99Ns))
-		// p99 >= worstP99Ns: normP99 stays 0.0
 	}
 
 	normTPS := 0.0
@@ -577,15 +653,140 @@ func buildResults(
 		}
 	}
 
-	// Correctness multiplier: an engine with 0% correctness scores 0 on every
-	// axis, regardless of how fast it is.
 	runScore := correctnessScore*
 		(profile.LatencyWeight*normP99+profile.ThroughputWeight*normTPS) +
 		profile.CorrectnessWeight*correctnessScore
 
 	result.RunScore = runScore
-	result.CompositeScore = runScore * 100.0 // legacy field; Stage 5.5 uses FinalScore
+	result.CompositeScore = runScore * 100.0
 	return result
+}
+
+// checkCorrectness replays the order sequence through the GoldenOrderbook and
+// compares canonical fills against what the contestant's engine returned.
+func (e *SandboxExecutor) checkCorrectness(
+	results []botfleet.OrderResult,
+	log *slog.Logger,
+) correctness.CorrectnessResult {
+
+	book := correctness.NewGoldenOrderbook()
+	checker := correctness.NewChecker()
+
+	var goldenFills []correctness.GoldenFill
+	var contestantFills []correctness.ContestantFill
+
+	for i := range results {
+		r := &results[i]
+		if r.Err != nil {
+			continue
+		}
+
+		goldenOrder := correctness.GoldenOrder{
+			ID:       r.Order.ID,
+			Kind:     correctness.OrderKind(r.Order.Kind),
+			Side:     correctness.Side(r.Order.Side),
+			Price:    r.Order.Price,
+			Quantity: r.Order.Quantity,
+		}
+
+		gf, err := book.Apply(goldenOrder)
+		if err != nil {
+			log.Warn("correctness: golden orderbook rejected order",
+				"order_id", r.Order.ID, "err", err)
+			continue
+		}
+		goldenFills = append(goldenFills, gf)
+
+		contestantFills = append(contestantFills, correctness.ContestantFill{
+			OrderID:       r.Fill.OrderID,
+			ExecutedPrice: r.Fill.ExecutedPrice,
+			ExecutedQty:   r.Fill.ExecutedQty,
+			Accepted:      r.Fill.Accepted,
+		})
+	}
+
+	result := checker.Check(contestantFills, goldenFills)
+	log.Info("executor: correctness check complete",
+		"score", result.Score,
+		"total_fills", result.TotalFills,
+		"correct", result.CorrectFills,
+		"incorrect", result.IncorrectFills,
+	)
+	return result
+}
+
+// emitFleetTelemetry converts OrderResults to telemetry.Events and sends
+// them to the configured Emitter in batches of e.telemetryBatchSize.
+//
+// Errors are logged but NOT propagated — telemetry failure must never prevent
+// the benchmark result from being stored.
+func (e *SandboxExecutor) emitFleetTelemetry(
+	ctx context.Context,
+	submissionID string,
+	results []botfleet.OrderResult,
+	log *slog.Logger,
+) {
+	if len(results) == 0 {
+		return
+	}
+
+	batch := make([]telemetry.Event, 0, e.telemetryBatchSize)
+	emitted := 0
+	errors := 0
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := e.emitter.BatchEmit(ctx, batch); err != nil {
+			log.Warn("executor: telemetry batch emit error",
+				"batch_size", len(batch), "err", err)
+			errors++
+		} else {
+			emitted += len(batch)
+		}
+		batch = batch[:0]
+	}
+
+	for i := range results {
+		r := &results[i]
+		if r.Err != nil {
+			continue
+		}
+
+		kind := telemetry.KindOrderAck
+		if !r.Fill.Accepted {
+			kind = telemetry.KindReject
+		} else if r.Fill.ExecutedQty > 0 {
+			kind = telemetry.KindFill
+		} else if r.Order.Kind == botfleet.KindCancel {
+			kind = telemetry.KindCancelAck
+		}
+
+		batch = append(batch, telemetry.Event{
+			Kind:         kind,
+			SubmissionID: submissionID,
+			Timestamp:    r.SentAt.UTC(),
+			OrderID:      r.Order.ID,
+			LatencyNs:    r.LatencyNs,
+			Meta: map[string]string{
+				"order_kind": string(r.Order.Kind),
+				"side":       string(r.Order.Side),
+				"accepted":   strconv.FormatBool(r.Fill.Accepted),
+			},
+		})
+
+		if len(batch) >= e.telemetryBatchSize {
+			flush()
+		}
+	}
+	flush()
+
+	log.Info("executor: telemetry emission complete",
+		"emitted", emitted,
+		"batch_errors", errors,
+		"total_results", len(results),
+	)
 }
 
 func (e *SandboxExecutor) waitHealthy(ctx context.Context, containerID string, log *slog.Logger) error {

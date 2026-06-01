@@ -50,7 +50,7 @@ Stage 5.1  models + ContestStore               ✅ COMPLETE
 Stage 5.2  ContestService + admin endpoints    ✅ COMPLETE
 Stage 5.3  One-active-submission guard         ✅ COMPLETE
 Stage 5.4  Volatility-aware scoring            ✅ COMPLETE
-Stage 5.5  Sequential three-job dispatch       (replace hardcoded buildResults)
+Stage 5.5  Sequential three-job dispatch       ✅ COMPLETE
 Stage 5.6  Dry-run Validator                   (job chaining, no new packages)
 Stage 5.7  SSE live leaderboard                (new internal/validator package)
 Stage 5.8  WebSocket BotTransport              (leaderboardBus + stream endpoint)

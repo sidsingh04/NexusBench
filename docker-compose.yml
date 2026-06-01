@@ -32,6 +32,7 @@ services:
       MAX_UPLOAD_BYTES:     "268435456"
       REDPANDA_BROKERS:     "redpanda:9092"
       DISTRIBUTED_MODE:     "true"
+      ADMIN_API_KEY:        "testkey"
     volumes:
       - submissions_data:/data/submissions
       - /var/run/docker.sock:/var/run/docker.sock:rw
