@@ -1,0 +1,29 @@
+# k8s/postgres/pvc.yaml
+#
+# PersistentVolumeClaim for the PostgreSQL contest store.
+#
+# Why 10Gi?
+#   Contest records and leaderboard snapshots are tiny compared to the
+#   time-series telemetry in TimescaleDB. Even with 10,000 leaderboard
+#   snapshots of 1,000 entries each (100MB of JSONB), 10Gi is generous
+#   and leaves ample headroom for WAL and index overhead.
+#
+# StorageClass: standard-rwo (GKE standard persistent disk, ReadWriteOnce).
+# For GKE Autopilot, omit storageClassName and let the default provisioner
+# choose. For local development use HostPath or a local provisioner.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard-rwo

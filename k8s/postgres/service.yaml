@@ -1,0 +1,28 @@
+# k8s/postgres/service.yaml
+#
+# Headless ClusterIP Service for the PostgreSQL contest store.
+#
+# ClusterIP (not LoadBalancer): the only client is the control-plane pod,
+# which connects via the internal cluster DNS name "postgres.nexusbench.svc".
+# No external access is needed or desired.
+#
+# Port 5432 is the standard PostgreSQL port. The DSN in the control-plane
+# ConfigMap uses this service name: postgres://...@postgres:5432/nexusbench.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

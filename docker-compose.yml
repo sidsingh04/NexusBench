@@ -3,7 +3,7 @@ version: "3.9"
 # NexusBench — Local Development Stack
 #
 # Start everything:           docker compose up --build
-# Start infra only:           docker compose up redpanda timescaledb loki prometheus cadvisor -d
+# Start infra only:           docker compose up redpanda timescaledb postgres loki prometheus cadvisor -d
 # Stop everything:            docker compose down -v
 
 services:
@@ -33,11 +33,17 @@ services:
       REDPANDA_BROKERS:     "redpanda:9092"
       DISTRIBUTED_MODE:     "true"
       ADMIN_API_KEY:        "testkey"
+      # Stage 5.9: PostgreSQL for durable contest storage.
+      # The control-plane uses PostgresContestStore in distributed mode when
+      # this DSN is set. MemoryContestStore is used as a fallback if unset.
+      POSTGRES_DSN: "postgres://nexusbench:nexusbench_dev@postgres:5432/nexusbench"
     volumes:
       - submissions_data:/data/submissions
       - /var/run/docker.sock:/var/run/docker.sock:rw
     depends_on:
       redpanda:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
@@ -45,6 +51,36 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # ── PostgreSQL (Stage 5.9: contest store) ────────────────────────────────────
+  #
+  # Separate from TimescaleDB (which stores latency time-series metrics).
+  # This instance stores contest lifecycle data: contests, leaderboard snapshots.
+  #
+  # Why not reuse TimescaleDB?
+  #   TimescaleDB is owned by the metrics-consumer (different service boundary).
+  #   Contest data requires transactional guarantees (status transitions) that
+  #   TimescaleDB's hypertable model is not optimised for. Keeping them separate
+  #   also lets each be scaled/maintained independently.
+  #
+  # In production (GKE), this maps to k8s/postgres/statefulset.yaml.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       nexusbench
+      POSTGRES_USER:     nexusbench
+      POSTGRES_PASSWORD: nexusbench_dev
+    ports:
+      - "5433:5432"   # host:5433 to avoid collision with TimescaleDB on 5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexusbench -d nexusbench"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   # ── Redpanda ─────────────────────────────────────────────────────────────────
   redpanda:
@@ -168,8 +204,6 @@ services:
     restart: unless-stopped
 
   # ── Node exporter ─────────────────────────────────────────────────────────────
-  # network_mode:host is Linux-only. On Windows Docker Desktop we bind the port
-  # and address it via host.docker.internal in prometheus.yml.
   node-exporter:
     image: prom/node-exporter:v1.8.0
     command:
@@ -237,9 +271,6 @@ services:
       start_period: 15s
 
   # ── Benchmark Worker (Phase 3) ───────────────────────────────────────────────
-  # Scale this service horizontally to add more worker capacity:
-  #   docker compose up --scale worker=3
-  # Each replica picks up a different job partition from jobs.benchmark.
   worker:
     build:
       context: .
@@ -263,7 +294,6 @@ services:
       SANDBOX_PORT_MIN:     "21000"
       SANDBOX_PORT_MAX:     "22000"
       SANDBOX_HOST:         "host.docker.internal"
-      # Bot fleet configuration
       BOT_COUNT:              "100"
       BOT_TEST_DURATION:      "60s"
       BOT_RAMP_UP_DURATION:   "5s"
@@ -285,6 +315,7 @@ volumes:
   submissions_data:
   redpanda_data:
   timescale_data:
+  postgres_data:
   prometheus_data:
   loki_data:
   grafana_data:
