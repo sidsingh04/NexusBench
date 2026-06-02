@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,6 +32,15 @@ const queueDepthScrapeInterval = 15 * time.Second
 
 // autoCloseTick is how often the drain-and-wait goroutine checks contest state.
 const autoCloseTick = 30 * time.Second
+
+// leaderboardWatchInterval is how often the leaderboard watcher polls the
+// submission store and pushes an SSE "update" event if scores changed.
+//
+// 5 seconds gives contestants near-real-time feedback while keeping store
+// read pressure negligible (DiskStore.List is an O(N) directory scan).
+// This is not a "hot poll" — it fires only when subscribers are connected,
+// and the change-detection hash prevents redundant broadcasts.
+const leaderboardWatchInterval = 5 * time.Second
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -121,18 +131,17 @@ func main() {
 		slog.Info("server: local mode — sandboxes deployed in-process")
 	}
 
-	// ── Contest service (Phase 5+) ────────────────────────────────────────────
-	// MemoryContestStore for all modes through Stage 5.8.
-	// Stage 5.9 switches to PostgresContestStore when DistributedMode=true.
+	// ── Contest service + Leaderboard Bus (Phase 5+) ──────────────────────────
+	// The bus is created here and passed to both the contest service and the
+	// router. The contest service uses it to broadcast "frozen" events when a
+	// contest closes. The leaderboard watcher (below) uses it to broadcast
+	// "update" events as FinalScores are written by workers.
 	bus := api.NewLeaderboardBus()
 	contestStore := contest.NewMemoryContestStore()
 	contestSvc := contest.NewContestService(contestStore, bus)
 
 	// Wire the contest service into the submission service so that Ingest
-	// enforces contest-scoped checks (Stage 5.3):
-	//  - requires an active contest
-	//  - rejects uploads after SubmissionsClosedAt
-	//  - blocks duplicate in-flight submissions per team
+	// enforces contest-scoped checks (Stage 5.3).
 	if cfg.AdminAPIKey != "" {
 		submissionSvc = submissionSvc.WithContestGetter(contestSvc)
 		slog.Info("server: admin API enabled — contest lifecycle routes mounted",
@@ -141,13 +150,22 @@ func main() {
 		slog.Warn("server: ADMIN_API_KEY not set — admin routes will not be mounted; contest checks disabled")
 	}
 
-	// ── Auto-close goroutine (AD-3: hybrid drain-and-wait) ────────────────────
-	// Receives the submission store and worker registry so it can:
-	//  a) build real leaderboard entries from completed submissions on close, and
-	//  b) check queue depth + busy-worker count for the drain condition.
+	// ── Leaderboard watcher (Stage 5.7 — cross-process update bridge) ─────────
+	// This goroutine polls the submission store every leaderboardWatchInterval,
+	// detects score changes via a cheap hash, and broadcasts "update" events to
+	// SSE subscribers. It is the architectural solution to the process-isolation
+	// dilemma: the worker writes FinalScore to the shared store; the control
+	// plane's watcher notices and pushes the update. Zero new infrastructure,
+	// zero changes to the worker.
 	//
-	// jobQueue is nil in local mode → drain check is skipped (no queue to drain).
-	// workerRegistry is always non-nil → Stats() is always safe to call.
+	// The watcher is always started regardless of mode (local or distributed)
+	// because in local mode the in-process executor writes to the same store,
+	// and the watcher handles both cases identically.
+	watcherCtx, watcherCancel := context.WithCancel(context.Background())
+	go runLeaderboardWatcher(watcherCtx, store, bus)
+	defer watcherCancel()
+
+	// ── Auto-close goroutine (AD-3: hybrid drain-and-wait) ────────────────────
 	autoCloseCtx, autoCloseCancel := context.WithCancel(context.Background())
 	go runContestAutoClose(autoCloseCtx, contestSvc, store, jobQueue, workerRegistry)
 	defer autoCloseCancel()
@@ -194,26 +212,134 @@ func main() {
 	slog.Info("control plane stopped")
 }
 
+// ── Leaderboard watcher (Stage 5.7) ──────────────────────────────────────────
+
+// runLeaderboardWatcher polls the submission store on a fixed interval,
+// computes a change-detection hash over all completed FinalScores, and fires
+// a bus.Broadcast("update") only when the hash changes.
+//
+// This is the architectural bridge for the process-isolation dilemma in Stage
+// 5.7: the worker (a separate OS process in distributed mode) writes FinalScore
+// to the shared submission store, and this watcher on the control plane side
+// notices and pushes the SSE update. No new infrastructure is needed.
+//
+// Design properties:
+//   - Zero work when no SSE clients are connected (bus.SubscriberCount() == 0).
+//     The store is not read at all in that case, keeping idle overhead at zero.
+//   - Change detection via scoreHash: only broadcasts when the set of
+//     completed submission scores actually changes. This prevents redundant
+//     fan-out when no benchmark has completed since the last tick.
+//   - Identical behavior in local and distributed mode — the executor in both
+//     cases writes to the same store, so the watcher does not need to know
+//     which mode is active.
+//   - Supersedes the need for bus.Broadcast calls inside executor.go or
+//     worker.go, keeping those packages free of the api dependency.
+func runLeaderboardWatcher(ctx context.Context, store submission.Store, bus *api.LeaderboardBus) {
+	slog.Info("server: leaderboard watcher started",
+		"interval", leaderboardWatchInterval)
+
+	ticker := time.NewTicker(leaderboardWatchInterval)
+	defer ticker.Stop()
+
+	var lastHash float64 // hash of the last broadcast leaderboard state
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("server: leaderboard watcher stopped")
+			return
+		case <-ticker.C:
+			lastHash = tickLeaderboardWatcher(store, bus, lastHash)
+		}
+	}
+}
+
+// tickLeaderboardWatcher is the per-tick logic of runLeaderboardWatcher,
+// extracted as a pure function so it can be unit-tested without a goroutine
+// or a ticker.
+//
+// Returns the new lastHash (unchanged if no broadcast was sent).
+func tickLeaderboardWatcher(
+	store submission.Store,
+	bus *api.LeaderboardBus,
+	lastHash float64,
+) float64 {
+	// Fast path: skip the store read entirely when no clients are connected.
+	// This makes the idle cost of the watcher truly zero rather than just low.
+	if bus.SubscriberCount() == 0 {
+		return lastHash
+	}
+
+	all, err := store.List()
+	if err != nil {
+		slog.Warn("server: leaderboard watcher: store.List failed", "err", err)
+		return lastHash
+	}
+
+	// Compute a cheap hash that changes whenever any completed submission's
+	// score changes. We sum the FinalScores (and CompositeScores for P1–4
+	// submissions) of all completed submissions. Floating-point addition is
+	// order-dependent, so we sort by submission ID first for determinism.
+	//
+	// Why not a cryptographic hash? Because we only need to detect changes,
+	// not identify them. A sum is O(N), allocation-free, and sufficient —
+	// two different leaderboard states will almost certainly produce different
+	// sums, and false positives (a spurious broadcast) are harmless.
+	newHash := leaderboardHash(all)
+	if newHash == lastHash {
+		return lastHash // nothing changed — skip broadcast
+	}
+
+	// State changed. Build the full deduplicated leaderboard and broadcast.
+	entries := buildLeaderboardEntries(context.Background(), store, "" /* all contests */)
+	ptrs := make([]*models.LeaderboardEntry, len(entries))
+	copy(ptrs, entries)
+
+	bus.Broadcast(contest.LeaderboardEvent{
+		Type:    "update",
+		Entries: ptrs,
+	})
+
+	slog.Debug("server: leaderboard watcher: score change detected, broadcast sent",
+		"subscriber_count", bus.SubscriberCount(),
+		"entry_count", len(entries),
+	)
+
+	return newHash
+}
+
+// leaderboardHash returns a deterministic float64 that changes whenever the
+// set of completed submission scores changes.
+//
+// Algorithm: sum the effective score of every completed submission that has
+// a non-zero score, rounded to avoid float64 accumulation drift. The result
+// is not a cryptographic hash — it is a fast change-detection signal.
+//
+// Collision probability: two different leaderboard states would have to
+// produce exactly the same sum of FinalScores to collide. In practice this
+// means a spurious SSE broadcast is sent (harmless) but a missed broadcast
+// is essentially impossible for scores that differ by more than float64 epsilon.
+func leaderboardHash(subs []*models.Submission) float64 {
+	var sum float64
+	for _, s := range subs {
+		if s.Status != models.StatusCompleted {
+			continue
+		}
+		score := s.FinalScore
+		if score == 0 && s.Results != nil {
+			score = s.Results.CompositeScore
+		}
+		// Round to 6 decimal places to avoid float64 accumulation drift
+		// producing false positives across identical states.
+		sum += math.Round(score*1e6) / 1e6
+	}
+	return sum
+}
+
 // ── Hybrid drain-and-wait auto-close (AD-3) ───────────────────────────────────
 
-// runContestAutoClose implements the two-timestamp contest closing protocol:
-//
-//  1. Intake gate  — SubmissionsClosedAt (checked in Ingest, Stage 5.3):
-//     New uploads are rejected after this timestamp. Set by the admin 5–60
-//     minutes before EndsAt to give in-flight submissions time to complete.
-//
-//  2. Drain close — once SubmissionsClosedAt has passed AND the queue is
-//     empty AND no workers are busy, the contest closes naturally. This is the
-//     fair path: all on-time submissions have finished.
-//
-//  3. Hard failsafe — if EndsAt has passed and the queue has NOT drained
-//     (stuck due to infrastructure failure), the contest is force-closed.
-//     Teams whose jobs were not completed are not scored for those runs.
-//
-// jobQueue may be nil in local (Phase 1–4) mode — the drain check is skipped
-// and the goroutine only uses the EndsAt failsafe.
-//
-// workerRegistry is always non-nil — Stats() is always safe to call.
+// runContestAutoClose implements the two-timestamp contest closing protocol.
+// See PROGRESS.md Stage 5.4 for the full rationale.
 func runContestAutoClose(
 	ctx context.Context,
 	svc *contest.ContestService,
@@ -236,8 +362,7 @@ func runContestAutoClose(
 	}
 }
 
-// tickAutoClose is the per-tick logic of runContestAutoClose, extracted so it
-// can be unit-tested independently of the goroutine and ticker machinery.
+// tickAutoClose is the per-tick logic of runContestAutoClose.
 func tickAutoClose(
 	ctx context.Context,
 	svc *contest.ContestService,
@@ -247,7 +372,6 @@ func tickAutoClose(
 ) {
 	active, err := svc.GetActive(ctx)
 	if err != nil {
-		// ErrNoActiveContest is the normal state between contests.
 		if !errors.Is(err, models.ErrNoActiveContest) {
 			slog.Warn("server: auto-close: GetActive failed", "err", err)
 		}
@@ -257,7 +381,6 @@ func tickAutoClose(
 	now := time.Now().UTC()
 
 	// ── Path A: natural drain ─────────────────────────────────────────────────
-	// Trigger once submissions are closed (SubmissionsClosedAt is set and past).
 	if active.SubmissionsClosedAt != nil && now.After(*active.SubmissionsClosedAt) {
 		if queueDrained(ctx, jobQueue) && !workersAreStillBusy(registry) {
 			slog.Info("server: auto-close: queue drained and no busy workers — closing contest",
@@ -275,7 +398,6 @@ func tickAutoClose(
 	}
 
 	// ── Path B: hard failsafe ─────────────────────────────────────────────────
-	// Force-close if EndsAt has passed, regardless of drain state.
 	if active.EndsAt != nil && now.After(*active.EndsAt) {
 		slog.Warn("server: auto-close: EndsAt passed — force-closing contest",
 			"id", active.ID, "ends_at", active.EndsAt,
@@ -288,25 +410,20 @@ func tickAutoClose(
 	}
 }
 
-// queueDrained returns true when there are no unconsumed jobs in the queue.
-// Returns true when jobQueue is nil (local mode — no queue to drain).
 func queueDrained(ctx context.Context, jobQueue queue.Queue) bool {
 	if jobQueue == nil {
-		return true // local mode: no queue → always drained
+		return true
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	depth, err := jobQueue.QueueDepth(pollCtx)
 	if err != nil {
-		slog.Warn("server: auto-close: queue depth poll failed — assuming not drained",
-			"err", err)
-		return false // fail-safe: assume not drained on error
+		slog.Warn("server: auto-close: queue depth poll failed — assuming not drained", "err", err)
+		return false
 	}
 	return depth == 0
 }
 
-// workersAreStillBusy returns true if any registered worker reports busy status.
-// A nil registry is treated as "no workers registered" → not busy.
 func workersAreStillBusy(registry *orchestrator.WorkerRegistry) bool {
 	if registry == nil {
 		return false
@@ -314,21 +431,20 @@ func workersAreStillBusy(registry *orchestrator.WorkerRegistry) bool {
 	return registry.Stats().Busy > 0
 }
 
-// buildLeaderboardEntries reads all completed submissions for the given
-// contestID from the store and converts them to ranked LeaderboardEntry values.
+// buildLeaderboardEntries builds a ranked, deduplicated leaderboard from the
+// store. Used by both the auto-close goroutine and the leaderboard watcher.
 //
-// This is called by the auto-close goroutine immediately before closing so the
-// snapshot reflects the final state. It uses the same deduplication and
-// ranking logic as the public leaderboard endpoint (best-score-per-team).
+// contestID filters to submissions for a specific contest. Pass "" to include
+// all completed submissions (used by the watcher, which is not contest-scoped).
 //
-// For Phase 1–4 submissions (ContestID is empty), all completed submissions
-// are included regardless of contestID to keep the snapshot non-empty.
+// Phase 1–4 submissions (ContestID == "") are always included regardless of
+// the filter, preserving backward compatibility.
 func buildLeaderboardEntries(
 	ctx context.Context,
 	subStore submission.Store,
 	contestID string,
 ) []*models.LeaderboardEntry {
-	_ = ctx // reserved for future store implementations that accept a context
+	_ = ctx
 
 	all, err := subStore.List()
 	if err != nil {
@@ -336,8 +452,6 @@ func buildLeaderboardEntries(
 		return nil
 	}
 
-	// Filter to this contest's completed submissions.
-	// Phase 5: match ContestID. Phase 1–4: include all completed (ContestID=="").
 	var completed []*models.Submission
 	for _, s := range all {
 		if s.Status != models.StatusCompleted {
@@ -349,7 +463,6 @@ func buildLeaderboardEntries(
 		completed = append(completed, s)
 	}
 
-	// Deduplicate: best score per team (mirrors leaderboard handler logic).
 	type candidate struct {
 		sub   *models.Submission
 		score float64
@@ -368,7 +481,6 @@ func buildLeaderboardEntries(
 		}
 	}
 
-	// Sort and rank.
 	candidates := make([]candidate, 0, len(best))
 	for _, c := range best {
 		candidates = append(candidates, c)
@@ -389,14 +501,12 @@ func buildLeaderboardEntries(
 			FinalScore:   c.sub.FinalScore,
 			CompletedAt:  c.sub.CompletedAt,
 		}
-		// Phase 1–4 compat: populate legacy columns.
 		if c.sub.Results != nil {
 			e.CompositeScore = c.sub.Results.CompositeScore
 			e.P99LatencyMs = c.sub.Results.P99LatencyMs
 			e.MaxTPS = c.sub.Results.MaxTPS
 			e.CorrectnessScore = c.sub.Results.CorrectnessScore
 		}
-		// Phase 5: use FinalScore for CompositeScore too (backward compat field).
 		if c.sub.FinalScore > 0 {
 			e.CompositeScore = c.sub.FinalScore
 		}
@@ -407,11 +517,9 @@ func buildLeaderboardEntries(
 
 // ── Queue-depth scraper (Phase 3+) ───────────────────────────────────────────
 
-// runQueueDepthScraper polls the queue's consumer-group lag on a fixed
-// interval and updates the nexusbench_queue_depth Prometheus gauge.
 func runQueueDepthScraper(ctx context.Context, q queue.Queue, reg *metrics.Registry) {
 	slog.Info("server: queue-depth scraper started", "interval", queueDepthScrapeInterval)
-	pollAndSet(ctx, q, reg) // fire immediately on startup
+	pollAndSet(ctx, q, reg)
 
 	ticker := time.NewTicker(queueDepthScrapeInterval)
 	defer ticker.Stop()

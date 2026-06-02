@@ -189,8 +189,8 @@ write, Docker socket permission). All documented in TASK.md.
 ## Phase 5 — Advanced Benchmarking
 
 > **Status: 🔄 In Progress**
-> Stage 5.1 through Stage 5.4 are ✅ complete and tested.
-> **Current Focus: Implementing Stage 5.6 (Dry-run Validator).**
+> Stage 5.1 through Stage 5.7 are ✅ complete and tested.
+> **Current Focus: Implementing Stage 5.8 (WebSocket Bot Transport).**
 > See TASK.md for full analysis.
 
 ### Goal
