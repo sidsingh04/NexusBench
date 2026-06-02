@@ -23,11 +23,19 @@ type FleetConfig struct {
 	TestDuration time.Duration
 
 	// TargetURL is the base URL of the contestant's engine.
-	// Example: "http://localhost:20001"
+	//   REST:      "http://host:port"
+	//   WebSocket: "ws://host:port/path"
 	TargetURL string
 
-	// PerBotHTTPTimeout is the per-request HTTP timeout for each bot.
-	// Default: 2s (tight enough to detect latency regressions).
+	// Protocol selects the BotTransport implementation.
+	//   "rest"      → RESTTransport (default, backward compatible)
+	//   "websocket" → WebSocketTransport
+	// Empty string defaults to "rest".
+	Protocol string
+
+	// PerBotHTTPTimeout is the per-request HTTP timeout for REST bots.
+	// Ignored for WebSocket bots (which use a per-send deadline instead).
+	// Default: 2s.
 	PerBotHTTPTimeout time.Duration
 
 	// GeneratorConfig controls order generation for every bot.
@@ -37,12 +45,14 @@ type FleetConfig struct {
 }
 
 // DefaultFleetConfig returns production defaults.
+// Protocol defaults to "rest" — existing callers are unaffected.
 func DefaultFleetConfig(targetURL string) FleetConfig {
 	return FleetConfig{
 		BotCount:          100,
 		RampUpDuration:    5 * time.Second,
 		TestDuration:      60 * time.Second,
 		TargetURL:         targetURL,
+		Protocol:          "rest",
 		PerBotHTTPTimeout: 2 * time.Second,
 		GeneratorConfig:   DefaultRandomGeneratorConfig(),
 	}
@@ -61,6 +71,15 @@ func (c *FleetConfig) Validate() error {
 	}
 	if err := c.GeneratorConfig.Ratios.Validate(); err != nil {
 		return fmt.Errorf("fleet: %w", err)
+	}
+	protocol := c.Protocol
+	if protocol == "" {
+		protocol = "rest"
+	}
+	switch protocol {
+	case "rest", "websocket":
+	default:
+		return fmt.Errorf("fleet: unsupported Protocol %q (want \"rest\" or \"websocket\")", protocol)
 	}
 	return nil
 }
@@ -102,13 +121,17 @@ func NewFleet(cfg FleetConfig) (*Fleet, error) {
 // After RampUpDuration+TestDuration the root context is canceled, which
 // causes every bot's Run loop to return.
 //
+// Each bot's transport is closed after the bot finishes (via bot.Close()).
+// For REST bots this is a no-op. For WebSocket bots it closes the TCP
+// connection, preventing file-descriptor and goroutine leaks.
+//
 // The outer ctx controls the maximum wall-clock time including ramp-up.
 // If ctx is canceled before the test completes, Run returns immediately with
 // whatever results have been collected so far.
 func (f *Fleet) Run(ctx context.Context) (*FleetResult, error) {
 	startedAt := time.Now()
 
-	// Per-bot HTTP client with its own timeout.
+	// Per-bot HTTP client with its own timeout (REST only).
 	httpClient := &http.Client{Timeout: f.cfg.PerBotHTTPTimeout}
 
 	// testCtx is canceled when the test duration (+ ramp-up) elapses.
@@ -145,11 +168,14 @@ func (f *Fleet) Run(ctx context.Context) (*FleetResult, error) {
 
 			bot, err := f.newBot(idx, httpClient)
 			if err != nil {
-				// Construction failure is a programming error, not a runtime one.
-				// Log would be nice but we have no logger here — return nil results.
 				resultsCh <- nil
 				return
 			}
+
+			// Always close the transport after the bot finishes, regardless
+			// of how Run exits. For REST this is a no-op; for WebSocket it
+			// closes the TCP connection and frees the OS file descriptor.
+			defer bot.Close() //nolint:errcheck
 
 			resultsCh <- bot.Run(testCtx)
 		}(i)
@@ -178,8 +204,12 @@ func (f *Fleet) Run(ctx context.Context) (*FleetResult, error) {
 	}, nil
 }
 
-// newBot constructs a single Bot for the given index.
-// idx is used to derive a unique seed and bot ID.
+// newBot constructs a single Bot for the given index, selecting the transport
+// based on FleetConfig.Protocol.
+//
+// For REST bots the shared httpClient is reused across bots (connection pool).
+// For WebSocket bots a new TCP connection is established per bot — each bot
+// requires its own persistent connection to the engine.
 func (f *Fleet) newBot(idx int, httpClient *http.Client) (*Bot, error) {
 	botID := fmt.Sprintf("bot-%04d", idx)
 
@@ -198,7 +228,23 @@ func (f *Fleet) newBot(idx int, httpClient *http.Client) (*Bot, error) {
 		return nil, fmt.Errorf("fleet: bot %d: generator: %w", idx, err)
 	}
 
-	transport := NewRESTTransport(f.cfg.TargetURL, httpClient)
+	// Select transport based on protocol.
+	// The Protocol field defaults to "rest" when empty for backward compat.
+	protocol := f.cfg.Protocol
+	if protocol == "" {
+		protocol = "rest"
+	}
+
+	var transport BotTransport
+	switch protocol {
+	case "websocket":
+		transport, err = NewWebSocketTransport(f.cfg.TargetURL)
+		if err != nil {
+			return nil, fmt.Errorf("fleet: bot %d: websocket transport: %w", idx, err)
+		}
+	default: // "rest" or empty
+		transport = NewRESTTransport(f.cfg.TargetURL, httpClient)
+	}
 
 	return NewBot(botID, gen, transport)
 }

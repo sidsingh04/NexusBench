@@ -53,7 +53,7 @@ Stage 5.4  Volatility-aware scoring            ✅ COMPLETE
 Stage 5.5  Sequential three-job dispatch       ✅ COMPLETE
 Stage 5.6  Dry-run Validator                   ✅ COMPLETE
 Stage 5.7  SSE live leaderboard                ✅ COMPLETE
-Stage 5.8  WebSocket BotTransport              (new transport, BotTransport.Close)
+Stage 5.8  WebSocket BotTransport              ✅ COMPLETE
 Stage 5.9  PostgreSQL ContestStore             (replace MemoryContestStore in prod)
 Stage 5.10 Integration smoke test              (full system run)
 ```
@@ -949,9 +949,10 @@ curl -N localhost:8080/api/v1/leaderboard/stream
 # → prints "data: {"type":"frozen",...}" and closes
 ```
 
-> [!WARNING]
-> **Architectural Dilemma Identified (Phase 5.7):**
-> Section 5.7.3 mandates that the worker's `computeAndWriteFinalScore` calls `bus.Broadcast(contest.LeaderboardEvent{Type: "update", ...})`. However, in Phase 5.5, the Worker was split into a standalone distributed process (`cmd/worker/main.go`). It does not share memory with the Control Plane (`cmd/server/main.go`), meaning it cannot physically invoke the in-memory `LeaderboardBus` owned by the server. Furthermore, the logic to build the full leaderboard (`buildLeaderboardEntries`) is unexported in `cmd/server`. Currently, this means live `update` events are NOT pushed mid-stream on submission completion because the worker lacks an IPC/webhook mechanism to notify the Control Plane's memory bus. See the `walkthrough.md` artifact for a detailed analysis of this issue so it can be resolved in a future stage.
+> [!NOTE]
+> **Architectural Dilemma & Solution (Phase 5.7):**
+> **The Problem:** Section 5.7.3 mandates that the worker's `computeAndWriteFinalScore` triggers the live SSE leaderboard update. However, because the Worker was isolated into a standalone distributed process (`cmd/worker`), it does not share memory with the Control Plane (`cmd/server`) and therefore cannot physically invoke the in-memory `LeaderboardBus` to push the update.
+> **The Solution:** Instead of introducing heavy infrastructure like Redis PubSub or fragile worker-to-server webhooks, we extended an existing Control Plane polling pattern. We added a `runLeaderboardWatcher` goroutine in `cmd/server/main.go` that polls the `submission.Store` every 5 seconds. To optimize this, the watcher skips database reads entirely if `bus.SubscriberCount() == 0`. When clients are connected, it computes a cheap float64 hash of completed scores and only broadcasts an `update` event when the hash changes. This cleanly solves the IPC problem with zero new dependencies while keeping the worker completely decoupled.
 
 
 ---

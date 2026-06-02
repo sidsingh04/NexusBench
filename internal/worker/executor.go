@@ -87,7 +87,7 @@ func WithHealthPollInterval(d time.Duration) ExecutorOption {
 }
 
 // WithSandboxHost sets the hostname the executor uses to build the bot fleet
-// target URL (http://<sandboxHost>:<hostPort>).
+// target URL.
 //
 // When the worker runs inside a Docker container, sandbox port bindings are
 // published on the HOST's network interface — not on localhost inside the
@@ -95,7 +95,7 @@ func WithHealthPollInterval(d time.Duration) ExecutorOption {
 //
 //	"host-gateway"  — Docker Desktop (Windows/Mac)
 //	"172.17.0.1"    — Linux Docker Engine default bridge
-//	"localhost"      — Non-containerised local dev (default)
+//	"localhost"     — Non-containerised local dev (default)
 func WithSandboxHost(host string) ExecutorOption {
 	return func(e *SandboxExecutor) {
 		if host != "" {
@@ -153,7 +153,7 @@ func WithContestStore(cq ContestQuerier) ExecutorOption {
 //  2. Deploy sandbox container.
 //  3. Persist container metadata.
 //  4. Wait for container to become healthy.
-//  5. Run the bot fleet (profile-aware if Phase 5).
+//  5. Run the bot fleet (profile-aware if Phase 5, protocol-aware always).
 //  6. Compute correctness score.
 //  7. Build BenchmarkResults (profile-aware scoring if Phase 5).
 //  8. Persist results to sub.AllResults (Phase 5) or sub.Results (Phase 1–4).
@@ -200,7 +200,7 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 		return nil, fmt.Errorf("executor: deploy sandbox for %s: %w", j.SubmissionID, err)
 	}
 
-	// ── 10. Cleanup — always stop the container when Execute returns ───────────
+	// ── 10. Cleanup — always stop the container when Execute returns ──────────
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -257,8 +257,19 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 		}
 	}
 
-	targetURL := fmt.Sprintf("http://%s:%d", e.sandboxHost, hostPort)
-	fleetResult, correctnessResult, err := e.runFleet(ctx, j, targetURL, profile, log)
+	// Build the target URL for the bot fleet. The scheme depends on the
+	// submission's Protocol field:
+	//   REST      → http://host:port   (RESTTransport)
+	//   WebSocket → ws://host:port     (WebSocketTransport)
+	// The fleet config reads cfg.Protocol to pick the correct BotTransport
+	// implementation; the URL scheme must be consistent with that choice.
+	targetURL := targetURLForProtocol(sub.Protocol, e.sandboxHost, hostPort)
+	log.Info("executor: target URL resolved",
+		"protocol", sub.Protocol,
+		"target_url", targetURL,
+	)
+
+	fleetResult, correctnessResult, err := e.runFleet(ctx, j, targetURL, sub.Protocol, profile, log)
 	if err != nil {
 		return nil, fmt.Errorf("executor: bot fleet: %w", err)
 	}
@@ -311,6 +322,27 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 	return results, nil
 }
 
+// targetURLForProtocol builds the target URL for the bot fleet based on the
+// submission's declared protocol.
+//
+//   - REST (default, backward compat): "http://host:port"
+//   - WebSocket:                       "ws://host:port"
+//
+// The /orders path suffix is intentionally omitted here: REST sends to
+// /orders as a hardcoded path in RESTTransport.Send; WebSocketTransport uses
+// the path from the URL during the upgrade handshake (and /orders is the
+// conventional path). Both handle this internally, so the executor need not
+// repeat the path.
+func targetURLForProtocol(protocol models.Protocol, host string, port int) string {
+	switch protocol {
+	case models.ProtocolWebSocket:
+		return fmt.Sprintf("ws://%s:%d/orders", host, port)
+	default:
+		// REST, FIX (not yet implemented), or empty — all fall back to HTTP.
+		return fmt.Sprintf("http://%s:%d", host, port)
+	}
+}
+
 // appendProfileResult reloads the submission from the store (to pick up any
 // concurrent writes from previous profile jobs), appends the new result to
 // AllResults, and persists the updated submission.
@@ -343,10 +375,6 @@ func (e *SandboxExecutor) appendProfileResult(
 
 // enqueueNextProfile constructs and enqueues the job for the next volatility
 // profile in the chain. Called after each non-final profile run commits.
-//
-// If the queue is nil (local-only mode), the next job cannot be enqueued;
-// the submission is marked Failed and an error is returned so the caller
-// surfaces it as a terminal outcome.
 func (e *SandboxExecutor) enqueueNextProfile(
 	ctx context.Context,
 	sub *models.Submission,
@@ -365,10 +393,6 @@ func (e *SandboxExecutor) enqueueNextProfile(
 	nextJob := queue.NewProfileJob(sub, j.ContestID, nextLabel, remaining)
 
 	if e.jobQueue == nil {
-		// Local mode: no queue to enqueue into. Mark the submission failed so
-		// the team knows to resubmit. This path is only hit if a Phase 5 job
-		// somehow reaches a local-mode worker — which should not happen in a
-		// correctly configured deployment.
 		log.Error("executor: cannot enqueue next profile — no job queue configured (local mode?)",
 			"next_label", nextLabel)
 		e.markFailed(sub, fmt.Sprintf(
@@ -394,22 +418,12 @@ func (e *SandboxExecutor) enqueueNextProfile(
 // computeAndWriteFinalScore aggregates the three RunScores from AllResults
 // using the contest's aggregate weights and writes the result to the
 // submission store.
-//
-// If the active contest cannot be loaded (e.g. it was closed between the last
-// profile run starting and this call), default weights (0.20/0.35/0.45) are
-// used so the submission still receives a score rather than being silently
-// zeroed.
-//
-// This method does not return an error — a FinalScore computation failure is
-// non-fatal. The submission remains StatusCompleted and the partial/zero
-// FinalScore is visible to operators via the store.
 func (e *SandboxExecutor) computeAndWriteFinalScore(
 	ctx context.Context,
 	sub *models.Submission,
 	j queue.Job,
 	log *slog.Logger,
 ) {
-	// Re-read so we have the complete AllResults slice (all three profiles).
 	fresh, err := e.store.Get(sub.ID)
 	if err != nil {
 		log.Error("executor: computeAndWriteFinalScore: cannot reload submission",
@@ -417,8 +431,7 @@ func (e *SandboxExecutor) computeAndWriteFinalScore(
 		return
 	}
 
-	// Resolve aggregate weights from the contest if available.
-	lowW, medW, highW := 0.20, 0.35, 0.45 // sensible defaults
+	lowW, medW, highW := 0.20, 0.35, 0.45
 	if e.contestQuerier != nil {
 		if contest, cerr := e.contestQuerier.GetActive(ctx); cerr == nil {
 			lowW = contest.LowWeight
@@ -430,8 +443,6 @@ func (e *SandboxExecutor) computeAndWriteFinalScore(
 		}
 	}
 
-	// safeScore returns the RunScore for a label, or 0.0 if the result is
-	// missing (e.g. a prior profile job failed and wrote no result).
 	safeScore := func(label string) float64 {
 		if r := fresh.ResultByLabel(label); r != nil {
 			return r.RunScore
@@ -455,18 +466,13 @@ func (e *SandboxExecutor) computeAndWriteFinalScore(
 	)
 
 	fresh.FinalScore = finalScore
-	// AllResults is already set; we only update FinalScore here.
-	// Status is set to StatusCompleted by worker.processJob after Execute returns.
 	if updateErr := e.store.Update(fresh); updateErr != nil {
 		log.Error("executor: failed to persist FinalScore",
 			"submission_id", fresh.ID, "err", updateErr)
 	}
 }
 
-// markFailed writes StatusFailed to the submission store. Called on
-// non-recoverable errors in the Phase 5 dispatch chain (e.g. enqueue failure).
-// Errors from the store write are logged but not propagated — the caller
-// already has a terminal error to return.
+// markFailed writes StatusFailed to the submission store.
 func (e *SandboxExecutor) markFailed(sub *models.Submission, msg string) {
 	sub.Status = models.StatusFailed
 	sub.StatusMsg = msg
@@ -477,30 +483,43 @@ func (e *SandboxExecutor) markFailed(sub *models.Submission, msg string) {
 }
 
 // runFleet constructs and runs the bot fleet with the correct configuration
-// for this job:
-//   - Phase 5 (label != "" and profile non-zero): uses buildFleetConfigFromProfile.
-//   - Phase 5 (label != "" but profile is zero due to contest unavailability):
-//     falls back to DefaultFleetConfig so the run still produces results.
-//   - Phase 1–4 (label == ""): uses fleetCfgOverride (tests) or DefaultFleetConfig.
+// for this job. The protocol parameter is read from the submission and
+// propagated into the FleetConfig so newBot selects the correct transport.
+//
+//   - Phase 5, profile resolved: buildFleetConfigFromProfile (profile-aware).
+//   - Phase 5, profile unavailable: buildFleetConfig (falls back to defaults).
+//   - Phase 1–4 (label == ""): buildFleetConfig (fleetCfgOverride or defaults).
+//
+// In all cases, protocol is threaded through so WebSocket submissions use
+// WebSocketTransport regardless of which config path is taken.
 func (e *SandboxExecutor) runFleet(
 	ctx context.Context,
 	j queue.Job,
 	targetURL string,
+	protocol models.Protocol,
 	profile models.VolatilityProfile,
 	log *slog.Logger,
 ) (*botfleet.FleetResult, *correctness.CorrectnessResult, error) {
 
 	var cfg botfleet.FleetConfig
 	if j.VolatilityLabel != "" && profile.BotCount > 0 {
-		// Phase 5: profile successfully resolved — use profile-derived config.
 		cfg = buildFleetConfigFromProfile(targetURL, profile)
 	} else {
-		// Phase 1–4, or Phase 5 with unavailable profile: fall back.
 		cfg = e.buildFleetConfig(targetURL)
 	}
 
+	// Stage 5.8: set the protocol on the fleet config so Fleet.newBot picks
+	// the correct BotTransport. This is the single place where the submission's
+	// Protocol field reaches the transport layer.
+	//
+	// Backward compat: if protocol is empty or "rest" (Phase 1–4 submissions
+	// that pre-date the Protocol field), cfg.Protocol stays "" which defaults
+	// to "rest" inside Fleet.newBot. No change in behavior.
+	cfg.Protocol = string(protocol)
+
 	log.Info("executor: launching bot fleet",
 		"target_url", targetURL,
+		"protocol", cfg.Protocol,
 		"bot_count", cfg.BotCount,
 		"test_duration", cfg.TestDuration,
 	)
@@ -531,9 +550,8 @@ func (e *SandboxExecutor) runFleet(
 // buildFleetConfig returns the fleet configuration for Phase 1–4 jobs (or
 // Phase 5 jobs where the profile could not be resolved).
 //
-// Priority:
-//  1. fleetCfgOverride — set via WithFleetConfig; used in tests and dry-run.
-//  2. botfleet.DefaultFleetConfig.
+// Priority: fleetCfgOverride (tests/dry-run) → DefaultFleetConfig.
+// Protocol is NOT set here; it is applied by runFleet after construction.
 func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfig {
 	if e.fleetCfgOverride != nil {
 		cfg := *e.fleetCfgOverride
@@ -545,6 +563,7 @@ func (e *SandboxExecutor) buildFleetConfig(targetURL string) botfleet.FleetConfi
 
 // buildFleetConfigFromProfile translates a VolatilityProfile into the
 // botfleet.FleetConfig used for a Phase 5 benchmark run.
+// Protocol is NOT set here; it is applied by runFleet after construction.
 func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) botfleet.FleetConfig {
 	return botfleet.FleetConfig{
 		BotCount:          p.BotCount,
@@ -573,7 +592,6 @@ func buildFleetConfigFromProfile(targetURL string, p models.VolatilityProfile) b
 // buildResults converts fleet + correctness data into models.BenchmarkResults.
 //
 // Dispatch logic (keyed on label):
-//
 //   - label == "" (Phase 1–4): legacy hardcoded constants; CompositeScore set.
 //   - label != "" (Phase 5): profile-aware targets; RunScore set (0.0–1.0).
 //     CompositeScore = RunScore×100 for legacy leaderboard handler compat.

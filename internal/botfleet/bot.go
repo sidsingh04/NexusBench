@@ -7,27 +7,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
 // BotTransport is the interface between a Bot and the contestant's engine.
-// The default implementation is RESTTransport (HTTP/JSON). Future stages will
-// add FIXTransport and WebSocketTransport without changing Bot.
 //
-// Implementations must be goroutine-safe — each Bot owns its own transport
-// instance, but future pool implementations may share transports.
+// Each Bot owns its own BotTransport instance. Implementations are not
+// required to be goroutine-safe — concurrent access is prevented by the
+// one-bot-one-transport ownership model.
+//
+// Stage 5.8 adds Close() to allow WebSocket connections (which are persistent)
+// to be cleanly torn down after a fleet run. REST implementations return nil
+// immediately — this is a backward-compatible extension because the Fleet
+// calls Close() via Bot.Close() after Run returns, and the existing call site
+// in fleet.go is the only caller.
 type BotTransport interface {
 	// Send transmits o to the engine and returns the Fill response.
 	// Returns an error for any transport failure (timeout, connection refused,
-	// non-2xx status that cannot be decoded as a Fill).
+	// non-2xx status, malformed response).
 	// Send must respect ctx cancellation.
 	Send(ctx context.Context, o Order) (Fill, error)
+
+	// Close releases any persistent resources held by this transport.
+	// REST implementations return nil immediately (HTTP is connection-pooled
+	// by the http.Client and does not require explicit teardown per order).
+	// WebSocket implementations close the underlying TCP connection.
+	// Safe to call multiple times — subsequent calls after the first are no-ops.
+	Close() error
 }
 
 // ── RESTTransport ─────────────────────────────────────────────────────────────
 
 // restOrderRequest is the JSON body sent to the contestant's REST endpoint.
-// The schema is intentionally simple — contestants are told to expect this.
 type restOrderRequest struct {
 	OrderID  string `json:"order_id"`
 	Kind     string `json:"kind"`
@@ -45,8 +57,9 @@ type restOrderResponse struct {
 }
 
 // RESTTransport implements BotTransport over HTTP/JSON.
-// POST /orders   → submit a new Limit or Market order
-// DELETE /orders → submit a cancel
+//
+//	POST   /orders → submit a new Limit or Market order
+//	DELETE /orders → submit a cancel
 //
 // The zero value is NOT valid. Use NewRESTTransport.
 type RESTTransport struct {
@@ -55,8 +68,7 @@ type RESTTransport struct {
 }
 
 // NewRESTTransport constructs a RESTTransport targeting the given base URL
-// (e.g. "http://localhost:20001"). The provided http.Client controls timeouts;
-// pass nil to use a default 5-second timeout client.
+// (e.g. "http://localhost:20001"). Pass nil to use a default 5-second client.
 func NewRESTTransport(baseURL string, client *http.Client) *RESTTransport {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
@@ -64,7 +76,7 @@ func NewRESTTransport(baseURL string, client *http.Client) *RESTTransport {
 	return &RESTTransport{baseURL: baseURL, client: client}
 }
 
-// Send serializes o to JSON, POSTs it to the engine, and decodes the response.
+// Send serializes o to JSON, POSTs it to the engine, and decodes the fill.
 func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 	reqBody := restOrderRequest{
 		OrderID:  o.ID,
@@ -114,6 +126,11 @@ func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 	}, nil
 }
 
+// Close is a no-op for RESTTransport. The underlying http.Client manages its
+// connection pool automatically; no explicit teardown is required per transport
+// instance.
+func (t *RESTTransport) Close() error { return nil }
+
 // ── Bot ───────────────────────────────────────────────────────────────────────
 
 // Bot is a single virtual trading participant. It runs a tight loop:
@@ -150,7 +167,6 @@ func (b *Bot) Run(ctx context.Context) []OrderResult {
 	var results []OrderResult
 
 	for {
-		// Check for cancellation before generating the next order.
 		select {
 		case <-ctx.Done():
 			return results
@@ -178,4 +194,27 @@ func (b *Bot) Run(ctx context.Context) []OrderResult {
 
 		results = append(results, r)
 	}
+}
+
+// Close tears down the bot's transport. Called by Fleet after Run returns.
+// It is safe to call Close concurrently with other goroutines — the transport
+// implementation is responsible for its own close-once semantics.
+func (b *Bot) Close() error {
+	return b.transport.Close()
+}
+
+// ── closeOnce ─────────────────────────────────────────────────────────────────
+
+// closeOnce wraps any BotTransport and ensures Close() is idempotent.
+// Embedded in WebSocketTransport so WebSocket-specific close logic doesn't
+// need to repeat the sync.Once pattern.
+type closeOnce struct {
+	once sync.Once
+	fn   func() error
+	err  error
+}
+
+func (c *closeOnce) do() error {
+	c.once.Do(func() { c.err = c.fn() })
+	return c.err
 }
