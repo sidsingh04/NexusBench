@@ -164,7 +164,7 @@ func main() {
 
 	// ── Leaderboard watcher (Stage 5.7 — cross-process update bridge) ─────────
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
-	go runLeaderboardWatcher(watcherCtx, store, bus)
+	go runLeaderboardWatcher(watcherCtx, store, bus, contestSvc)
 	defer watcherCancel()
 
 	// ── Auto-close goroutine (AD-3: hybrid drain-and-wait) ────────────────────
@@ -184,7 +184,7 @@ func main() {
 		Addr:         cfg.ListenAddr,
 		Handler:      router,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: 10 * time.Minute,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -304,7 +304,7 @@ func safeDSNPrefix(dsn string) string {
 // a bus.Broadcast("update") only when the hash changes.
 //
 // See Stage 5.7 in PROGRESS.md for the full architectural rationale.
-func runLeaderboardWatcher(ctx context.Context, store submission.Store, bus *api.LeaderboardBus) {
+func runLeaderboardWatcher(ctx context.Context, store submission.Store, bus *api.LeaderboardBus, contestSvc *contest.ContestService) {
 	slog.Info("server: leaderboard watcher started", "interval", leaderboardWatchInterval)
 	ticker := time.NewTicker(leaderboardWatchInterval)
 	defer ticker.Stop()
@@ -317,14 +317,16 @@ func runLeaderboardWatcher(ctx context.Context, store submission.Store, bus *api
 			slog.Info("server: leaderboard watcher stopped")
 			return
 		case <-ticker.C:
-			lastHash = tickLeaderboardWatcher(store, bus, lastHash)
+			lastHash = tickLeaderboardWatcher(ctx, store, bus, contestSvc, lastHash)
 		}
 	}
 }
 
 func tickLeaderboardWatcher(
+	ctx context.Context,
 	store submission.Store,
 	bus *api.LeaderboardBus,
+	contestSvc *contest.ContestService,
 	lastHash float64,
 ) float64 {
 	if bus.SubscriberCount() == 0 {
@@ -340,11 +342,18 @@ func tickLeaderboardWatcher(
 		return lastHash
 	}
 
-	entries := buildLeaderboardEntries(context.Background(), store, "")
+	var activeID string
+	if contestSvc != nil {
+		if active, err := contestSvc.GetActive(ctx); err == nil {
+			activeID = active.ID
+		}
+	}
+
+	entries := buildLeaderboardEntries(context.Background(), store, activeID)
 	ptrs := make([]*models.LeaderboardEntry, len(entries))
 	copy(ptrs, entries)
 
-	bus.Broadcast(contest.LeaderboardEvent{Type: "update", Entries: ptrs})
+	bus.Broadcast(contest.LeaderboardEvent{Type: "update", ContestID: activeID, Entries: ptrs})
 
 	slog.Debug("server: leaderboard watcher: broadcast sent",
 		"subscriber_count", bus.SubscriberCount(),
@@ -363,7 +372,7 @@ func leaderboardHash(subs []*models.Submission) float64 {
 		if score == 0 && s.Results != nil {
 			score = s.Results.CompositeScore
 		}
-		sum += math.Round(score*1e6) / 1e6
+		sum += 1.0 + math.Round(score*1e6)/1e6
 	}
 	return sum
 }
@@ -486,9 +495,6 @@ func buildLeaderboardEntries(
 		score := s.FinalScore
 		if score == 0 && s.Results != nil {
 			score = s.Results.CompositeScore
-		}
-		if score == 0 {
-			continue
 		}
 		if ex, ok := best[s.TeamName]; !ok || score > ex.score {
 			best[s.TeamName] = candidate{sub: s, score: score}

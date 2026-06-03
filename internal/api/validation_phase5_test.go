@@ -98,10 +98,17 @@ func TestValidate_Success(t *testing.T) {
 	}
 }
 
-func TestValidate_BenchmarkingConflict(t *testing.T) {
+func TestValidate_BenchmarkingAllowed(t *testing.T) {
 	t.Parallel()
 
-	router, store := setupValidationRouter(t, nil)
+	expectedResult := &api.ValidatorResult{
+		AllPassed: true,
+		Scenarios: []api.ScenarioResult{},
+		TestedAt:  time.Now().UTC(),
+	}
+
+	runner := &mockValidatorRunner{result: expectedResult}
+	router, store := setupValidationRouter(t, runner)
 
 	sub := &models.Submission{
 		ID:          "test-sub-conflict",
@@ -115,13 +122,15 @@ func TestValidate_BenchmarkingConflict(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("expected 409 Conflict, got %d", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
 	}
-	var apiErr models.APIError
-	_ = json.NewDecoder(rr.Body).Decode(&apiErr)
-	if apiErr.Code != "VALIDATION_CONFLICT" {
-		t.Errorf("expected VALIDATION_CONFLICT, got %s", apiErr.Code)
+	var result api.ValidatorResult
+	if err := json.NewDecoder(rr.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if result.SubmissionID != "test-sub-conflict" {
+		t.Errorf("expected SubmissionID test-sub-conflict, got %s", result.SubmissionID)
 	}
 }
 

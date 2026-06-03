@@ -1,0 +1,149 @@
+# k8s/postgres/statefulset.yaml
+#
+# PostgreSQL StatefulSet — durable contest store for Phase 5+.
+#
+# Purpose:
+#   Stores contest lifecycle data (contests table, leaderboard snapshots).
+#   Separate from TimescaleDB (which stores time-series latency telemetry)
+#   because contest data requires transactional guarantees on status transitions
+#   that TimescaleDB's hypertable model is not optimised for.
+#
+# Security model (matches TimescaleDB StatefulSet conventions from Phase 4):
+#   - Runs as uid 999 (postgres user in the official postgres:16-alpine image).
+#   - All Linux capabilities dropped.
+#   - allowPrivilegeEscalation: false.
+#   - readOnlyRootFilesystem cannot be set because initdb writes to /tmp and
+#     /var/run/postgresql; both are covered by emptyDir volume mounts.
+#   - Scheduled on the control-plane node pool — stateful, must not land on
+#     preemptible spot worker nodes.
+#
+# Access restriction:
+#   Only the control-plane pod connects to this database.
+#   Workers have no path to PostgreSQL (enforced by NetworkPolicy).
+#   See k8s/network-policies/allow-postgres-ingress.yaml.
+#
+# Resource sizing:
+#   Contest records are tiny (< 1KB per contest, < 100KB per snapshot).
+#   Even at 10,000 contests, the working set fits in 512Mi RAM with room to spare.
+#   Limits are conservatively set to protect the control-plane node pool.
+#
+# Single replica:
+#   PostgreSQL open-source has no built-in multi-master mode. A standby replica
+#   for HA is out of scope for the hackathon. Durability is provided by the PVC
+#   (persistent disk with three-way replication in GKE), not by replica count.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: nexusbench
+    spec:
+      # Schedule on control-plane node pool — do not allow eviction onto
+      # preemptible worker nodes.
+      nodeSelector:
+        role: control-plane
+
+      terminationGracePeriodSeconds: 60
+
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: nexusbench
+            - name: POSTGRES_USER
+              value: nexusbench
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexusbench-secrets
+                  key: postgres-password
+            # PGDATA points PostgreSQL at a subdirectory of the mounted PVC.
+            # Using a subdirectory avoids the "lost+found" incompatibility
+            # that occurs when PGDATA points directly at a volume root on some
+            # storage providers.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "250m"
+              memory: "512Mi"
+
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - nexusbench
+                - -d
+                - nexusbench
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - nexusbench
+                - -d
+                - nexusbench
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            # tmpfs for PostgreSQL socket, lock files, and temp work during
+            # initdb. Keeps ephemeral writes off the persistent disk and out
+            # of the root filesystem.
+            - name: pg-run
+              mountPath: /var/run/postgresql
+            - name: pg-tmp
+              mountPath: /tmp
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 999     # postgres uid in postgres:16-alpine
+            runAsGroup: 999
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: pg-run
+          emptyDir:
+            medium: Memory
+        - name: pg-tmp
+          emptyDir:
+            medium: Memory

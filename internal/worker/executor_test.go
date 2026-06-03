@@ -76,7 +76,7 @@ func miniFleetConfig() botfleet.FleetConfig {
 	return botfleet.FleetConfig{
 		BotCount:          2,
 		RampUpDuration:    0,
-		TestDuration:      50 * time.Millisecond,
+		TestDuration:      500 * time.Millisecond,
 		PerBotHTTPTimeout: time.Second,
 		GeneratorConfig:   botfleet.DefaultRandomGeneratorConfig(),
 	}

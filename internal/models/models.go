@@ -319,7 +319,7 @@ type LeaderboardEntry struct {
 
 	// FinalScore is the weighted aggregate scaled 0–100.
 	// This is the primary ranking key for Phase 5+ contests.
-	FinalScore float64 `json:"final_score,omitempty"`
+	FinalScore float64 `json:"final_score"`
 
 	// Diagnostic columns shown on the leaderboard.
 	BestP99Ms        float64 `json:"best_p99_ms,omitempty"`

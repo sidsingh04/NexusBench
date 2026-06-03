@@ -46,7 +46,8 @@ type handler struct {
 // contestHandler handles all /api/v1/admin/contests/* routes.
 // It contains no business logic — all lifecycle decisions live in ContestService.
 type contestHandler struct {
-	svc *contest.ContestService
+	svc    *contest.ContestService
+	subSvc *submission.Service
 }
 
 // ── Dry-run Validator (Stage 5.6) ─────────────────────────────────────────────
@@ -110,18 +111,19 @@ func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sub.Status == models.StatusBenchmarking {
-		writeError(w, http.StatusConflict, "VALIDATION_CONFLICT",
-			"submission is currently being benchmarked; please wait until it completes")
-		return
-	}
-
 	if !vh.limiter.allow(id) {
 		retryAfter := vh.limiter.retryAfter(id)
 		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 		writeError(w, http.StatusTooManyRequests, "TOO_MANY_REQUESTS",
 			fmt.Sprintf("validation rate limit: one request per 2 minutes per submission; retry after %.0f seconds",
 				retryAfter.Seconds()))
+		return
+	}
+
+	if sub.Status != models.StatusPending && sub.Status != models.StatusBenchmarking {
+		// ALREADY completed or failed.
+		vh.limiter.revoke(id)
+		writeError(w, http.StatusConflict, "WRONG_STATUS", "submission is not in 'pending' or 'benchmarking' status")
 		return
 	}
 
@@ -379,7 +381,7 @@ func NewRouter(
 
 	// ── Admin routes (Phase 5) ────────────────────────────────────────────────
 	if contestSvc != nil && cfg.AdminAPIKey != "" {
-		ch := &contestHandler{svc: contestSvc}
+		ch := &contestHandler{svc: contestSvc, subSvc: svc}
 		admin := v1.PathPrefix("/admin").Subrouter()
 		admin.Use(adminAuthMiddleware(cfg.AdminAPIKey))
 
@@ -523,9 +525,6 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 		effectiveScore := sub.FinalScore
 		if effectiveScore == 0 && sub.Results != nil {
 			effectiveScore = sub.Results.CompositeScore
-		}
-		if effectiveScore == 0 {
-			continue
 		}
 
 		entry := buildLeaderboardEntry(sub, effectiveScore)
@@ -832,7 +831,16 @@ func (h *contestHandler) activateContest(w http.ResponseWriter, r *http.Request)
 // passes nil entries — the service handles the nil case gracefully.
 func (h *contestHandler) closeContest(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	if err := h.svc.Close(r.Context(), id, nil); err != nil {
+
+	var ptrs []*models.LeaderboardEntry
+	if subs, err := h.subSvc.List(); err == nil {
+		entries := buildDedupedLeaderboard(subs)
+		for i := range entries {
+			ptrs = append(ptrs, &entries[i])
+		}
+	}
+
+	if err := h.svc.Close(r.Context(), id, ptrs); err != nil {
 		code, apiErr := classifyError(err)
 		writeError(w, code, apiErr.Code, apiErr.Message)
 		return

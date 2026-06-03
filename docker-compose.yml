@@ -280,6 +280,8 @@ services:
       WORKER_ID: "worker-1"
       ORCHESTRATOR_URL:     "http://control-plane:8080"
       REDPANDA_BROKERS:     "redpanda:9092"
+      DISTRIBUTED_MODE:     "true"
+      POSTGRES_DSN:         "postgres://nexusbench:nexusbench_dev@postgres:5432/nexusbench"
       SUBMISSION_DIR:       "/data/submissions"
       JOB_TIMEOUT:          "35m"
       SANDBOX_IMAGE_GO:     "nexusbench-sandbox-go:latest"

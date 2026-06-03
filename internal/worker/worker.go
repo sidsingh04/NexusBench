@@ -233,7 +233,7 @@ func (w *Worker) processJob(ctx context.Context, j queue.Job) {
 	jobCtx, cancel := context.WithTimeout(ctx, w.cfg.JobTimeout)
 	defer cancel()
 
-	w.setStatus(log, sub, models.StatusBenchmarking, "worker picked up job")
+	w.setStatus(log, sub, models.StatusDeploying, "worker picked up job")
 
 	results, execErr := w.executor.Execute(jobCtx, j)
 

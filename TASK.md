@@ -1,7 +1,7 @@
 # TASK.md — Phase 5: Advanced Benchmarking
 
-> **Status: ⏳ In Progress**
-> Phase 4 is ✅ complete. Begin Phase 5 only after `make ci` passes clean on
+> **Status: ✅ Complete**
+> Phase 5 is ✅ complete.
 > the Phase 4 codebase.
 
 ---
@@ -54,8 +54,8 @@ Stage 5.5  Sequential three-job dispatch       ✅ COMPLETE
 Stage 5.6  Dry-run Validator                   ✅ COMPLETE
 Stage 5.7  SSE live leaderboard                ✅ COMPLETE
 Stage 5.8  WebSocket BotTransport              ✅ COMPLETE
-Stage 5.9  PostgreSQL ContestStore             (replace MemoryContestStore in prod)
-Stage 5.10 Integration smoke test              (full system run)
+Stage 5.9  PostgreSQL ContestStore             ✅ COMPLETE
+Stage 5.10 Integration smoke test              ✅ COMPLETE
 ```
 
 Each stage is independently testable. Each stage gate is a `make test -race`
@@ -1148,8 +1148,9 @@ curl -X POST localhost:8080/api/v1/admin/contests \
 
 ---
 
-## Stage 5.10 — Integration Smoke Test
+## Stage 5.10 — Integration Smoke Test ✅ COMPLETE
 
+> **Completed.** Gate passed: `make test -race` passes, `scripts/smoke_test_phase5.sh --dry-run` and `--live` both pass.
 > **Touches:** new `scripts/smoke_test_phase5.sh`.
 > **New packages:** none.
 > **Tests required:** the smoke test script itself.

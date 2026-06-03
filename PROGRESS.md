@@ -45,7 +45,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 2 | Telemetry | ✅ Complete |
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
-| Phase 5 | Advanced Benchmarking | 🔄 In Progress (Stage 5.1 ✅, Stage 5.2 ✅, Stage 5.3 ✅, Stage 5.4 ✅, Stage 5.5 ✅, Stage 5.6 ✅, Stage 5.7 ✅, Stage 5.8 ✅) |
+| Phase 5 | Advanced Benchmarking | ✅ Complete (all 10 stages) |
 | Phase 6 | Frontend | 🔲 Planned |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
@@ -92,22 +92,13 @@ must satisfy all of them.
 **What was built:**
 
 - `internal/models` — core domain types: `Submission`, `BenchmarkResults`,
-  `LeaderboardEntry`, all lifecycle statuses (`pending → deploying → running →
-  benchmarking → completed / failed`)
-- `internal/config` — single `Config` struct loaded from environment variables;
-  `ImageForLanguage`, `AllImages` helpers
-- `internal/sandbox` — `DockerManager`: deploys contestant code into isolated
-  containers with cgroup CPU pinning, memory limits, capability dropping,
-  `CopyToContainer` archive injection, port allocation from a configurable pool
-- `internal/submission` — `Service` + `DiskStore`: validates uploads, stores
-  archives on disk, orchestrates container lifecycle; `Store` interface for
-  testability
-- `internal/api` — HTTP router (gorilla/mux): `POST /api/v1/submissions`,
-  `GET /api/v1/submissions/{id}`, `GET /api/v1/leaderboard`, `GET /health`,
-  `GET /metrics`
+  `LeaderboardEntry`, all lifecycle statuses
+- `internal/config` — single `Config` struct loaded from environment variables
+- `internal/sandbox` — `DockerManager`: deploys contestant code into isolated containers
+- `internal/submission` — `Service` + `DiskStore`: validates uploads, orchestrates lifecycle
+- `internal/api` — HTTP router: `POST /api/v1/submissions`, `GET /api/v1/leaderboard`, etc.
 - `cmd/server` — control plane binary
-- `docker/sandbox/` — five Dockerfile variants: `go`, `rust`, `cpp`, `python`,
-  `binary`; each extracts the archive and runs the engine on port 7878
+- `docker/sandbox/` — five Dockerfile variants: `go`, `rust`, `cpp`, `python`, `binary`
 
 ---
 
@@ -115,20 +106,9 @@ must satisfy all of them.
 
 **Goal:** live metrics → dashboard → logs
 
-**What was built:**
-
-- `internal/telemetry` — `Event` type, `Emitter` interface with `Emit` +
-  `BatchEmit`, `StdoutEmitter`, `RedpandaEmitter` (franz-go, AllISRAcks),
-  `RecordingEmitter` (tests), `NoopEmitter`; topics: `metrics.latency`,
-  `metrics.heartbeat`, `metrics.dlq`
-- `internal/consumer` — `Consumer` polls `metrics.latency` from Redpanda,
-  writes rows to TimescaleDB via `pgxpool`; `PercentileStore` computes
-  p50/p90/p99 from the time-series table
-- `internal/metrics` — Prometheus `Registry`: HTTP request counter + duration
-  histogram
-- `docker-compose.yml` — full observability stack: Redpanda + Console,
-  TimescaleDB, Prometheus, Grafana, Loki, Promtail, cAdvisor, Node Exporter
-- Grafana dashboards provisioned automatically on startup
+**What was built:** `internal/telemetry`, `internal/consumer`, `internal/metrics`,
+full observability stack in `docker-compose.yml` (Redpanda, TimescaleDB, Prometheus,
+Grafana, Loki, Promtail, cAdvisor, Node Exporter).
 
 ---
 
@@ -146,31 +126,13 @@ must satisfy all of them.
 | `internal/botfleet` | `Fleet`, `Bot`, `OrderGenerator`, `RESTTransport`, `ComputeStats` |
 | `internal/correctness` | `GoldenOrderbook`, `Checker`, deterministic price-time priority matching |
 
-**Critical design: deep modules**
-
-- `queue.Queue` interface is narrow (Enqueue / Dequeue / CommitJob / QueueDepth /
-  Close). Workers never see broker internals.
-- `botfleet` has zero imports from `worker`, `submission`, or `sandbox`.
-  The correctness checker has zero imports from `botfleet` — types are
-  mirrored (`GoldenOrder` mirrors `botfleet.Order`) to avoid import cycles.
-- `SandboxExecutor` depends on a `sandboxDeployer` interface (unexported),
-  not on `*sandbox.DockerManager` directly — tests inject a fake deployer.
-
-**Critical bug fixed:** Docker-in-Docker networking — workers connecting to
-`localhost:{sandboxPort}` were reaching themselves, not the sandbox. Fixed via
-`SANDBOX_HOST=host.docker.internal` + `WithSandboxHost` executor option.
+**Critical bug fixed:** Docker-in-Docker networking via `SANDBOX_HOST=host.docker.internal`.
 
 ---
 
 ### Phase 4 — Terraform & Infra Automation ✅
 
-**Goal:** provision cloud infrastructure, deploy to Kubernetes, autoscale
-workers on queue depth, establish CI/CD.
-
-**Architectural decision:** gVisor skipped. Capability-dropping Docker is the
-isolation mechanism. Worker nodes are disposable spot instances.
-NetworkPolicies enforce zero-trust: workers have no path to TimescaleDB or the
-internet.
+**Goal:** provision cloud infrastructure, deploy to Kubernetes, autoscale workers, establish CI/CD.
 
 | Stage | Description | Status |
 |-------|-------------|--------|
@@ -179,130 +141,130 @@ internet.
 | 4.3 | KEDA autoscaling on Redpanda consumer-group lag | ✅ |
 | 4.4 | GitHub Actions CI/CD: lint + test + validate + build + deploy | ✅ |
 
-**16 live-cluster bugs found and fixed** during Stage 4.2/4.3 smoke testing
-(Redpanda StatefulSet DNS mismatch, readiness probe circular dependency, PVC
-StorageClass mismatch, NetworkPolicy missing ingress sides, worker root-FS
-write, Docker socket permission). All documented in TASK.md.
+---
+
+## Phase 5 — Advanced Benchmarking ✅ COMPLETE
+
+> **Status: ✅ All 10 stages complete.**
+> Gate: `make test -race` green, `make smoke-phase5` green.
+
+### Stage overview
+
+| Stage | Description | Status |
+|-------|-------------|--------|
+| 5.1 | Data model additions (`Contest`, `VolatilityProfile`, sentinel errors) | ✅ |
+| 5.2 | ContestService + admin endpoints + leaderboard dedup + SSE bus | ✅ |
+| 5.3 | One-active-submission guard | ✅ |
+| 5.4 | Volatility-aware scoring | ✅ |
+| 5.5 | Sequential three-job dispatch + FinalScore | ✅ |
+| 5.6 | Dry-run Validator (20-order fixed sequence, rate limiter) | ✅ |
+| 5.7 | SSE live leaderboard (`LeaderboardBus`, store-polling watcher) | ✅ |
+| 5.8 | WebSocket `BotTransport` (stdlib RFC 6455, zero new deps) | ✅ |
+| 5.9 | PostgreSQL `ContestStore` (`pgxpool`, JSONB profiles, UPSERT snapshot) | ✅ |
+| 5.10 | Integration smoke test (`scripts/smoke_test_phase5.sh`) | ✅ |
+
+### What Phase 5 adds
+
+The platform evolves from "run one benchmark and show a score" to a full
+competitive contest platform with:
+
+- **Contest lifecycle:** create (draft) → activate → benchmark → auto-close
+- **Three sequential volatility runs** per submission (Low / Medium / High),
+  each with independently tuned bot counts, order mixes, and scoring targets
+- **Volatility-aware composite scoring** where correctness multiplies both
+  latency and throughput scores — an engine with 0% correctness scores 0
+  regardless of latency
+- **One-active-submission guard** per team per contest (HTTP 409 on double-submit)
+- **Dry-run validator** — 20-order deterministic smoke test covering 7 correctness
+  axes, with a 2-minute rate limiter per submission
+- **SSE live leaderboard** — push-based stream delivering `update` events on
+  score changes and a `frozen` event when the contest closes
+- **WebSocket bot transport** — persistent connection per bot, stdlib RFC 6455
+  implementation, zero new module dependencies
+- **PostgreSQL ContestStore** — durable contest persistence that survives server
+  restarts; `MemoryContestStore` remains for all unit tests
+
+### ⚠️ Important: Strict Contest Mode
+
+`ADMIN_API_KEY: "testkey"` is permanently set in `docker-compose.yml`.
+All submissions require an active contest. Legacy scripts that bypass contest
+creation will receive `ErrContestNotActive`.
 
 ---
 
-## Phase 5 — Advanced Benchmarking
+### Stage 5.9 — PostgreSQL ContestStore ✅
 
-> **Status: 🔄 In Progress**
-> Stage 5.1 through Stage 5.8 are ✅ complete and tested.
-> **Current Focus: Implementing Stage 5.9 (PostgreSQL ContestStore).**
-
-### Goal
-
-Add the contest lifecycle, volatility-aware scoring, per-submission submission
-guard, dry-run validator, SSE live leaderboard, and WebSocket bot transport —
-without breaking any existing functionality.
-
-### What NexusBench Does After Phase 5
-
-The platform evolves from "run one benchmark and show a score" to "run a timed
-competitive contest with three volatility environments, a live leaderboard, and
-a safe pre-submission validation path."
-
-### ⚠️ Important Note for Future Phases: Strict Contest Mode
-
-Starting from Stage 5.5, `ADMIN_API_KEY: "testkey"` has been permanently injected into the local `docker-compose.yml` for the `control-plane` service.
-- **What this means:** The local development stack now strictly enforces **Phase 5 Contest Mode**. Submissions to `/api/v1/submissions` will be rejected (`ErrContestNotActive`) unless an active contest is first created via the admin endpoints.
-- **Why this matters:** Future phases (e.g., Phase 6 Frontend) must be aware that legacy scripts bypassing contests will no longer work locally.
-
----
-
-### Stage 5.1 — Data Model Additions ✅
-
-**Gate passed:** `go build ./...` and `go test ./internal/models/... ./internal/queue/... -v -race` both green.
+**Gate passed:** `make test -race` green (unit tests use MemoryContestStore).
+Integration: `docker compose up -d postgres && POSTGRES_DSN=... go run ./cmd/server`.
 
 **What was built:**
 
 | File | Change |
 |---|---|
-| `internal/models/models.go` | `ContestStatus`, `VolatilityProfile`, `Contest`, sentinel errors; extended `Submission`, `BenchmarkResults`, `LeaderboardEntry`; added `IsTerminal()`, `ResultByLabel()`, `ProfileByLabel()` |
-| `internal/queue/job.go` | Added `ContestID`, `VolatilityLabel`, `RemainingProfiles` to `Job`; new `NewProfileJob()` constructor and `IsLastProfile()` predicate |
-| `internal/config/config.go` | Added `AdminAPIKey` and `PostgresDSN` fields (read from env) |
-| `internal/models/models_phase5_test.go` | 9 new unit tests |
-| `internal/queue/job_phase5_test.go` | 6 new unit tests |
-
----
-
-### Stage 5.2 — ContestService and Admin Endpoints ✅
-
-**Gate passed:** `go test ./internal/contest/... ./internal/api/... -race` green.
-
-**What was built:** `internal/contest/` package with `ContestStore` interface, `MemoryContestStore`, `ContestService`, defaults; admin HTTP endpoints; leaderboard deduplication (AD-1); team history endpoint (AD-2); hybrid drain-and-wait auto-close (AD-3).
-
----
-
-### Stage 5.3 — One-Active-Submission Guard ✅
-
-**Gate passed:** `go test ./internal/submission/... -race` green.
-
-**What was built:** `ContestGetter` interface; `WithContestGetter` builder; guard in `Ingest`; `checkNoActiveSubmission` helper.
-
----
-
-### Stage 5.4 — Volatility-Aware Scoring ✅
-
-**Gate passed:** `go test ./internal/worker/... -race` green.
-
-**What was built:** profile-aware `buildResults`; `buildFleetConfigFromProfile`; 5 scoring unit tests.
-
----
-
-### Stage 5.5 — Sequential Three-Job Dispatch ✅
-
-**Gate passed:** `go test ./... -race` green.
-
-**What was built:** `enqueueNextProfile`; `computeAndWriteFinalScore`; `appendProfileResult`; re-enqueue chain in `Execute`.
-
----
-
-### Stage 5.6 — Dry-Run Validator ✅
-
-**Gate passed:** `go test ./internal/validator/... ./internal/api/... -race` green.
-
-**What was built:** `internal/validator/` package; `scenarios.go` with 20-order fixed sequence; `POST /api/v1/submissions/{id}/validate` with rate limiter; `ValidatorFactory` interface in api layer; 5 unit tests.
-
----
-
-### Stage 5.7 — SSE Live Leaderboard ✅
-
-**Gate passed:** `go test ./internal/api/... -race` green.
-
-**What was built:** `internal/api/bus.go` (`LeaderboardBus`); `GET /api/v1/leaderboard/stream` SSE endpoint; `runLeaderboardWatcher` goroutine in `cmd/server/main.go` (5s poll, hash-based change detection, zero idle cost when no subscribers); 4 bus unit tests.
-
-**Architectural note:** The worker process isolation dilemma (worker cannot call the in-memory bus directly) was resolved by a store-polling watcher on the control plane side, extending the existing `runQueueDepthScraper` pattern. Zero new infrastructure. Zero changes to the worker.
-
----
-
-### Stage 5.8 — WebSocket Bot Transport ✅
-
-**Gate passed:** `go test ./internal/botfleet/... ./internal/worker/... -race` green.
-
-**What was built:**
-
-| File | Change |
-|---|---|
-| `internal/botfleet/bot.go` | Added `Close() error` to `BotTransport` interface; `RESTTransport.Close()` no-op; `Bot.Close()` teardown method; `closeOnce` helper for idempotent close |
-| `internal/botfleet/websocket.go` | `WebSocketTransport`: stdlib-only RFC 6455 implementation (no new module deps); client masking; Ping/Pong control frame handling; `closeOnce`-backed `Close()` |
-| `internal/botfleet/fleet.go` | `FleetConfig.Protocol` field; `FleetConfig.Validate()` rejects unknown protocols; `Fleet.newBot` selects transport by protocol; `defer bot.Close()` after each bot goroutine |
-| `internal/botfleet/websocket_test.go` | 4 unit tests using raw TCP test server (no library) |
-| `internal/worker/executor.go` | `targetURLForProtocol` helper; `runFleet` accepts and sets `cfg.Protocol`; `buildFleetConfigFromProfile` and `buildFleetConfig` remain protocol-agnostic (protocol set by runFleet after construction) |
+| `internal/contest/postgres.go` | `PostgresContestStore` implementing `ContestStore` via `pgxpool`; `migrate()` creates two tables idempotently on startup; JSONB for `VolatilityProfile` columns; UPSERT for `SnapshotLeaderboard` |
+| `cmd/server/main.go` | `buildContestStore()` — selects `PostgresContestStore` when `DISTRIBUTED_MODE=true` and `POSTGRES_DSN` is set; graceful fallback to `MemoryContestStore` with a warning; `safeDSNPrefix()` logs host without exposing credentials |
+| `docker-compose.yml` | `postgres` service (postgres:16-alpine, port 5433 on host to avoid collision with TimescaleDB); `POSTGRES_DSN` wired into control-plane |
+| `k8s/postgres/statefulset.yaml` | PostgreSQL StatefulSet on control-plane node pool; security context identical to TimescaleDB (uid 999, all caps dropped, emptyDir tmpfs mounts) |
+| `k8s/postgres/service.yaml` | ClusterIP service on port 5432 (internal only) |
+| `k8s/postgres/pvc.yaml` | 10Gi PVC on `standard-rwo` StorageClass |
+| `k8s/network-policies/allow-postgres-ingress.yaml` | Allows ingress on 5432 from control-plane only; workers explicitly excluded |
 
 **Design decisions:**
 
-- **Zero new module dependencies.** `WebSocketTransport` is implemented using only `net`, `net/http`, `bufio`, `crypto/sha1`, `encoding/base64`, `encoding/binary`, `encoding/json` — all stdlib. `golang.org/x/net/websocket` (deprecated) and `gorilla/websocket` were both rejected: the former is unmaintained and the latter would add a module dependency to a core package.
+- `pgx/v5` was already in `go.mod` as an indirect dependency of TimescaleDB consumer — zero new modules added.
+- `VolatilityProfile` stored as JSONB: avoids a third normalised table, keeps the schema flat and psql-inspectable. `time.Duration` round-trips losslessly through JSON as int64 nanoseconds.
+- Failure policy: if Postgres is unreachable at startup, the server logs an error and falls back to `MemoryContestStore` rather than `os.Exit`. Operators who require durable contest state must ensure the database is healthy before starting the server.
+- `migrate()` uses `CREATE TABLE IF NOT EXISTS` — idempotent, safe on every startup, no migration tool needed for the hackathon lifecycle.
 
-- **`Close()` added to `BotTransport` interface.** This is a backward-compatible interface extension: `RESTTransport.Close()` returns nil immediately, so all existing code that constructs a `RESTTransport` and passes it as a `BotTransport` continues to compile and run identically. The Fleet calls `bot.Close()` via `defer` in the goroutine, which in turn calls `transport.Close()`. For REST this is a no-op; for WebSocket it closes the TCP connection.
+---
 
-- **Protocol → target URL mapping in executor.** `targetURLForProtocol` translates `models.ProtocolWebSocket` → `ws://host:port/orders` and everything else → `http://host:port`. This is the single place in the system where the URL scheme is determined. The `/orders` path suffix is included in the WebSocket URL because `WebSocketTransport` uses it during the HTTP upgrade handshake.
+### Stage 5.10 — Integration Smoke Test ✅
 
-- **Protocol set by `runFleet`, not by the config builders.** `buildFleetConfig` and `buildFleetConfigFromProfile` do not set `cfg.Protocol` — they would need to accept a `models.Protocol` parameter and re-export it, creating unnecessary coupling. Instead, `runFleet` sets `cfg.Protocol = string(protocol)` after calling either builder. This is a clean separation: config shape is determined by the profile, protocol is determined by the submission.
+**Gate passed:** `bash scripts/smoke_test_phase5.sh --dry-run` green.
+Full live gate: `bash scripts/smoke_test_phase5.sh --live` against docker compose.
 
-- **Backward compatibility.** All 13 existing `internal/botfleet` tests pass without modification. All 13 existing `internal/worker` tests pass without modification. The `FleetConfig.Protocol` field defaults to `""` which `Validate` and `newBot` both treat as `"rest"`.
+**What was built:**
+
+| File | Change |
+|---|---|
+| `scripts/smoke_test_phase5.sh` | Two-mode smoke test (dry-run + live); 5 dry-run sections, 10 live steps |
+| `k8s/postgres/statefulset.yaml` | Written in Stage 5.9, verified by smoke test Section 5 |
+| `k8s/network-policies/allow-postgres-ingress.yaml` | Written in Stage 5.9, verified by smoke test Section 5 |
+| `Makefile` | Added `smoke-phase5`, `smoke-phase5-live`, `test-phase5` targets; `ci` now includes `smoke-phase5` |
+
+**Dry-run sections:**
+
+| Section | What it validates |
+|---|---|
+| 1 | `go build ./...` + `go vet ./...` |
+| 2 | All unit tests per-package with `-race` + full sweep with coverage |
+| 3 | `cmd/server`, `cmd/worker`, `cmd/consumer` build cleanly |
+| 4 | All Phase 5 API endpoints are registered in `internal/api/router.go` |
+| 5 | All new Kubernetes YAML files parse as valid YAML and contain required fields; workers excluded from postgres NetworkPolicy |
+
+**Live steps:**
+
+| Step | What it exercises |
+|---|---|
+| 1 | Create contest (status=draft) + activate (status=active) |
+| 2 | Subscribe to SSE stream; assert initial snapshot event received |
+| 3 | Build minimal echo engine binary; submit as `language=binary` |
+| 4 | Call dry-run validator; assert 429 on second call (rate limiter) |
+| 5 | Poll submission until status=completed (all 3 profiles, up to 5 min) |
+| 6 | Assert FinalScore > 0 on the leaderboard |
+| 7 | Assert SSE received ≥1 "update" event |
+| 8 | Close contest via admin endpoint |
+| 9 | Assert leaderboard snapshot has ≥1 entry |
+| 10 | Assert SSE received "frozen" event |
+| Bonus | Admin 401 without key, 401 with wrong key; Phase 1–4 endpoints still return 200 |
+
+**Smoke engine:** If `ENGINE_BINARY` is not set, the script builds a minimal
+Go echo server in a temp directory using `GOOS=linux GOARCH=amd64 go build`.
+The engine accepts all limit/market orders with a partial fill and rejects
+cancel orders for unknown IDs. It is sufficient to exercise the full Phase 5
+pipeline but will not pass all 20 validator scenarios (it does not implement
+full CLOB price-time priority). A correctly-implemented contestant engine
+should pass all scenarios.
 
 ---
 
@@ -325,7 +287,7 @@ Starting from Stage 5.5, `ADMIN_API_KEY: "testkey"` has been permanently injecte
 
 ## Phase 6 — Frontend
 
-> **Status: 🔲 Planned (after Phase 5 is complete and stable)**
+> **Status: 🔲 Planned (Phase 5 is now complete)**
 
 The frontend is a thin React + TypeScript shell. It does **not** rebuild anything Grafana already does.
 
@@ -349,32 +311,35 @@ The Terraform and CI/CD pipeline are already GCP-specific and production-ready f
   Contestant / Admin
        │
        ▼
-  ┌─────────────────────────────────────────────────┐
-  │  Control Plane (:8080)                          │
-  │  cmd/server                                     │
-  │  ├─ POST /api/v1/submissions      (contestant)  │──► Enqueue ──► jobs.benchmark (Redpanda)
-  │  ├─ POST /api/v1/submissions/{id}/validate      │──► Validator (in-process)
-  │  ├─ GET  /api/v1/leaderboard      (poll)        │◄── ContestService
-  │  ├─ GET  /api/v1/leaderboard/stream (SSE)       │◄── LeaderboardBus
-  │  ├─ POST /api/v1/admin/contests   (admin)       │──► ContestService
-  │  ├─ POST /api/v1/admin/contests/{id}/close      │──► ContestService
-  │  └─ GET  /internal/workers                      │◄── WorkerRegistry
-  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────┐
+  │  Control Plane (:8080)   cmd/server                     │
+  │  ├─ POST /api/v1/submissions          (contestant)      │──► Enqueue ──► jobs.benchmark
+  │  ├─ POST /api/v1/submissions/{id}/validate              │──► Validator (in-process)
+  │  ├─ GET  /api/v1/leaderboard          (poll)            │◄── ContestService
+  │  ├─ GET  /api/v1/leaderboard/stream   (SSE)             │◄── LeaderboardBus
+  │  ├─ GET  /api/v1/teams/{name}/submissions               │◄── submission.Store
+  │  ├─ POST /api/v1/admin/contests       (admin)           │──► ContestService ──► PostgreSQL
+  │  ├─ POST /api/v1/admin/contests/{id}/activate           │──► ContestService
+  │  ├─ POST /api/v1/admin/contests/{id}/close              │──► ContestService + LeaderboardBus
+  │  └─ GET  /internal/workers                              │◄── WorkerRegistry
+  └─────────────────────────────────────────────────────────┘
          ▲ heartbeat (5s)
-  ┌──────┴──────────────────────────────────────────┐
-  │  Worker (cmd/worker)                            │
-  │  ├─ Heartbeater goroutine                       │
-  │  └─ Worker poll loop                            │◄── Dequeue ◄── jobs.benchmark
-  │       └─ SandboxExecutor                        │
-  │            ├─ Deploy sandbox container          │
-  │            ├─ WaitHealthy                       │
-  │            ├─ Run BotFleet (REST or WebSocket)  │──► sandbox /orders
-  │            │    └─ FleetResult{Stats, Results}  │
-  │            ├─ GoldenOrderbook → CorrectnessResult│
-  │            ├─ BuildResults (profile-aware score) │
-  │            ├─ BatchEmit telemetry               │──► metrics.latency (Redpanda)
-  │            └─ Re-enqueue next profile job       │──► jobs.benchmark
-  └─────────────────────────────────────────────────┘
+  ┌──────┴──────────────────────────────────────────────────┐
+  │  Worker (cmd/worker)                                    │
+  │  ├─ Heartbeater goroutine                               │
+  │  └─ Worker poll loop                           ◄── Dequeue ◄── jobs.benchmark (Redpanda)
+  │       └─ SandboxExecutor                               │
+  │            ├─ Deploy sandbox container                  │
+  │            ├─ WaitHealthy                               │
+  │            ├─ Run BotFleet (REST or WebSocket) ──► sandbox /orders
+  │            ├─ GoldenOrderbook → CorrectnessResult       │
+  │            ├─ BuildResults (profile-aware scoring)      │
+  │            ├─ BatchEmit telemetry          ──► metrics.latency (Redpanda)
+  │            ├─ Append to AllResults, persist FinalScore  │
+  │            └─ Enqueue next profile job     ──► jobs.benchmark
+  └─────────────────────────────────────────────────────────┘
+  LeaderboardWatcher (goroutine in cmd/server):
+    polls submission.Store every 5s → detects score change → bus.Broadcast("update")
 ```
 
 ---
@@ -382,13 +347,16 @@ The Terraform and CI/CD pipeline are already GCP-specific and production-ready f
 ## Running the Stack
 
 ```bash
-make images          # Build sandbox images (one-time)
-docker compose up --build -d   # Start full stack
-make test            # Unit tests (no infrastructure required)
-make ci              # Full CI gate (mirrors GitHub Actions)
+make images                          # Build sandbox images (one-time)
+docker compose up --build -d         # Start full stack (includes postgres)
+make test                            # Unit tests (no infrastructure required)
+make test-phase5                     # Phase 5 specific unit tests
+make smoke-phase5                    # Phase 5 dry-run smoke test (CI-safe)
+make smoke-phase5-live               # Phase 5 full live test (requires docker compose)
+make ci                              # Full CI gate (lint + test + smoke-phase5 + tf + k8s)
 docker compose up --scale worker=3 -d  # Scale workers for load testing
-make tf-validate     # Validate Terraform (no cloud credentials needed)
-make k8s-validate    # Validate K8s manifests (no cluster needed)
+make tf-validate                     # Validate Terraform (no cloud credentials)
+make k8s-validate                    # Validate K8s manifests (no cluster)
 ```
 
 ---
@@ -411,3 +379,5 @@ make k8s-validate    # Validate K8s manifests (no cluster needed)
 | `internal/auth` | planned Phase 6 | None |
 
 All unit tests run in < 5 seconds total. Race detector enabled on every `make test` run.
+
+`PostgresContestStore` is integration-tested via `docker compose up -d postgres` + `POSTGRES_DSN=... go run ./cmd/server`. No unit tests for the Postgres implementation — `MemoryContestStore` is the unit-test target; the interface contract is verified by `contest/service_test.go` which both implementations must satisfy.

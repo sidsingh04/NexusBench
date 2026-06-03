@@ -1,0 +1,50 @@
+# k8s/network-policies/allow-postgres-ingress.yaml
+#
+# NetworkPolicy: allow ingress TO PostgreSQL (contest store) pods.
+#
+# Why this file is necessary:
+#   The default-deny-all baseline (default-deny-all.yaml) blocks ALL ingress to
+#   every pod. The control-plane's egress policy opens port 5432 outbound, but
+#   NetworkPolicy is per-direction: the receiving pod must also carry a matching
+#   ingress rule. Without this file, the control-plane's contest store queries
+#   would be silently dropped at the PostgreSQL pod.
+#
+# Permitted sources (port 5432 only):
+#   • control-plane — reads and writes contest records and leaderboard snapshots.
+#
+# Deliberately excluded:
+#   • worker      — workers never access the contest store directly. They write
+#                   to the submission DiskStore and enqueue jobs via Redpanda.
+#                   Excluding workers means a container-escape from a sandboxed
+#                   engine cannot reach the contest database even if the worker's
+#                   network namespace is compromised.
+#   • consumer    — the metrics consumer writes to TimescaleDB, not PostgreSQL.
+#   • All others  — denied by the default-deny-all baseline.
+#
+# Relationship to allow-timescaledb-ingress.yaml:
+#   Both allow port 5432 ingress to their respective database pods, but they
+#   select different podSelector targets. This policy targets
+#   app.kubernetes.io/name: postgres (contest store). The TimescaleDB policy
+#   targets app.kubernetes.io/name: timescaledb (metrics store). They are
+#   independent — changing one does not affect the other.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-ingress
+  namespace: nexusbench
+  labels:
+    app.kubernetes.io/part-of: nexusbench
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - port: 5432
+          protocol: TCP

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -104,6 +105,7 @@ func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 
 	resp, err := t.client.Do(req)
 	if err != nil {
+		log.Printf("REST client error to %s: %v", req.URL.String(), err)
 		return Fill{}, fmt.Errorf("rest: do request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -115,6 +117,7 @@ func (t *RESTTransport) Send(ctx context.Context, o Order) (Fill, error) {
 
 	var respData restOrderResponse
 	if err := json.Unmarshal(rawBody, &respData); err != nil {
+		log.Printf("REST decode error: status=%d, body=%s, err=%v", resp.StatusCode, string(rawBody), err)
 		return Fill{}, fmt.Errorf("rest: decode response (status %d): %w", resp.StatusCode, err)
 	}
 

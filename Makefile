@@ -11,12 +11,17 @@
 # Run telemetry integration tests:  make test-integration
 # Full local stack:                 make up
 #
-# ── Phase 4 additions ────────────────────────────────────────────────────────────
+# ── Phase 4 additions ─────────────────────────────────────────────────────────
 # Validate Terraform HCL:           make tf-validate
 # Validate K8s manifests (dry-run): make k8s-validate
 # Lint Go code:                     make lint
 # Full local CI gate:               make ci
 # Build + push all images to reg:   make build-push REGISTRY=<url>
+#
+# ── Phase 5 additions ─────────────────────────────────────────────────────────
+# Phase 5 dry-run smoke test:       make smoke-phase5
+# Phase 5 live smoke test:          make smoke-phase5-live
+# Phase 5 per-package unit tests:   make test-phase5
 
 REGISTRY   ?= nexusbench
 TAG        ?= latest
@@ -31,7 +36,8 @@ GO_PKGS := $(shell go list ./... 2>/dev/null | grep -v 'docker/sandbox')
 .PHONY: images $(addprefix image-,$(LANGUAGES)) \
         run run-worker up up-infra down \
         test test-telemetry test-queue test-worker test-integration \
-        smoke deps clean-images sizes \
+        test-phase5 smoke smoke-phase5 smoke-phase5-live \
+        deps clean-images sizes \
         lint tf-validate k8s-validate ci build-push
 
 # ── Image targets ─────────────────────────────────────────────────────────────
@@ -73,8 +79,6 @@ up:
 	docker compose up --build
 
 ## Start only the infrastructure services (Redpanda + Console).
-## Use this when running the control plane with `make run` and you only
-## want the backing services in Docker.
 up-infra:
 	docker compose up redpanda console -d
 	@echo ""
@@ -97,7 +101,6 @@ test:
 	@go tool cover -func=coverage.out | tail -1
 
 ## Run only the telemetry package unit tests.
-## Fast feedback loop — no broker needed, runs in ~1s.
 test-telemetry:
 	go test ./internal/telemetry/... -v -race -timeout 30s -count=1
 
@@ -114,15 +117,48 @@ test-worker:
 	go test ./internal/worker/... -v -race -timeout 30s -count=1
 
 ## Run telemetry integration tests against a live Redpanda broker.
-## Requires Redpanda running at 127.0.0.1:19092.
-## Start it first with:  make up-infra
 test-integration:
 	@echo "Running integration tests (requires Redpanda at 127.0.0.1:19092)..."
 	go test ./internal/telemetry/... -tags=integration -v -race -timeout 120s -count=1
 
-## Run end-to-end smoke tests against localhost:8080
+## Run all Phase 5 unit tests with race detector.
+## Covers all new Phase 5 packages: models, queue, contest, submission, worker,
+## botfleet, correctness, validator, api (bus + SSE), telemetry, orchestrator.
+## No infrastructure required — all tests use in-memory or httptest fakes.
+test-phase5:
+	@echo "Running Phase 5 unit test suite (race detector)..."
+	go test \
+	    ./internal/models/... \
+	    ./internal/queue/... \
+	    ./internal/contest/... \
+	    ./internal/submission/... \
+	    ./internal/worker/... \
+	    ./internal/botfleet/... \
+	    ./internal/correctness/... \
+	    ./internal/validator/... \
+	    ./internal/api/... \
+	    ./internal/telemetry/... \
+	    ./internal/orchestrator/... \
+	    -v -race -timeout 90s -count=1
+	@echo ""
+	@echo "✓ Phase 5 unit tests complete"
+
+## Run end-to-end smoke tests against localhost:8080 (Phase 1–4)
 smoke:
 	@bash scripts/smoke_test.sh
+
+## Phase 5 smoke test — dry-run mode (default, CI-safe).
+## Validates: go build, all unit tests, binary builds, router endpoints,
+## and all new Kubernetes YAML manifests. No running infrastructure needed.
+smoke-phase5:
+	@bash scripts/smoke_test_phase5.sh --dry-run
+
+## Phase 5 smoke test — live mode.
+## Exercises the full Phase 5 flow against a running docker compose stack.
+## Requires: docker compose up --build -d, curl, jq.
+## Override the URL with: NEXUSBENCH_URL=http://host:port make smoke-phase5-live
+smoke-phase5-live:
+	@bash scripts/smoke_test_phase5.sh --live
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
@@ -139,16 +175,12 @@ sizes:
 	@docker images --filter "reference=$(REGISTRY)-sandbox-*" \
 	    --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
 
-# ── Phase 4: Terraform & Infra Automation ───────────────────────────────────────
+# ── Phase 4: Terraform & Infra Automation ─────────────────────────────────────
 
 TF_DIR     = terraform
 TF_VARFILE = envs/dev.tfvars
 
 ## Validate Terraform HCL: fmt check + validate (no cloud credentials needed).
-## Mirrors the tf-validate job in .github/workflows/ci.yml.
-##
-## Requires: terraform CLI in PATH (https://developer.hashicorp.com/terraform/install)
-## The backend block is skipped with -backend=false so no GCS bucket is needed locally.
 tf-validate:
 	@echo "─── terraform fmt ───"
 	terraform -chdir=$(TF_DIR) fmt -check -recursive
@@ -157,18 +189,12 @@ tf-validate:
 	terraform -chdir=$(TF_DIR) validate
 	@echo "✓ Terraform HCL is valid"
 
-## Dry-run all Kubernetes manifests.
-## Does NOT require the cluster to exist — uses kubeconform for offline validation.
-##
-## If you want to run this completely isolated, use:
-##   docker run --rm -v $(PWD)/k8s:/k8s ghcr.io/yannh/kubeconform:latest -strict -summary /k8s/
+## Dry-run all Kubernetes manifests (includes Phase 5 postgres manifests).
 k8s-validate:
 	@echo "─── k8s manifest validation (offline) ───"
 	@bash scripts/smoke_test_phase4_stage2.sh --dry-run
 
 ## Run golangci-lint on all Go packages.
-## Config: .golangci.yml (created in Stage 4.4).
-## Requires: golangci-lint >= 1.59 (https://golangci-lint.run/usage/install/)
 lint:
 	@if command -v golangci-lint > /dev/null 2>&1; then \
 		golangci-lint run ./... ; \
@@ -178,17 +204,14 @@ lint:
 		exit 1; \
 	fi
 
-## Full local CI gate: runs every check that GitHub Actions runs on a PR.
-## All checks must pass before opening a PR or merging to main.
-## Does NOT require cloud credentials (tf-validate uses -backend=false,
-## k8s-validate uses --dry-run=client).
-ci: lint test tf-validate k8s-validate
+## Full local CI gate: lint + unit tests + terraform + k8s + Phase 5 smoke.
+## All checks must pass before merging to main.
+ci: lint test smoke-phase5 tf-validate k8s-validate
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push"
 
 ## Build all images and push to the registry.
 ## Usage:  make build-push REGISTRY=us-docker.pkg.dev/my-project/nexusbench TAG=abc1234
-## Requires: docker login to the registry (or Workload Identity in CI).
 build-push:
 	@echo "Building and pushing to $(REGISTRY) with tag $(TAG)"
 	docker build -t $(REGISTRY)/control-plane:$(TAG) -f Dockerfile.server .

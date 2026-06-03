@@ -94,6 +94,7 @@ EOF
 binary)
     log "Using pre-compiled binary..."
     if [ ! -f /app/submission_binary ]; then
+        find /app -type f -exec chmod +x {} +
         BIN=$(find /app -maxdepth 2 -type f -executable | head -1)
         if [ -z "$BIN" ]; then
             log "ERROR: no executable found in archive"
