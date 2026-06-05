@@ -212,8 +212,9 @@ func (l *validationRateLimiter) revoke(submissionID string) {
 // It holds the submission service (for the initial snapshot on connect) and
 // the bus (for subsequent push events).
 type leaderboardStreamHandler struct {
-	svc *submission.Service
-	bus *LeaderboardBus
+	svc        *submission.Service
+	bus        *LeaderboardBus
+	contestSvc *contest.ContestService
 }
 
 // stream is the SSE handler for GET /api/v1/leaderboard/stream.
@@ -253,15 +254,43 @@ func (lsh *leaderboardStreamHandler) stream(w http.ResponseWriter, r *http.Reque
 		"subscriber_id", subID, "remote_addr", r.RemoteAddr)
 
 	// Send current leaderboard immediately on connect.
-	if subs, err := lsh.svc.List(); err == nil {
-		entries := buildDedupedLeaderboard(subs)
-		ptrs := make([]*models.LeaderboardEntry, len(entries))
-		for i := range entries {
-			e := entries[i]
-			ptrs[i] = &e
+	if active, err := lsh.contestSvc.GetActive(r.Context()); err == nil {
+		if subs, err := lsh.svc.List(); err == nil {
+			var activeSubs []*models.Submission
+			for _, sub := range subs {
+				if sub.ContestID == active.ID {
+					activeSubs = append(activeSubs, sub)
+				}
+			}
+			entries := buildDedupedLeaderboard(activeSubs)
+			ptrs := make([]*models.LeaderboardEntry, len(entries))
+			for i := range entries {
+				e := entries[i]
+				ptrs[i] = &e
+			}
+			writeSSEEvent(w, LeaderboardEvent{Type: "update", ContestID: active.ID, ContestName: active.Name, Entries: ptrs})
+			flusher.Flush()
 		}
-		writeSSEEvent(w, LeaderboardEvent{Type: "update", Entries: ptrs})
+	} else {
+		// No active contest, fetch the most recent closed contest
+		past, err := lsh.contestSvc.ListPast(r.Context())
+		if err == nil && len(past) > 0 {
+			var recent *models.Contest
+			for _, c := range past {
+				if recent == nil || c.CreatedAt.After(recent.CreatedAt) {
+					recent = c
+				}
+			}
+			if snapshot, err := lsh.contestSvc.GetLeaderboardSnapshot(r.Context(), recent.ID); err == nil {
+				writeSSEEvent(w, LeaderboardEvent{Type: "frozen", ContestID: recent.ID, ContestName: recent.Name, Entries: snapshot})
+			} else {
+				writeSSEEvent(w, LeaderboardEvent{Type: "frozen", ContestID: recent.ID, ContestName: recent.Name})
+			}
+		} else {
+			writeSSEEvent(w, LeaderboardEvent{Type: "frozen"})
+		}
 		flusher.Flush()
+		return
 	}
 
 	for {
@@ -365,7 +394,7 @@ func NewRouter(
 	v1.HandleFunc("/leaderboard", h.leaderboard).Methods(http.MethodGet)
 
 	if bus != nil {
-		lsh := &leaderboardStreamHandler{svc: svc, bus: bus}
+		lsh := &leaderboardStreamHandler{svc: svc, bus: bus, contestSvc: contestSvc}
 		// NOTE: gorilla/mux matches routes in registration order. Register the
 		// more-specific /leaderboard/stream BEFORE /leaderboard so mux does
 		// not greedily match the stream path against the poll route.
@@ -834,7 +863,13 @@ func (h *contestHandler) closeContest(w http.ResponseWriter, r *http.Request) {
 
 	var ptrs []*models.LeaderboardEntry
 	if subs, err := h.subSvc.List(); err == nil {
-		entries := buildDedupedLeaderboard(subs)
+		var activeSubs []*models.Submission
+		for _, sub := range subs {
+			if sub.ContestID == id {
+				activeSubs = append(activeSubs, sub)
+			}
+		}
+		entries := buildDedupedLeaderboard(activeSubs)
 		for i := range entries {
 			ptrs = append(ptrs, &entries[i])
 		}

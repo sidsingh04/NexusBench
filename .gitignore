@@ -23,10 +23,13 @@ coverage
 .DS_Store
 Thumbs.db
 
-# Node
+# Node & Frontend
 node_modules/
 npm-debug.log
 yarn-error.log
+dist/
+dist-ssr/
+*.local
 
 # Generated Output
 graphify-out/

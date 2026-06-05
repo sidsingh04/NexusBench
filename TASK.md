@@ -2,7 +2,7 @@
 
 > **Status: ✅ Complete**
 > Phase 5 is ✅ complete.
-> the Phase 4 codebase.
+> Phase 6 (Frontend & Integration) is 🔄 In Progress (Stages 6.1 - 6.3 Complete). See `walkthrough.md` for details on Admin Panel Integration.
 
 ---
 

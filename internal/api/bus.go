@@ -41,6 +41,8 @@ type LeaderboardEvent struct {
 	// ContestID identifies which contest this event belongs to.
 	ContestID string `json:"contest_id"`
 
+	ContestName string `json:"contest_name"`
+
 	// Entries is the full ranked leaderboard at the time of the event.
 	Entries []*models.LeaderboardEntry `json:"entries"`
 }
@@ -80,9 +82,10 @@ func NewLeaderboardBus() *LeaderboardBus {
 // goroutine).
 func (b *LeaderboardBus) Broadcast(event contest.LeaderboardEvent) {
 	wire := LeaderboardEvent{
-		Type:      event.Type,
-		ContestID: event.ContestID,
-		Entries:   event.Entries,
+		Type:        event.Type,
+		ContestID:   event.ContestID,
+		ContestName: event.ContestName,
+		Entries:     event.Entries,
 	}
 
 	b.mu.RLock()

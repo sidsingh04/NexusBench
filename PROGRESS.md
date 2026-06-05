@@ -46,7 +46,7 @@ not portfolio managers, not execution algorithms. The engine must:
 | Phase 3 | Distributed Workers | ✅ Complete |
 | Phase 4 | Terraform & Infra Automation | ✅ Complete |
 | Phase 5 | Advanced Benchmarking | ✅ Complete (all 10 stages) |
-| Phase 6 | Frontend | 🔲 Planned |
+| Phase 6 | Frontend | 🔄 In Progress (Up to 6.3) |
 | Cloud Deployment | GCP Production Deploy | 🔲 Planned (after Phase 6) |
 
 ---
@@ -287,9 +287,19 @@ should pass all scenarios.
 
 ## Phase 6 — Frontend
 
-> **Status: 🔲 Planned (Phase 5 is now complete)**
+> **Status: 🔄 In Progress (Stages 6.1 to 6.3 Complete)**
 
 The frontend is a thin React + TypeScript shell. It does **not** rebuild anything Grafana already does.
+
+### Stage Overview
+
+| Stage | Description | Status |
+|-------|-------------|--------|
+| 6.1 | Basic Frontend Boilerplate & Routing | ✅ Complete |
+| 6.2 | Contestant Dashboard (Submissions, Validator, Live SSE Leaderboard) | ✅ Complete |
+| 6.3 | Admin Panel Integration (History, Snapshot Viewer, UI Polish) | ✅ Complete |
+| 6.4 | Grafana Embedding (Latency, TPS, Correctness Charts) | 🔲 Planned |
+| 6.5 | Authentication / Protected Routes | 🔲 Planned |
 
 **Frontend owns:** Login, contest status, submission upload, dry-run trigger + `ValidationResult` display, live leaderboard via SSE, past contest archive.
 

@@ -25,19 +25,8 @@ import (
 	"github.com/nexusbench/nexusbench/internal/validator"
 )
 
-// queueDepthScrapeInterval is how often the control plane polls Redpanda for
-// consumer-group lag and updates the nexusbench_queue_depth Prometheus gauge.
 const queueDepthScrapeInterval = 15 * time.Second
-
-// autoCloseTick is how often the drain-and-wait goroutine checks contest state.
 const autoCloseTick = 30 * time.Second
-
-// leaderboardWatchInterval is how often the leaderboard watcher polls the
-// submission store and pushes an SSE "update" event if scores changed.
-//
-// 5 seconds gives contestants near-real-time feedback while keeping store
-// read pressure negligible (DiskStore.List is an O(N) directory scan).
-// Zero work when no SSE clients are connected.
 const leaderboardWatchInterval = 5 * time.Second
 
 func main() {
@@ -47,10 +36,8 @@ func main() {
 
 	cfg := config.Load()
 
-	// ── Submission directory ──────────────────────────────────────────────────
 	if err := os.MkdirAll(cfg.SubmissionDir, 0o750); err != nil {
-		slog.Error("cannot create submission directory",
-			"path", cfg.SubmissionDir, "err", err)
+		slog.Error("cannot create submission directory", "path", cfg.SubmissionDir, "err", err)
 		os.Exit(1)
 	}
 	slog.Info("submission directory ready", "path", cfg.SubmissionDir)
@@ -58,7 +45,6 @@ func main() {
 	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer startCancel()
 
-	// ── Docker (local mode only) ──────────────────────────────────────────────
 	var dockerMgr *sandbox.DockerManager
 	if !cfg.DistributedMode {
 		var err error
@@ -76,29 +62,22 @@ func main() {
 		}
 	}
 
-	// ── Core services ─────────────────────────────────────────────────────────
 	reg := metrics.New()
 	store := submission.NewDiskStore(cfg.SubmissionDir)
 	submissionSvc := submission.NewService(store, dockerMgr, cfg)
 
-	// workerRegistry is always created. In local mode it stays empty and is
-	// passed (as a non-nil pointer with zero workers) to runContestAutoClose
-	// so the drain condition can safely call registry.Stats() without a nil
-	// guard in the goroutine. In distributed mode it is populated by worker
-	// heartbeats via orchHandler.
 	workerRegistry := orchestrator.NewWorkerRegistry()
-	var orchHandler *orchestrator.Handler // nil = local mode, routes not mounted
-	var jobQueue queue.Queue              // nil = local mode, drain check skipped
+	var orchHandler *orchestrator.Handler
+	var jobQueue queue.Queue
 
-	// ── Distributed mode ──────────────────────────────────────────────────────
 	if cfg.DistributedMode {
-		slog.Info("server: distributed mode — wiring job queue + orchestrator",
-			"brokers", cfg.RedpandaBrokers)
+		slog.Info("server: distributed mode — wiring job queue + orchestrator", "brokers", cfg.RedpandaBrokers)
 
 		rpQueue, err := queue.NewRedpandaQueue(queue.RedpandaConfig{
 			Brokers:           cfg.RedpandaBrokers,
 			Partitions:        4,
 			ReplicationFactor: 1,
+			DisableConsumer:   true,
 		})
 		if err != nil {
 			slog.Error("server: create job queue", "err", err)
@@ -115,7 +94,6 @@ func main() {
 			os.Exit(1)
 		}
 		jobQueue = rpQueue
-
 		submissionSvc = submissionSvc.WithQueue(jobQueue)
 		orchHandler = orchestrator.NewHandler(workerRegistry)
 
@@ -129,50 +107,26 @@ func main() {
 		slog.Info("server: local mode — sandboxes deployed in-process")
 	}
 
-	// ── Contest store (Stage 5.9) ─────────────────────────────────────────────
-	// In distributed mode with a PostgresDSN configured, use the durable
-	// PostgresContestStore. Otherwise fall back to MemoryContestStore.
-	//
-	// MemoryContestStore remains the correct choice for:
-	//   - Local development (DISTRIBUTED_MODE=false)
-	//   - CI / unit test runs (no real database)
-	//   - Distributed mode without a Postgres DSN (operator misconfiguration
-	//     is logged as a warning rather than a hard crash so the server still
-	//     starts and serves Phase 1–4 traffic)
-	//
-	// Backward compatibility: all Phase 1–4 paths are unaffected — they never
-	// call any ContestStore method.
 	contestStore := buildContestStore(startCtx, cfg)
 
-	// ── Contest service + Leaderboard Bus (Phase 5+) ──────────────────────────
-	// The bus is created here and passed to both the contest service and the
-	// router. The contest service uses it to broadcast "frozen" events when a
-	// contest closes. The leaderboard watcher (below) uses it to broadcast
-	// "update" events as FinalScores are written by workers.
 	bus := api.NewLeaderboardBus()
 	contestSvc := contest.NewContestService(contestStore, bus)
 
-	// Wire the contest service into the submission service so that Ingest
-	// enforces contest-scoped checks (Stage 5.3).
 	if cfg.AdminAPIKey != "" {
 		submissionSvc = submissionSvc.WithContestGetter(contestSvc)
-		slog.Info("server: admin API enabled — contest lifecycle routes mounted",
-			"route_prefix", "/api/v1/admin")
+		slog.Info("server: admin API enabled — contest lifecycle routes mounted", "route_prefix", "/api/v1/admin")
 	} else {
 		slog.Warn("server: ADMIN_API_KEY not set — admin routes will not be mounted; contest checks disabled")
 	}
 
-	// ── Leaderboard watcher (Stage 5.7 — cross-process update bridge) ─────────
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	go runLeaderboardWatcher(watcherCtx, store, bus, contestSvc)
 	defer watcherCancel()
 
-	// ── Auto-close goroutine (AD-3: hybrid drain-and-wait) ────────────────────
 	autoCloseCtx, autoCloseCancel := context.WithCancel(context.Background())
 	go runContestAutoClose(autoCloseCtx, contestSvc, store, jobQueue, workerRegistry)
 	defer autoCloseCancel()
 
-	// ── HTTP server ───────────────────────────────────────────────────────────
 	factory := func(targetURL string) api.ValidatorRunner {
 		transport := botfleet.NewRESTTransport(targetURL, &http.Client{Timeout: 5 * time.Second})
 		v := validator.New(transport)
@@ -212,9 +166,6 @@ func main() {
 		slog.Error("forced shutdown", "err", err)
 	}
 
-	// Close the Postgres pool cleanly after the HTTP server has stopped
-	// accepting new requests. All in-flight contest operations will have
-	// returned by the time Shutdown() returns.
 	if pgStore, ok := contestStore.(*contest.PostgresContestStore); ok {
 		pgStore.Close()
 		slog.Info("server: postgres contest store closed")
@@ -223,56 +174,24 @@ func main() {
 	slog.Info("control plane stopped")
 }
 
-// ── Contest store factory (Stage 5.9) ─────────────────────────────────────────
-
-// buildContestStore returns the correct ContestStore implementation based on
-// the runtime configuration:
-//
-//   - Distributed mode + PostgresDSN set → PostgresContestStore
-//     (durable, survives server restarts, correct choice for production)
-//   - All other cases → MemoryContestStore
-//     (in-process, zero infrastructure, correct for local dev and CI)
-//
-// Failure policy: if PostgresContestStore cannot be created (DSN wrong,
-// database unreachable), the error is logged and the server falls back to
-// MemoryContestStore rather than calling os.Exit. This matches the behavior
-// of Phase 1–4 — the server is still useful for benchmarking even if the
-// contest store is in-memory.
-//
-// Operators who require durable contest state must ensure the database is
-// reachable before starting the control plane. The CI gate (Stage 5.9)
-// verifies this.
 func buildContestStore(ctx context.Context, cfg *config.Config) contest.ContestStore {
 	if cfg.DistributedMode && cfg.PostgresDSN != "" {
-		slog.Info("server: connecting to PostgreSQL contest store",
-			"dsn_prefix", safeDSNPrefix(cfg.PostgresDSN))
-
+		slog.Info("server: connecting to PostgreSQL contest store", "dsn_prefix", safeDSNPrefix(cfg.PostgresDSN))
 		pgStore, err := contest.NewPostgresContestStore(ctx, cfg.PostgresDSN)
 		if err != nil {
-			// Non-fatal: log and fall back. The operator will see repeated
-			// log lines and can restart with a corrected DSN.
-			slog.Error("server: failed to connect to PostgreSQL — falling back to in-memory contest store",
-				"err", err)
+			slog.Error("server: failed to connect to PostgreSQL — falling back to in-memory contest store", "err", err)
 			return contest.NewMemoryContestStore()
 		}
-
 		slog.Info("server: PostgreSQL contest store ready (schema migrated)")
 		return pgStore
 	}
-
 	if cfg.DistributedMode && cfg.PostgresDSN == "" {
 		slog.Warn("server: DISTRIBUTED_MODE=true but POSTGRES_DSN is empty — contest store will NOT survive restarts; set POSTGRES_DSN for production")
 	}
-
 	return contest.NewMemoryContestStore()
 }
 
-// safeDSNPrefix returns the scheme+host portion of a DSN for logging without
-// exposing the password.
-//
-// "postgres://user:secret@host:5432/db" → "postgres://***@host:5432/db"
 func safeDSNPrefix(dsn string) string {
-	// Find "://" and then the "@" separator.
 	schemeEnd := -1
 	for i := 0; i+3 <= len(dsn); i++ {
 		if dsn[i:i+3] == "://" {
@@ -291,26 +210,17 @@ func safeDSNPrefix(dsn string) string {
 		}
 	}
 	if atIdx < 0 {
-		// No credentials in DSN — safe to log as-is.
 		return dsn
 	}
 	return dsn[:schemeEnd] + "***" + dsn[atIdx:]
 }
 
-// ── Leaderboard watcher (Stage 5.7) ──────────────────────────────────────────
-
-// runLeaderboardWatcher polls the submission store on a fixed interval,
-// computes a change-detection hash over all completed FinalScores, and fires
-// a bus.Broadcast("update") only when the hash changes.
-//
-// See Stage 5.7 in PROGRESS.md for the full architectural rationale.
 func runLeaderboardWatcher(ctx context.Context, store submission.Store, bus *api.LeaderboardBus, contestSvc *contest.ContestService) {
 	slog.Info("server: leaderboard watcher started", "interval", leaderboardWatchInterval)
 	ticker := time.NewTicker(leaderboardWatchInterval)
 	defer ticker.Stop()
 
 	var lastHash float64
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -342,18 +252,23 @@ func tickLeaderboardWatcher(
 		return lastHash
 	}
 
-	var activeID string
-	if contestSvc != nil {
-		if active, err := contestSvc.GetActive(ctx); err == nil {
-			activeID = active.ID
-		}
+	// Only broadcast while a contest is active. When there is no active contest
+	// the watcher must not broadcast — the "frozen" event was already sent by
+	// ContestService.Close, and broadcasting "update" with an empty contestID
+	// clears the frontend contest header and causes the blank-page flash.
+	if contestSvc == nil {
+		return newHash
+	}
+	active, err := contestSvc.GetActive(ctx)
+	if err != nil {
+		return newHash
 	}
 
-	entries := buildLeaderboardEntries(context.Background(), store, activeID)
+	entries := buildLeaderboardEntries(context.Background(), store, active.ID)
 	ptrs := make([]*models.LeaderboardEntry, len(entries))
 	copy(ptrs, entries)
 
-	bus.Broadcast(contest.LeaderboardEvent{Type: "update", ContestID: activeID, Entries: ptrs})
+	bus.Broadcast(contest.LeaderboardEvent{Type: "update", ContestID: active.ID, ContestName: active.Name, Entries: ptrs})
 
 	slog.Debug("server: leaderboard watcher: broadcast sent",
 		"subscriber_count", bus.SubscriberCount(),
@@ -377,8 +292,6 @@ func leaderboardHash(subs []*models.Submission) float64 {
 	return sum
 }
 
-// ── Hybrid drain-and-wait auto-close (AD-3) ───────────────────────────────────
-
 func runContestAutoClose(
 	ctx context.Context,
 	svc *contest.ContestService,
@@ -389,7 +302,6 @@ func runContestAutoClose(
 	slog.Info("server: contest auto-close goroutine started (hybrid drain-and-wait)")
 	ticker := time.NewTicker(autoCloseTick)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -427,8 +339,7 @@ func tickAutoClose(
 			}
 			return
 		}
-		slog.Debug("server: auto-close: waiting for drain",
-			"id", active.ID, "submissions_closed_at", active.SubmissionsClosedAt)
+		slog.Debug("server: auto-close: waiting for drain", "id", active.ID, "submissions_closed_at", active.SubmissionsClosedAt)
 	}
 
 	if active.EndsAt != nil && now.After(*active.EndsAt) {
@@ -521,11 +432,37 @@ func buildLeaderboardEntries(
 			FinalScore:   c.sub.FinalScore,
 			CompletedAt:  c.sub.CompletedAt,
 		}
+		// Phase 1-4 legacy single-run result.
 		if c.sub.Results != nil {
 			e.CompositeScore = c.sub.Results.CompositeScore
 			e.P99LatencyMs = c.sub.Results.P99LatencyMs
 			e.MaxTPS = c.sub.Results.MaxTPS
 			e.CorrectnessScore = c.sub.Results.CorrectnessScore
+		}
+		// Phase 5: populate per-profile scores from AllResults.
+		// This was the root cause of all-zero leaderboard values in SSE update
+		// events — BestP99Ms, PeakSustainedTPS, AvgCorrectness, and per-profile
+		// scores were never read here, so every watcher broadcast carried zeros.
+		if len(c.sub.AllResults) > 0 {
+			var sumCorrectness float64
+			for _, r := range c.sub.AllResults {
+				switch r.VolatilityLabel {
+				case "low":
+					e.LowScore = r.RunScore
+				case "medium":
+					e.MediumScore = r.RunScore
+				case "high":
+					e.HighScore = r.RunScore
+				}
+				if r.P99LatencyMs > 0 && (e.BestP99Ms == 0 || r.P99LatencyMs < e.BestP99Ms) {
+					e.BestP99Ms = r.P99LatencyMs
+				}
+				if r.SustainedTPS > e.PeakSustainedTPS {
+					e.PeakSustainedTPS = r.SustainedTPS
+				}
+				sumCorrectness += r.CorrectnessScore
+			}
+			e.AvgCorrectness = sumCorrectness / float64(len(c.sub.AllResults))
 		}
 		if c.sub.FinalScore > 0 {
 			e.CompositeScore = c.sub.FinalScore
@@ -534,8 +471,6 @@ func buildLeaderboardEntries(
 	}
 	return entries
 }
-
-// ── Queue-depth scraper (Phase 3+) ───────────────────────────────────────────
 
 func runQueueDepthScraper(ctx context.Context, q queue.Queue, reg *metrics.Registry) {
 	slog.Info("server: queue-depth scraper started", "interval", queueDepthScrapeInterval)
@@ -565,10 +500,6 @@ func pollAndSet(ctx context.Context, q queue.Queue, reg *metrics.Registry) {
 	slog.Debug("server: queue depth updated", "depth", depth)
 }
 
-// ── Validator Adapter (Stage 5.6) ─────────────────────────────────────────────
-
-// validatorAdapter wraps *validator.Validator to satisfy api.ValidatorRunner
-// without the api package importing internal/validator.
 type validatorAdapter struct {
 	v *validator.Validator
 }

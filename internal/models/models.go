@@ -313,9 +313,9 @@ type LeaderboardEntry struct {
 	CompositeScore float64 `json:"composite_score"`
 
 	// Phase 5 per-profile run scores (0.0–1.0 each).
-	LowScore    float64 `json:"low_score,omitempty"`
-	MediumScore float64 `json:"medium_score,omitempty"`
-	HighScore   float64 `json:"high_score,omitempty"`
+	LowScore    float64 `json:"low_score"`
+	MediumScore float64 `json:"medium_score"`
+	HighScore   float64 `json:"high_score"`
 
 	// FinalScore is the weighted aggregate scaled 0–100.
 	// This is the primary ranking key for Phase 5+ contests.
@@ -324,7 +324,7 @@ type LeaderboardEntry struct {
 	// Diagnostic columns shown on the leaderboard.
 	BestP99Ms        float64 `json:"best_p99_ms,omitempty"`
 	PeakSustainedTPS float64 `json:"peak_sustained_tps,omitempty"`
-	AvgCorrectness   float64 `json:"avg_correctness,omitempty"`
+	AvgCorrectness   float64 `json:"avg_correctness"`
 
 	// Phase 1–4 legacy columns (kept for backward compatibility).
 	P99LatencyMs     float64 `json:"p99_latency_ms"`

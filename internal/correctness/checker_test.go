@@ -258,9 +258,9 @@ func TestChecker_PartialMatch(t *testing.T) {
 func TestChecker_BothEmpty(t *testing.T) {
 	t.Parallel()
 	checker := correctness.NewChecker()
-	result := checker.Check(nil, nil)
-	if result.Score != 1.0 {
-		t.Errorf("score = %f, want 1.0 for empty input", result.Score)
+	result := checker.Check([]correctness.ContestantFill{}, []correctness.GoldenFill{})
+	if result.Score != 0.0 {
+		t.Errorf("score = %f, want 0.0 for empty input", result.Score)
 	}
 }
 

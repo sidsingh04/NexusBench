@@ -69,6 +69,10 @@ type RedpandaConfig struct {
 	// ReplicationFactor is the number of broker replicas per partition.
 	// Must be ≤ the number of brokers. Use 1 for single-broker dev setups.
 	ReplicationFactor int16
+
+	// DisableConsumer prevents the consumer client from being created.
+	// Useful for enqueue-only clients (e.g. control-plane API).
+	DisableConsumer bool
 }
 
 // DefaultRedpandaQueueConfig returns a Config suitable for local development
@@ -126,17 +130,20 @@ func NewRedpandaQueue(cfg RedpandaConfig) (*RedpandaQueue, error) {
 	// DisableAutoCommit is intentional: we commit manually via CommitJob
 	// only after the worker has durably recorded its results. This gives
 	// at-least-once delivery with a clear commit boundary.
-	consumer, err := kgo.NewClient(
-		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.ConsumerGroup(workerGroupID),
-		kgo.ConsumeTopics(TopicJobs),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.DisableAutoCommit(),
-		kgo.FetchMaxWait(pollTimeout),
-	)
-	if err != nil {
-		producer.Close()
-		return nil, fmt.Errorf("queue: create consumer client: %w", err)
+	var consumer *kgo.Client
+	if !cfg.DisableConsumer {
+		consumer, err = kgo.NewClient(
+			kgo.SeedBrokers(cfg.Brokers...),
+			kgo.ConsumerGroup(workerGroupID),
+			kgo.ConsumeTopics(TopicJobs),
+			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+			kgo.DisableAutoCommit(),
+			kgo.FetchMaxWait(pollTimeout),
+		)
+		if err != nil {
+			producer.Close()
+			return nil, fmt.Errorf("queue: create consumer client: %w", err)
+		}
 	}
 
 	return &RedpandaQueue{
@@ -225,6 +232,10 @@ func (q *RedpandaQueue) Enqueue(ctx context.Context, j Job) error {
 //
 // If ctx is canceled, Dequeue returns (Job{}, ctx.Err()).
 func (q *RedpandaQueue) Dequeue(ctx context.Context) (Job, error) {
+	if q.consumer == nil {
+		return Job{}, fmt.Errorf("queue: consumer disabled")
+	}
+
 	for {
 		// Check for cancellation before blocking on poll.
 		select {
@@ -305,6 +316,10 @@ func (q *RedpandaQueue) Dequeue(ctx context.Context) (Job, error) {
 //
 // Calling CommitJob without a preceding Dequeue is a no-op.
 func (q *RedpandaQueue) CommitJob(ctx context.Context) error {
+	if q.consumer == nil {
+		return fmt.Errorf("queue: consumer disabled")
+	}
+
 	q.mu.Lock()
 	r := q.pendingRecord
 	q.pendingRecord = nil
@@ -386,7 +401,9 @@ func (q *RedpandaQueue) Close() error {
 			firstErr = err
 		}
 		q.producer.Close()
-		q.consumer.Close()
+		if q.consumer != nil {
+			q.consumer.Close()
+		}
 		slog.Info("queue: RedpandaQueue closed")
 	})
 	return firstErr

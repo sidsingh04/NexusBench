@@ -59,7 +59,7 @@ func NewChecker() *Checker { return &Checker{} }
 func (c *Checker) Check(contestantFills []ContestantFill, goldenFills []GoldenFill) CorrectnessResult {
 	// Handle empty slices — no orders, no errors.
 	if len(goldenFills) == 0 && len(contestantFills) == 0 {
-		return CorrectnessResult{Score: 1.0}
+		return CorrectnessResult{Score: 0.0}
 	}
 
 	// Build a lookup of golden fills by OrderID.

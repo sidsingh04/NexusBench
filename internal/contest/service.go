@@ -34,9 +34,10 @@ type LeaderboardBroadcaster interface {
 //   - "update"  — one or more scores changed; Entries is the full ranked list.
 //   - "frozen"  — the contest just closed; Entries is the final snapshot.
 type LeaderboardEvent struct {
-	Type      string // "update" | "frozen"
-	ContestID string
-	Entries   []*models.LeaderboardEntry
+	Type        string // "update" | "frozen"
+	ContestID   string
+	ContestName string
+	Entries     []*models.LeaderboardEntry
 }
 
 // ── Request / Response DTOs ────────────────────────────────────────────────────
@@ -277,9 +278,10 @@ func (s *ContestService) Close(_ context.Context, id string, entries []*models.L
 	slog.Info("contest: closed", "id", id, "entries", len(ranked))
 
 	s.broadcast(LeaderboardEvent{
-		Type:      "frozen",
-		ContestID: id,
-		Entries:   ranked,
+		Type:        "frozen",
+		ContestID:   id,
+		ContestName: c.Name,
+		Entries:     ranked,
 	})
 	return nil
 }
