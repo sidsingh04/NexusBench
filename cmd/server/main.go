@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"syscall"
 	"time"
 
@@ -397,79 +396,14 @@ func buildLeaderboardEntries(
 		completed = append(completed, s)
 	}
 
-	type candidate struct {
-		sub   *models.Submission
-		score float64
-	}
-	best := make(map[string]candidate)
-	for _, s := range completed {
-		score := s.FinalScore
-		if score == 0 && s.Results != nil {
-			score = s.Results.CompositeScore
-		}
-		if ex, ok := best[s.TeamName]; !ok || score > ex.score {
-			best[s.TeamName] = candidate{sub: s, score: score}
-		}
+	entries := api.BuildDedupedLeaderboard(completed)
+
+	ptrs := make([]*models.LeaderboardEntry, len(entries))
+	for i := range entries {
+		ptrs[i] = &entries[i]
 	}
 
-	candidates := make([]candidate, 0, len(best))
-	for _, c := range best {
-		candidates = append(candidates, c)
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
-	})
-
-	entries := make([]*models.LeaderboardEntry, 0, len(candidates))
-	for rank, c := range candidates {
-		e := &models.LeaderboardEntry{
-			Rank:         rank + 1,
-			SubmissionID: c.sub.ID,
-			TeamName:     c.sub.TeamName,
-			Language:     c.sub.Language,
-			Protocol:     c.sub.Protocol,
-			Status:       c.sub.Status,
-			FinalScore:   c.sub.FinalScore,
-			CompletedAt:  c.sub.CompletedAt,
-		}
-		// Phase 1-4 legacy single-run result.
-		if c.sub.Results != nil {
-			e.CompositeScore = c.sub.Results.CompositeScore
-			e.P99LatencyMs = c.sub.Results.P99LatencyMs
-			e.MaxTPS = c.sub.Results.MaxTPS
-			e.CorrectnessScore = c.sub.Results.CorrectnessScore
-		}
-		// Phase 5: populate per-profile scores from AllResults.
-		// This was the root cause of all-zero leaderboard values in SSE update
-		// events — BestP99Ms, PeakSustainedTPS, AvgCorrectness, and per-profile
-		// scores were never read here, so every watcher broadcast carried zeros.
-		if len(c.sub.AllResults) > 0 {
-			var sumCorrectness float64
-			for _, r := range c.sub.AllResults {
-				switch r.VolatilityLabel {
-				case "low":
-					e.LowScore = r.RunScore
-				case "medium":
-					e.MediumScore = r.RunScore
-				case "high":
-					e.HighScore = r.RunScore
-				}
-				if r.P99LatencyMs > 0 && (e.BestP99Ms == 0 || r.P99LatencyMs < e.BestP99Ms) {
-					e.BestP99Ms = r.P99LatencyMs
-				}
-				if r.SustainedTPS > e.PeakSustainedTPS {
-					e.PeakSustainedTPS = r.SustainedTPS
-				}
-				sumCorrectness += r.CorrectnessScore
-			}
-			e.AvgCorrectness = sumCorrectness / float64(len(c.sub.AllResults))
-		}
-		if c.sub.FinalScore > 0 {
-			e.CompositeScore = c.sub.FinalScore
-		}
-		entries = append(entries, e)
-	}
-	return entries
+	return ptrs
 }
 
 func runQueueDepthScraper(ctx context.Context, q queue.Queue, reg *metrics.Registry) {

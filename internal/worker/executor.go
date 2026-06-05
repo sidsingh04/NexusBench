@@ -695,9 +695,6 @@ func (e *SandboxExecutor) checkCorrectness(
 
 	for i := range results {
 		r := &results[i]
-		if r.Err != nil {
-			continue
-		}
 
 		goldenOrder := correctness.GoldenOrder{
 			ID:       r.Order.ID,
@@ -714,6 +711,10 @@ func (e *SandboxExecutor) checkCorrectness(
 			continue
 		}
 		goldenFills = append(goldenFills, gf)
+
+		if r.Err != nil {
+			continue
+		}
 
 		contestantFills = append(contestantFills, correctness.ContestantFill{
 			OrderID:       r.Fill.OrderID,

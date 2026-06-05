@@ -4,7 +4,6 @@ package submission
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -112,48 +111,18 @@ func (s *DiskStore) List() ([]*models.Submission, error) {
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
-// Service orchestrates ingestion and on-demand container deployment.
-//
-// Phase 3 dispatch modes (controlled by the jobQueue field):
-//
-//   - jobQueue == nil (Phase 1/2 mode):
-//     Ingest calls deployAsync directly — runs the full sandbox lifecycle
-//     in-process. Identical to the original behavior; no existing tests break.
-//
-//   - jobQueue != nil (Phase 3 distributed mode):
-//     Ingest enqueues a Job to the queue. A separate worker process picks it
-//     up, runs the sandbox, and writes results back via the shared Store.
-//     The control plane stays stateless between submission and completion.
-//
-// Phase 5 additions (controlled by the contestGetter field):
-//
-//   - contestGetter == nil (Phase 1–4 compatibility mode):
-//     Ingest skips all contest-scoped checks. Teams may submit freely.
-//     No ContestID is attached to the submission.
-//
-//   - contestGetter != nil (Phase 5 contest mode):
-//     Ingest requires an active contest, enforces the one-active-submission
-//     guard, and rejects uploads after SubmissionsClosedAt.
 type Service struct {
 	store         Store
 	docker        *sandbox.DockerManager
 	cfg           *config.Config
-	jobQueue      queue.Queue   // nil = local mode (Phase 1/2), non-nil = distributed mode (Phase 3+)
-	contestGetter ContestGetter // nil = Phase 1–4 compat (no contest checks), non-nil = Phase 5
+	jobQueue      queue.Queue
+	contestGetter ContestGetter
 }
 
-// NewService creates a Service in local (Phase 1/2) mode.
-// No queue is wired — Ingest deploys sandboxes directly via docker.
 func NewService(store Store, docker *sandbox.DockerManager, cfg *config.Config) *Service {
 	return &Service{store: store, docker: docker, cfg: cfg}
 }
 
-// WithQueue returns a copy of s with a job queue wired in, enabling
-// distributed (Phase 3+) mode. The original Service is not modified.
-//
-// Usage in cmd/server/main.go:
-//
-//	svc := submission.NewService(store, docker, cfg).WithQueue(jobQueue)
 func (s *Service) WithQueue(q queue.Queue) *Service {
 	return &Service{
 		store:         s.store,
@@ -164,15 +133,6 @@ func (s *Service) WithQueue(q queue.Queue) *Service {
 	}
 }
 
-// WithContestGetter returns a copy of s with a ContestGetter wired in,
-// enabling Phase 5 contest-scoped submission behavior. The original Service
-// is not modified.
-//
-// Usage in cmd/server/main.go:
-//
-//	svc := submission.NewService(store, docker, cfg).
-//	    WithQueue(jobQueue).
-//	    WithContestGetter(contestSvc)
 func (s *Service) WithContestGetter(cg ContestGetter) *Service {
 	return &Service{
 		store:         s.store,
@@ -183,19 +143,6 @@ func (s *Service) WithContestGetter(cg ContestGetter) *Service {
 	}
 }
 
-// Ingest validates the upload, persists the archive, records the submission,
-// then either enqueues a job (distributed mode) or deploys the sandbox
-// directly (local mode).
-//
-// The returned Submission is always in StatusPending — callers poll
-// GET /submissions/{id} to observe status transitions.
-//
-// Phase 5 contest checks (only when contestGetter is non-nil):
-//
-//  1. Requires an active contest; returns ErrContestNotActive if none.
-//  2. Rejects uploads after contest.SubmissionsClosedAt; returns ErrContestNotActive.
-//  3. One-active-submission guard: returns ErrSubmissionInProgress if the team
-//     already has a non-terminal submission in the same contest.
 func (s *Service) Ingest(
 	ctx context.Context,
 	req models.SubmitRequest,
@@ -215,27 +162,17 @@ func (s *Service) Ingest(
 		return nil, fmt.Errorf("no sandbox image configured for language %q", req.Language)
 	}
 
-	// ── Phase 5 contest checks ────────────────────────────────────────────────
-	// These checks are skipped when contestGetter is nil (Phase 1–4 compat).
 	var contestID string
 	if s.contestGetter != nil {
 		contest, err := s.contestGetter.GetActive(ctx)
 		if err != nil {
-			// ErrNoActiveContest and any other error both map to ErrContestNotActive
-			// from the caller's perspective: you cannot submit without an active contest.
 			return nil, models.ErrContestNotActive
 		}
 
-		// Gate 1: submissions-closed check.
-		// If the admin has set SubmissionsClosedAt and that time has passed,
-		// reject new uploads so in-flight jobs can drain cleanly.
 		if contest.SubmissionsClosedAt != nil && time.Now().UTC().After(*contest.SubmissionsClosedAt) {
 			return nil, models.ErrContestNotActive
 		}
 
-		// Gate 2: one-active-submission guard.
-		// A team may not flood the queue by submitting while their previous
-		// submission is still being evaluated.
 		if err := s.checkNoActiveSubmission(req.TeamName, contest.ID); err != nil {
 			return nil, err
 		}
@@ -279,27 +216,14 @@ func (s *Service) Ingest(
 		"contest_id", contestID,
 	)
 
-	// ── dispatch ──────────────────────────────────────────────────────────────
 	if s.jobQueue != nil {
-		// Distributed mode (Phase 3+): enqueue to the worker fleet.
-		// We enqueue synchronously so any broker failure surfaces immediately
-		// to the caller as a 500 rather than silently losing the job.
-		//
-		// Phase 5 (contest active): dispatch only the first profile job.
-		// The worker re-enqueues the next profile after each run completes,
-		// keeping all three runs sequential on the same sandbox container.
-		//
-		// Phase 1–4 (no contest): dispatch a single legacy job with no label.
 		var j queue.Job
 		if contestID != "" {
-			// Phase 5: first profile is "low"; remaining are ["medium","high"].
 			j = queue.NewProfileJob(sub, contestID, "low", []string{"medium", "high"})
 		} else {
-			// Phase 1–4: single-run job, backward compatible.
 			j = queue.NewJob(sub)
 		}
 		if err := s.jobQueue.Enqueue(ctx, j); err != nil {
-			// Roll back the submission to failed so the client knows to retry.
 			s.setStatus(sub, models.StatusFailed, fmt.Sprintf("enqueue error: %v", err))
 			return nil, fmt.Errorf("enqueue job: %w", err)
 		}
@@ -310,29 +234,15 @@ func (s *Service) Ingest(
 			"remaining_profiles", j.RemainingProfiles,
 		)
 	} else {
-		// Local mode (Phase 1/2): deploy in this process. Unchanged behavior.
 		go s.deployAsync(context.WithoutCancel(ctx), sub)
 	}
 
 	return sub, nil
 }
 
-// checkNoActiveSubmission returns ErrSubmissionInProgress if the given team
-// already has a non-terminal submission associated with contestID.
-//
-// Terminal statuses (StatusCompleted, StatusFailed) are allowed — a team may
-// resubmit once their previous run finishes. Only non-terminal statuses
-// (pending, building, deploying, running, benchmarking) block re-ingestion.
-//
-// Design note: this iterates the full submission list, which is acceptable
-// because the list is bounded by the number of submissions per contest
-// (typically tens to low hundreds). A database index on (team_name, contest_id,
-// status) would be the correct optimisation if the list grew to thousands.
 func (s *Service) checkNoActiveSubmission(teamName, contestID string) error {
 	all, err := s.store.List()
 	if err != nil {
-		// Treat a store error conservatively: block the submission rather than
-		// accidentally allowing a flood if the store is temporarily unavailable.
 		return fmt.Errorf("submission guard: list failed: %w", err)
 	}
 
@@ -356,8 +266,6 @@ func (s *Service) checkNoActiveSubmission(teamName, contestID string) error {
 	return nil
 }
 
-// deployAsync picks the pre-built image for this submission's language
-// and spins it up as a container. Only called in local (Phase 1/2) mode.
 func (s *Service) deployAsync(ctx context.Context, sub *models.Submission) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, s.cfg.SandboxTimeout)
 	defer cancel()
@@ -416,12 +324,6 @@ func (s *Service) StopContainer(ctx context.Context, id string) error {
 	return nil
 }
 
-// storeArchive persists the uploaded file to <submissionDir>/<id>/archive.<ext>
-//
-// Bug fix 1 — extension detection:
-//
-//	filepath.Ext("file.tar.gz") returns ".gz", not ".tar.gz".
-//	We check the full filename suffix manually to preserve compound extensions.
 func (s *Service) storeArchive(id string, fh *multipart.FileHeader) (string, error) {
 	dir := filepath.Join(s.cfg.SubmissionDir, id)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -449,9 +351,6 @@ func (s *Service) storeArchive(id string, fh *multipart.FileHeader) (string, err
 	return dest, nil
 }
 
-// archiveExt returns the full compound extension for an archive filename.
-// filepath.Ext only returns the last segment (.gz instead of .tar.gz),
-// so we check known compound extensions explicitly.
 func archiveExt(filename string) string {
 	lower := strings.ToLower(filename)
 	for _, ext := range []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"} {
@@ -462,7 +361,7 @@ func archiveExt(filename string) string {
 	if ext := filepath.Ext(filename); ext != "" {
 		return ext
 	}
-	return "" // Return empty string if no extension is provided
+	return ""
 }
 
 // ── Validators ────────────────────────────────────────────────────────────────
@@ -485,24 +384,4 @@ func validateProtocol(p models.Protocol) error {
 	}
 }
 
-// ── JSON helpers ──────────────────────────────────────────────────────────────
-
-func writeJSON(path string, v any) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
-func readJSON(path string, v any) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	return json.NewDecoder(f).Decode(v)
-}
+// ── JSON helpers: writeJSON and readJSON are in writejson.go ─────────────────

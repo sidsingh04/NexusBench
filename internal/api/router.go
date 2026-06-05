@@ -262,7 +262,7 @@ func (lsh *leaderboardStreamHandler) stream(w http.ResponseWriter, r *http.Reque
 					activeSubs = append(activeSubs, sub)
 				}
 			}
-			entries := buildDedupedLeaderboard(activeSubs)
+			entries := BuildDedupedLeaderboard(activeSubs)
 			ptrs := make([]*models.LeaderboardEntry, len(entries))
 			for i := range entries {
 				e := entries[i]
@@ -524,21 +524,28 @@ func (h *handler) leaderboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "LEADERBOARD_ERROR", err.Error())
 		return
 	}
-	entries := buildDedupedLeaderboard(subs)
+	entries := BuildDedupedLeaderboard(subs)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":   len(entries),
 		"entries": entries,
 	})
 }
 
-// buildDedupedLeaderboard converts a raw submission list into a ranked
+func getCorrectness(e models.LeaderboardEntry) float64 {
+	if e.AvgCorrectness > 0 {
+		return e.AvgCorrectness
+	}
+	return e.CorrectnessScore
+}
+
+// BuildDedupedLeaderboard converts a raw submission list into a ranked
 // leaderboard where each team appears at most once (best score wins).
 //
 // Extracted as a pure function so it can be unit-tested and reused by:
 //   - The poll handler (above)
 //   - The SSE stream handler (sends initial snapshot on connect)
 //   - The auto-close goroutine in cmd/server/main.go
-func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntry {
+func BuildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntry {
 	type candidate struct {
 		entry models.LeaderboardEntry
 		score float64
@@ -559,7 +566,10 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 		entry := buildLeaderboardEntry(sub, effectiveScore)
 
 		existing, seen := bestByTeam[sub.TeamName]
-		if !seen || effectiveScore > existing.score {
+		isBetterScore := effectiveScore > existing.score
+		isTiedButBetterCorrectness := (effectiveScore == existing.score) && (getCorrectness(entry) > getCorrectness(existing.entry))
+
+		if !seen || isBetterScore || isTiedButBetterCorrectness {
 			bestByTeam[sub.TeamName] = candidate{entry: entry, score: effectiveScore}
 		}
 	}
@@ -569,7 +579,11 @@ func buildDedupedLeaderboard(subs []*models.Submission) []models.LeaderboardEntr
 		ranked = append(ranked, c.entry)
 	}
 	sort.Slice(ranked, func(i, j int) bool {
-		return ranked[i].CompositeScore > ranked[j].CompositeScore
+		if ranked[i].CompositeScore != ranked[j].CompositeScore {
+			return ranked[i].CompositeScore > ranked[j].CompositeScore
+		}
+		// Tie-breaker: sort by correctness
+		return getCorrectness(ranked[i]) > getCorrectness(ranked[j])
 	})
 	for i := range ranked {
 		ranked[i].Rank = i + 1
@@ -869,7 +883,7 @@ func (h *contestHandler) closeContest(w http.ResponseWriter, r *http.Request) {
 				activeSubs = append(activeSubs, sub)
 			}
 		}
-		entries := buildDedupedLeaderboard(activeSubs)
+		entries := BuildDedupedLeaderboard(activeSubs)
 		for i := range entries {
 			ptrs = append(ptrs, &entries[i])
 		}

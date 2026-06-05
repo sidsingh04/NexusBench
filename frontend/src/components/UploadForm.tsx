@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import { api, ApiError } from '../api/client';
 import type { Submission, ValidationResult } from '../types';
@@ -211,12 +211,12 @@ export function UploadForm() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>Final Score</span>
             <span style={{
-              background: activeSubmission.final_score >= 80 ? 'rgba(16,185,129,0.15)' : activeSubmission.final_score >= 50 ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.12)',
-              color: activeSubmission.final_score >= 80 ? 'var(--accent-success)' : activeSubmission.final_score >= 50 ? 'var(--accent-warning)' : 'var(--accent-error)',
-              border: `1px solid ${activeSubmission.final_score >= 80 ? 'rgba(16,185,129,0.35)' : activeSubmission.final_score >= 50 ? 'rgba(245,158,11,0.35)' : 'rgba(239,68,68,0.3)'}`,
+              background: (activeSubmission.final_score || 0) >= 80 ? 'rgba(16,185,129,0.15)' : (activeSubmission.final_score || 0) >= 50 ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.12)',
+              color: (activeSubmission.final_score || 0) >= 80 ? 'var(--accent-success)' : (activeSubmission.final_score || 0) >= 50 ? 'var(--accent-warning)' : 'var(--accent-error)',
+              border: `1px solid ${(activeSubmission.final_score || 0) >= 80 ? 'rgba(16,185,129,0.35)' : (activeSubmission.final_score || 0) >= 50 ? 'rgba(245,158,11,0.35)' : 'rgba(239,68,68,0.3)'}`,
               padding: '0.2rem 0.6rem', borderRadius: 'var(--radius-full)', fontWeight: 700, fontSize: '1rem',
             }}>
-              {activeSubmission.final_score.toFixed(2)}
+              {(activeSubmission.final_score || 0).toFixed(2)}
             </span>
           </div>
         </div>
@@ -242,11 +242,11 @@ export function UploadForm() {
                 {/* Profile name + run score */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.75rem' }}>
                   <span style={{ color, fontWeight: 700, fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
-                  <span style={{ color: 'var(--text-primary)', fontWeight: 700, fontSize: '1rem' }}>{res.run_score.toFixed(2)}</span>
+                  <span style={{ color: 'var(--text-primary)', fontWeight: 700, fontSize: '1rem' }}>{(res.run_score || 0).toFixed(2)}</span>
                 </div>
 
                 {/* Score bar */}
-                <div title={`Run score: ${res.run_score.toFixed(2)}`} style={scoreBarStyle(Math.min(res.run_score / 100, 1), color)} />
+                <div title={`Run score: ${(res.run_score || 0).toFixed(2)}`} style={scoreBarStyle(Math.min((res.run_score || 0) / 100, 1), color)} />
 
                 {/* Metrics */}
                 <div style={{ marginTop: '0.75rem' }}>

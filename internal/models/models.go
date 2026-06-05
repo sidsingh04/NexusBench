@@ -244,7 +244,7 @@ type Submission struct {
 	// FinalScore is the weighted aggregate across all three profile runs,
 	// scaled 0–100. Set by computeAndWriteFinalScore after the last profile
 	// job commits. Zero for in-progress submissions.
-	FinalScore float64 `json:"final_score,omitempty"`
+	FinalScore float64 `json:"final_score"`
 }
 
 // ResultByLabel returns the BenchmarkResults for the given volatility label
@@ -283,7 +283,7 @@ type BenchmarkResults struct {
 
 	// RunScore is the per-profile composite score (0.0–1.0) computed from
 	// the profile's weighting formula. Zero for Phase 1–4 results.
-	RunScore float64 `json:"run_score,omitempty"`
+	RunScore float64 `json:"run_score"`
 
 	// CompositeScore is the legacy single-run score (0–100), kept for
 	// backward compatibility with Phase 1–4 leaderboard consumers.

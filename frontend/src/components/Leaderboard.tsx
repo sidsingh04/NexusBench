@@ -3,13 +3,15 @@ import { api } from '../api/client';
 import type { LeaderboardEntry } from '../types';
 
 interface LeaderboardProps {
-  /** Called whenever the active contest ID is known from the SSE stream. */
   onActiveContestId?: (id: string | null) => void;
 }
 
 export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
   const [entries, setEntries] = useState<LeaderboardEntry[]>([]);
-  const [status, setStatus] = useState<'connecting' | 'live' | 'frozen' | 'error'>('connecting');
+  // 'loading' only during the very first REST seed fetch before SSE connects.
+  // After that, status reflects the SSE connection state. The table is ALWAYS
+  // rendered — no full-component blanking on connect/reconnect.
+  const [status, setStatus] = useState<'loading' | 'live' | 'frozen' | 'error'>('loading');
   const [contestId, setContestId] = useState<string | null>(null);
   const [contestName, setContestName] = useState<string | null>(null);
 
@@ -17,9 +19,7 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
   const reconnectTimeoutRef = useRef<number | null>(null);
   const isComponentMounted = useRef<boolean>(true);
   // Ref (not state) so onerror reads the current value synchronously in the
-  // same tick that onmessage set it — avoids the stale-closure reconnect loop
-  // that blanked the leaderboard when the server closed the connection after
-  // sending the "frozen" event.
+  // same tick that onmessage set it — avoids the stale-closure reconnect loop.
   const isFrozenRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -27,15 +27,34 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
     isFrozenRef.current = false;
     let reconnectDelay = 1000;
 
+    // ── Seed from REST on mount ───────────────────────────────────────────────
+    // Fetch the current leaderboard immediately so the table shows real data
+    // while the SSE connection is establishing. This eliminates the "No
+    // submissions yet" flash that appeared on every page load or navigation.
+    // SSE updates will overwrite this seed once they arrive.
+    const seedFromREST = async () => {
+      try {
+        const data = await api.get<LeaderboardEntry[]>('/leaderboard');
+        if (isComponentMounted.current && data && data.length > 0) {
+          setEntries(data);
+        }
+      } catch {
+        // Silently ignore — SSE will populate the table when it connects.
+      }
+    };
+    seedFromREST();
+
+    // ── SSE connection ────────────────────────────────────────────────────────
     const connect = () => {
       if (!isComponentMounted.current) return;
-      if (isFrozenRef.current) return; // never reconnect after contest closes
+      if (isFrozenRef.current) return;
 
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
 
-      setStatus('connecting');
+      // Do NOT reset entries here — keep the REST seed (or last known entries)
+      // visible while the new connection is establishing.
       const eventSource = api.getEventSource('/leaderboard/stream');
       eventSourceRef.current = eventSource;
 
@@ -56,13 +75,12 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
             }
             if (data.contest_name) setContestName(data.contest_name);
 
-            // Only replace entries when incoming list is non-empty, or when
-            // we have no entries yet. Prevents a late empty-list event from
-            // blanking a populated table.
+            // Only overwrite entries when the incoming list is non-empty.
+            // An empty list from an "update" event means no submissions yet —
+            // only apply it if we also have no entries (avoids blanking a
+            // populated table with an empty update).
             if (data.entries && data.entries.length > 0) {
               setEntries(data.entries);
-            } else if (data.type === 'update') {
-              setEntries(prev => prev.length === 0 ? [] : prev);
             }
 
             if (data.type === 'frozen') {
@@ -80,10 +98,9 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
       eventSource.onerror = () => {
         if (!isComponentMounted.current) return;
         eventSource.close();
-
-        // Server closes the connection intentionally after "frozen" — do not
-        // reconnect. isFrozenRef is set synchronously inside onmessage so it
-        // is already true here even though React state hasn't committed yet.
+        // Server intentionally closes the connection after sending "frozen".
+        // isFrozenRef is set synchronously in onmessage so it is already true
+        // here even though React state hasn't committed yet.
         if (isFrozenRef.current) return;
 
         if (reconnectTimeoutRef.current) {
@@ -117,16 +134,37 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
   const formatP99 = (num?: number) =>
     !num ? '—' : num.toFixed(2);
 
+  // Status indicator — shown inline in the header, never blanks the table.
+  const statusBadge = () => {
+    switch (status) {
+      case 'loading':
+        return (
+          <span className="status-badge pending" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', border: '2px solid currentColor', borderTopColor: 'transparent', display: 'inline-block', animation: 'spin 0.8s linear infinite' }} />
+            Loading
+          </span>
+        );
+      case 'live':
+        return <span className="status-badge active">Live</span>;
+      case 'frozen':
+        return <span className="status-badge closed">Closed</span>;
+      case 'error':
+        return (
+          <span className="status-badge failed" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', border: '2px solid currentColor', borderTopColor: 'transparent', display: 'inline-block', animation: 'spin 0.8s linear infinite' }} />
+            Reconnecting
+          </span>
+        );
+    }
+  };
+
   return (
     <div className="glass-panel" style={{ padding: '2rem' }}>
       <div className="flex-between" style={{ marginBottom: '1.5rem' }}>
         <div>
           <h2 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
             {contestName || 'Live Leaderboard'}
-            {status === 'live' && <span className="status-badge active">Live</span>}
-            {status === 'frozen' && <span className="status-badge closed">Closed</span>}
-            {status === 'connecting' && <span className="status-badge pending">Connecting...</span>}
-            {status === 'error' && <span className="status-badge failed">Reconnecting...</span>}
+            {statusBadge()}
           </h2>
           {contestId && (
             <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
@@ -136,6 +174,7 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
         </div>
       </div>
 
+      {/* Table is ALWAYS rendered. Connection state is shown in the header only. */}
       <div className="data-table-container">
         <table className="data-table">
           <thead>
@@ -152,7 +191,7 @@ export function Leaderboard({ onActiveContestId }: LeaderboardProps = {}) {
             {entries.length === 0 ? (
               <tr>
                 <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '3rem 1rem' }}>
-                  No submissions yet. Be the first to submit!
+                  {status === 'loading' ? 'Loading leaderboard…' : 'No submissions yet. Be the first to submit!'}
                 </td>
               </tr>
             ) : (
