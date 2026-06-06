@@ -428,12 +428,17 @@ func scanContest(row scanner) (*models.Contest, error) {
 	if err := json.Unmarshal(lowRaw, &c.LowProfile); err != nil {
 		return nil, fmt.Errorf("unmarshal low_profile: %w", err)
 	}
+	c.LowProfile = mergeProfile(DefaultLowProfile(), c.LowProfile)
+
 	if err := json.Unmarshal(medRaw, &c.MediumProfile); err != nil {
 		return nil, fmt.Errorf("unmarshal medium_profile: %w", err)
 	}
+	c.MediumProfile = mergeProfile(DefaultMediumProfile(), c.MediumProfile)
+
 	if err := json.Unmarshal(highRaw, &c.HighProfile); err != nil {
 		return nil, fmt.Errorf("unmarshal high_profile: %w", err)
 	}
+	c.HighProfile = mergeProfile(DefaultHighProfile(), c.HighProfile)
 
 	return &c, nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nexusbench/nexusbench/internal/botfleet"
+	"github.com/nexusbench/nexusbench/internal/contest"
 	"github.com/nexusbench/nexusbench/internal/correctness"
 	"github.com/nexusbench/nexusbench/internal/models"
 	"github.com/nexusbench/nexusbench/internal/queue"
@@ -243,16 +244,25 @@ func (e *SandboxExecutor) Execute(ctx context.Context, j queue.Job) (*models.Ben
 	// Resolve the VolatilityProfile for this job (Phase 5 only).
 	// profile is the zero value for Phase 1–4 jobs (label == "").
 	var profile models.VolatilityProfile
+	switch j.VolatilityLabel {
+	case "low":
+		profile = contest.DefaultLowProfile()
+	case "medium":
+		profile = contest.DefaultMediumProfile()
+	case "high":
+		profile = contest.DefaultHighProfile()
+	}
+
 	if j.VolatilityLabel != "" && e.contestQuerier != nil {
-		if contest, cerr := e.contestQuerier.GetActive(ctx); cerr == nil {
-			if p, ok := contest.ProfileByLabel(j.VolatilityLabel); ok {
+		if active, cerr := e.contestQuerier.GetActive(ctx); cerr == nil {
+			if p, ok := active.ProfileByLabel(j.VolatilityLabel); ok {
 				profile = p
 			} else {
-				log.Warn("executor: contest has no profile for label — using zero profile",
+				log.Warn("executor: contest has no profile for label — using default profile",
 					"label", j.VolatilityLabel)
 			}
 		} else {
-			log.Warn("executor: could not load active contest for profile lookup — using zero profile",
+			log.Warn("executor: could not load active contest for profile lookup — using default profile",
 				"label", j.VolatilityLabel, "err", cerr)
 		}
 	}
