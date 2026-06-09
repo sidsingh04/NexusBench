@@ -450,7 +450,7 @@ func TestValidator_ContextCancellation(t *testing.T) {
 			// Stall until the client disconnects.
 			select {
 			case <-r.Context().Done():
-			case <-time.After(30 * time.Second):
+			case <-time.After(2 * time.Second):
 			}
 			return
 		}
@@ -619,7 +619,7 @@ func TestRunConcurrent_TimeoutReported(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
-		case <-time.After(30 * time.Second):
+		case <-time.After(2 * time.Second):
 		}
 	}))
 	defer srv.Close()
