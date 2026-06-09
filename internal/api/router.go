@@ -120,10 +120,21 @@ func (vh *validationHandler) validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sub.Status != models.StatusPending && sub.Status != models.StatusBenchmarking {
-		// ALREADY completed or failed.
+	// Manual HTTP validation is only meaningful while the container is live and
+	// the bot fleet has not yet started. The worker's pre-flight gate runs
+	// automatically before the fleet; check dry_run_result on the submission
+	// for its outcome. Once status advances past 'running', the book is no
+	// longer in the empty initial state the validator assumes.
+	if sub.Status != models.StatusRunning {
 		vh.limiter.revoke(id)
-		writeError(w, http.StatusConflict, "WRONG_STATUS", "submission is not in 'pending' or 'benchmarking' status")
+		writeError(w, http.StatusConflict, "WRONG_STATUS",
+			fmt.Sprintf(
+				"manual validation is only available when status=running "+
+					"(current status: %q). The worker runs an automatic pre-flight "+
+					"validator before the bot fleet; check the dry_run_result field "+
+					"on the submission for its outcome.",
+				sub.Status,
+			))
 		return
 	}
 

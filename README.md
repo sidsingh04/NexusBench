@@ -48,12 +48,14 @@ Beyond the scoring model, several design choices separate this from standard hac
 
 **The WebSocket bot transport was implemented from stdlib only.** RFC 6455 compliant, zero new module dependencies. Every bot maintains a persistent connection per run — this is not the toy "one request per connection" HTTP pattern that most benchmarks use.
 
+**The pre-flight validator gate eliminates wasted benchmark time on broken engines.** Before the bot fleet fires a single order, the worker automatically runs a 20-scenario deterministic correctness check against the live sandbox. An engine that rejects limit orders, mishandles cancels, or violates price-time priority fails this gate in seconds, is marked `status=failed` with a per-scenario breakdown stored in `dry_run_result`, and never consumes a benchmark slot. Only engines that pass all 20 scenarios advance to the bot fleet.
+
 **Atomic file writes eliminate a class of distributed read races.** The `DiskStore` uses `os.CreateTemp` + `Sync` + `os.Rename` to guarantee readers (running in separate processes across Docker volumes) never observe a truncated file mid-write.
 
 ---
 
 ## Architecture
-
+Before diving into the codebase, please read the [Architecture Guide](docs/architecture/ARCHITECTURE.md) to understand the system design, component interactions, and project structure.
 ```
   Contestant / Admin Browser
          │
@@ -70,7 +72,9 @@ Beyond the scoring model, several design choices separate this from standard hac
   │  ├─ POST /api/v1/submissions       → validates + enqueues│
   │  ├─ GET  /api/v1/leaderboard/stream→ SSE push (EventSrc) │
   │  ├─ POST /api/v1/admin/contests    → contest lifecycle   │
-  │  └─ POST /api/v1/submissions/{id}/validate → dry-run     │
+  │  └─ POST /api/v1/submissions/{id}/validate → manual      │
+  │       probe (status=running only; worker runs pre-flight │
+  │       automatically before the bot fleet)                │
   └──────────┬───────────────────────┬────────────────────────┘
              │ Enqueue               │ Broadcast
              ▼                       ▼
@@ -83,7 +87,9 @@ Beyond the scoring model, several design choices separate this from standard hac
   ┌──────────────────────────────────────────────────────────┐
   │  Worker  cmd/worker  (scale horizontally)                │
   │  ├─ Deploy sandbox container (language-specific image)   │
-  │  ├─ WaitHealthy (2s poll, 2min timeout)                  │
+  │  ├─ WaitHealthy (HTTP probe + 2s proxy warmup)           │
+  │  ├─ Pre-flight gate (20-scenario validator, auto-runs)   │
+  │  │    └─ FAIL → write dry_run_result, mark failed, stop  │
   │  ├─ Run BotFleet (REST or WebSocket, goroutine-per-bot)  │
   │  ├─ GoldenOrderbook → CorrectnessResult                  │
   │  ├─ Profile-aware scoring → RunScore (0.0–1.0)           │
@@ -153,8 +159,9 @@ Correctness acts as a multiplier on the latency and throughput terms — an engi
 | **2 — Telemetry** | Redpanda producer in executor, consumer process, TimescaleDB hypertables, Prometheus metrics, Grafana dashboards, Loki log aggregation | Telemetry is fire-and-forget — emit failures never propagate to the benchmark result; batched to 100 events to reduce broker round-trips |
 | **3 — Distributed Workers** | `queue.Queue` interface + `RedpandaQueue`, `worker.Worker` poll loop, `SandboxExecutor`, `Heartbeater`, `WorkerRegistry`, `BotFleet` with goroutine-per-bot, `GoldenOrderbook` + `Checker` | `DisableConsumer` flag on control-plane queue prevents partition stealing; idempotent guard reads current submission status before executing to handle at-least-once redelivery |
 | **4 — Infrastructure** | Terraform (VPC, GKE, two node pools, Artifact Registry), Kubernetes manifests (NetworkPolicies, RBAC, PVCs, KEDA ScaledObject), GitHub Actions CI/CD | Workers autoscale on Redpanda consumer-group lag (KEDA); control-plane and worker node pools are separate to prevent resource contention |
-| **5 — Advanced Benchmarking** | Contest lifecycle (draft→active→closed), three sequential volatility profiles, volatility-aware scoring, one-active-submission guard, dry-run validator, SSE leaderboard bus, WebSocket bot transport, PostgreSQL contest store | WebSocket transport is stdlib-only RFC 6455 — zero new module dependencies; correctness score multiplies performance score so broken engines cannot hide behind low latency |
+| **5 — Advanced Benchmarking** | Contest lifecycle (draft→active→closed), three sequential volatility profiles, volatility-aware scoring, one-active-submission guard, dry-run validator (HTTP-triggered, rate-limited), SSE leaderboard bus, WebSocket bot transport, PostgreSQL contest store | WebSocket transport is stdlib-only RFC 6455 — zero new module dependencies; correctness score multiplies performance score so broken engines cannot hide behind low latency |
 | **6 — Frontend** | React + TypeScript + Vite contestant and admin UIs, SSE leaderboard with exponential backoff reconnect, XHR upload with progress bar, per-profile results card, team submission history | REST seed on mount eliminates leaderboard blank on reconnect; atomic temp-file rename in `DiskStore` eliminates truncation race between control-plane and worker processes |
+| **7 — Pre-flight Validator Gate** | Worker-side automatic correctness gate: 20-scenario deterministic sequence runs between `WaitHealthy` and the bot fleet; `DryRunResult` persisted on the submission; frontend `UploadForm` renders per-scenario pass/fail breakdown; `TeamHistory` expands failed submissions with enriched failure reasons | Pre-flight fires only on the `low` profile job (first in the chain) so it runs exactly once per submission; HTTP `/validate` endpoint restricted to `status=running` to prevent colliding with the live gate; worker error path reloads submission before persisting `StatusFailed` so `dry_run_result` is never overwritten |
 
 ---
 
@@ -272,7 +279,7 @@ scripts/        Smoke test scripts (Phase 5)
 |---|---|---|---|
 | `POST` | `/api/v1/submissions` | None | Upload engine archive (multipart) |
 | `GET` | `/api/v1/submissions/{id}` | None | Poll submission status + results |
-| `POST` | `/api/v1/submissions/{id}/validate` | None | Trigger dry-run validator |
+| `POST` | `/api/v1/submissions/{id}/validate` | None | Manual correctness probe — only accepted when `status=running`; the worker runs this automatically before the bot fleet, so this endpoint is primarily useful for diagnostic re-checks |
 | `GET` | `/api/v1/teams/{name}/submissions` | None | Team submission history |
 | `GET` | `/api/v1/leaderboard` | None | Current ranked leaderboard (REST) |
 | `GET` | `/api/v1/leaderboard/stream` | None | Live leaderboard (SSE) |
@@ -324,10 +331,10 @@ A contestant engine must:
 
 ## Known Limitations
 
-- **No cancel endpoint.** Once submitted, a benchmark runs to completion across all three profiles (up to 9 minutes). The dry-run validator provides early correctness feedback but cannot abort the pipeline.
+- **No submission cancel endpoint.** Once a submission passes the pre-flight gate and the bot fleet starts, the benchmark runs to completion across all three volatility profiles (up to 9 minutes). For engines that fail the pre-flight gate, this is not an issue — they are stopped in seconds with a full per-scenario breakdown in `dry_run_result`. For engines that pass pre-flight and then degrade under load, there is no way to abort mid-run.
 - **Shared Docker socket.** Workers and the control plane share the host Docker daemon via socket mount. In production this is mitigated by running workers on a dedicated node pool with strict NetworkPolicies; a proper solution would use a container runtime API (e.g. containerd gRPC) with per-tenant namespacing.
 - **DiskStore is single-host.** In the current architecture, the control plane and all workers share a Docker volume on one host. True multi-host distribution would require a network filesystem (NFS, GCS FUSE) or migrating submission metadata to PostgreSQL.
 
 ---
 
-*Built for IICPC Summer Hackathon 2026 — May 9 to June 10.*
+*Built for IICPC Summer Hackathon 2026*

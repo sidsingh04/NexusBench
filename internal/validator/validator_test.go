@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,10 +74,18 @@ type orderFill struct {
 
 // inMemoryOrderbook is a minimal stateful orderbook for the test server.
 // It mirrors the GoldenOrderbook logic without the full package import.
+//
+// All exported methods are safe for concurrent use — the httptest.Server
+// dispatches each HTTP request in its own goroutine, so the concurrent_burst_10
+// scenario hits apply() from 10 goroutines simultaneously. The mu field
+// serializes all mutations, which is correct behavior for a matching engine
+// (a real engine would use its own internal lock).
 type inMemoryOrderbook struct {
+	mu    sync.Mutex
 	buys  []bookEntry
 	sells []bookEntry
 	index map[string]int // id → index in buys/sells (simplified)
+	seq   int            // per-instance sequence counter; no package-level state
 }
 
 type bookEntry struct {
@@ -87,13 +96,13 @@ type bookEntry struct {
 	seq        int
 }
 
-var globalSeq int
-
 func newOrderbook() *inMemoryOrderbook {
 	return &inMemoryOrderbook{index: make(map[string]int)}
 }
 
 func (ob *inMemoryOrderbook) apply(id, kind, side string, price, qty int64) orderFill {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 	switch kind {
 	case "cancel":
 		return ob.applyCancel(id)
@@ -130,7 +139,7 @@ func (ob *inMemoryOrderbook) applyLimit(id, side string, price, qty int64) order
 	if qty <= 0 || price <= 0 {
 		return orderFill{OrderID: id, Accepted: false}
 	}
-	globalSeq++
+	ob.seq++
 	remaining := qty
 	var execPrice int64
 	var execQty int64
@@ -178,13 +187,14 @@ func (ob *inMemoryOrderbook) applyLimit(id, side string, price, qty int64) order
 	}
 
 	if remaining > 0 {
-		entry := bookEntry{id: id, side: side, price: price, remainingQ: remaining, seq: globalSeq}
+		entry := bookEntry{id: id, side: side, price: price, remainingQ: remaining, seq: ob.seq}
 		if side == "buy" {
 			ob.buys = append(ob.buys, entry)
 		} else {
 			ob.sells = append(ob.sells, entry)
 		}
-		ob.index[id] = globalSeq
+		ob.seq++
+		ob.index[id] = ob.seq
 	}
 
 	return orderFill{OrderID: id, Accepted: true, ExecutedPrice: execPrice, ExecutedQty: execQty}
@@ -494,4 +504,232 @@ func TestValidator_New_NilTransportPanics(t *testing.T) {
 		}
 	}()
 	validator.New(nil)
+}
+
+// ── Stage 5: additional scenario-structure and concurrent-burst tests ─────────
+
+// TestFixedScenarios_TotalCount verifies that fixedScenarios returns exactly 20
+// entries (19 sequential + 1 concurrent burst).
+// The function is unexported; we verify its effect indirectly through Run.
+func TestFixedScenarios_TotalCount(t *testing.T) {
+	srv := correctEngine(t)
+	defer srv.Close()
+
+	transport := botfleet.NewRESTTransport(srv.URL, &http.Client{Timeout: 5 * time.Second})
+	v := validator.New(transport)
+
+	result, err := v.Run(context.Background(), "sub-count")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if len(result.Scenarios) != 20 {
+		t.Errorf("expected 20 scenarios, got %d", len(result.Scenarios))
+	}
+}
+
+// TestFixedScenarios_ConcurrentBurstPresent verifies that exactly one scenario
+// is named "concurrent_burst_10" and that it is the last in the slice.
+func TestFixedScenarios_ConcurrentBurstPresent(t *testing.T) {
+	srv := correctEngine(t)
+	defer srv.Close()
+
+	transport := botfleet.NewRESTTransport(srv.URL, &http.Client{Timeout: 5 * time.Second})
+	v := validator.New(transport)
+
+	result, err := v.Run(context.Background(), "sub-burst-check")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	var burstCount int
+	var lastIsBurst bool
+	for i, sc := range result.Scenarios {
+		if sc.Name == "concurrent_burst_10" {
+			burstCount++
+			lastIsBurst = i == len(result.Scenarios)-1
+		}
+	}
+	if burstCount != 1 {
+		t.Errorf("expected exactly 1 concurrent_burst_10 scenario, got %d", burstCount)
+	}
+	if !lastIsBurst {
+		t.Error("concurrent_burst_10 must be the last scenario")
+	}
+}
+
+// TestRunConcurrent_AllPass verifies that the concurrent burst scenario passes
+// when the server accepts all orders promptly.
+func TestRunConcurrent_AllPass(t *testing.T) {
+	// Server that accepts all limit orders without fills (they rest on the book).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			OrderID string `json:"order_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"order_id":       req.OrderID,
+			"accepted":       true,
+			"executed_price": int64(0),
+			"executed_qty":   int64(0),
+		})
+	}))
+	defer srv.Close()
+
+	// We test only the concurrent burst by using a correct full server,
+	// since RunConcurrent is exercised as part of Run.
+	transport := botfleet.NewRESTTransport(srv.URL, &http.Client{Timeout: 5 * time.Second})
+	v := validator.New(transport)
+
+	// Run only the concurrent scenario via a full correctEngine so the
+	// preceding sequential scenarios build the book state correctly.
+	// Here we verify the concurrent burst specifically via the correctEngine.
+	srvCorrect := correctEngine(t)
+	defer srvCorrect.Close()
+
+	t2 := botfleet.NewRESTTransport(srvCorrect.URL, &http.Client{Timeout: 5 * time.Second})
+	v2 := validator.New(t2)
+
+	result, err := v2.Run(context.Background(), "sub-concurrent-pass")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Find the concurrent burst scenario in results.
+	var burstResult *validator.ScenarioResult
+	for i := range result.Scenarios {
+		if result.Scenarios[i].Name == "concurrent_burst_10" {
+			burstResult = &result.Scenarios[i]
+			break
+		}
+	}
+	if burstResult == nil {
+		t.Fatal("concurrent_burst_10 scenario not found in results")
+	}
+	if !burstResult.Passed {
+		t.Errorf("concurrent_burst_10 should pass on a correct engine; reason: %s", burstResult.Reason)
+	}
+	_ = v // suppress unused warning
+}
+
+// TestRunConcurrent_TimeoutReported verifies that a server which stalls on all
+// requests causes the concurrent burst scenario to fail with a deadline reason.
+func TestRunConcurrent_TimeoutReported(t *testing.T) {
+	// Stalling server: blocks all requests until the client disconnects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	// We cannot run all 21 scenarios against a stalling server without hanging.
+	// Use a context timeout that is shorter than the test's own deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	transport := botfleet.NewRESTTransport(srv.URL, &http.Client{Timeout: time.Second})
+	v := validator.New(transport)
+
+	// Run will return early with an error or with AllPassed=false when the
+	// first scenario times out. Either is acceptable — no panic is required.
+	result, err := v.Run(ctx, "sub-timeout")
+	if err == nil && result.AllPassed {
+		t.Fatal("expected failure when server stalls; got AllPassed=true")
+	}
+	if result != nil {
+		for _, sc := range result.Scenarios {
+			if !sc.Passed && sc.Reason != "" {
+				t.Logf("scenario %q failed with reason: %s", sc.Name, sc.Reason)
+				break
+			}
+		}
+	}
+}
+
+// TestRunConcurrent_WrongFillReported verifies that a concurrent burst where
+// the server returns accepted=false is detected and reported with the order ID.
+func TestRunConcurrent_WrongFillReported(t *testing.T) {
+	// Server that rejects every order (accepted=false).
+	rejectedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			OrderID string `json:"order_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"order_id": req.OrderID,
+			"accepted": false,
+		})
+	}))
+	defer rejectedSrv.Close()
+
+	transport := botfleet.NewRESTTransport(rejectedSrv.URL, &http.Client{Timeout: 5 * time.Second})
+	v := validator.New(transport)
+
+	result, err := v.Run(context.Background(), "sub-reject")
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+	if result.AllPassed {
+		t.Fatal("expected AllPassed=false when server rejects all orders")
+	}
+
+	// At minimum the first failed scenario should have a non-empty reason.
+	for _, sc := range result.Scenarios {
+		if !sc.Passed {
+			if sc.Reason == "" {
+				t.Errorf("failed scenario %q has empty Reason", sc.Name)
+			}
+			t.Logf("first failure: %s — %s", sc.Name, sc.Reason)
+			break
+		}
+	}
+}
+
+// TestCompareFills_EnrichedReason verifies that failure reasons include the
+// $X.XX price format and book context string.
+func TestCompareFills_EnrichedReason(t *testing.T) {
+	srv := wrongPriceEngine(t)
+	defer srv.Close()
+
+	transport := botfleet.NewRESTTransport(srv.URL, &http.Client{Timeout: 5 * time.Second})
+	v := validator.New(transport)
+
+	result, err := v.Run(context.Background(), "sub-enriched")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if result.AllPassed {
+		t.Fatal("expected failure on wrong-price engine")
+	}
+
+	for _, sc := range result.Scenarios {
+		if !sc.Passed && sc.Reason != "" {
+			// Reason should contain "$" (price formatted as $X.XX).
+			if !containsStr(sc.Reason, "$") {
+				t.Errorf("enriched reason should contain '$X.XX' price: %s", sc.Reason)
+			}
+			// Reason should contain book state context.
+			if !containsStr(sc.Reason, "book state:") && !containsStr(sc.Reason, "book:") {
+				t.Errorf("enriched reason should contain book context: %s", sc.Reason)
+			}
+			t.Logf("enriched reason sample: %s", sc.Reason)
+			break
+		}
+	}
+}
+
+func containsStr(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(sub) == 0 || findSubstring(s, sub))
+}
+
+func findSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

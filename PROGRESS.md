@@ -287,7 +287,7 @@ should pass all scenarios.
 
 ## Phase 6 — Frontend
 
-> **Status: 🔄 In Progress (Stages 6.1 to 6.3 Complete)**
+> **Status: 🔄 In Progress (Stages 6.1 to 6.3 Complete; Preflight Validator UI complete)**
 
 The frontend is a thin React + TypeScript shell. It does **not** rebuild anything Grafana already does.
 
@@ -304,6 +304,24 @@ The frontend is a thin React + TypeScript shell. It does **not** rebuild anythin
 **Frontend owns:** Login, contest status, submission upload, dry-run trigger + `ValidationResult` display, live leaderboard via SSE, past contest archive.
 
 **Grafana owns (embedded as iframes):** latency/TPS/correctness charts, container health, system health.
+
+---
+
+## Preflight Validator Implementation Plan
+
+> **Doc:** `docs/architecture/PREFLIGHT_VALIDATOR_IMPLEMENTATION_PLAN.md`
+
+Moves the dry-run validator from an optional HTTP call to a mandatory worker-side pre-flight gate, resolving the parallel-execution race and ensuring broken engines never consume benchmark time.
+
+| Stage | Description | Status |
+|-------|-------------|--------|
+| 1 | `models.go` — `DryRunResult` + field on `Submission` | ✅ Complete |
+| 2 | `validator.go` + `scenarios.go` — enriched reasons + 21st concurrent burst scenario | ✅ Complete |
+| 3 | `executor.go` — `runPreflightValidator` wired between `waitHealthy` and `runFleet` | ✅ Complete |
+| 4 | `router.go` — HTTP validate endpoint status guard tightened to `StatusRunning` | ✅ Complete |
+| 5 | Tests — validator (6 new) + executor (5 new preflight gate tests) | ✅ Complete |
+| 6 | Smoke test `scripts/smoke_test_phase7.sh` | ✅ Complete |
+| 7 | Frontend — `DryRunResult` types, `UploadForm` failure/pass cards, `TeamHistory` `DryRunBreakdown` | ✅ Complete |
 
 ---
 

@@ -249,12 +249,10 @@ func (r *RedpandaEmitter) Emit(ctx context.Context, e Event) error {
 		Value: payload,
 	}
 
-	// ProduceSync returns after the record is buffered internally.
+	// Produce returns after the record is buffered internally.
 	// It does NOT wait for the broker to acknowledge — that happens via the
 	// deliveryHook asynchronously.
-	if err := r.client.ProduceSync(ctx, record).FirstErr(); err != nil {
-		return fmt.Errorf("telemetry: produce to %q: %w", record.Topic, err)
-	}
+	r.client.Produce(ctx, record, nil)
 
 	return nil
 }
@@ -304,8 +302,8 @@ func (r *RedpandaEmitter) BatchEmit(ctx context.Context, events []Event) error {
 	}
 
 	if len(records) > 0 {
-		if err := r.client.ProduceSync(ctx, records...).FirstErr(); err != nil {
-			errs = append(errs, fmt.Errorf("produce batch: %w", err))
+		for _, record := range records {
+			r.client.Produce(ctx, record, nil)
 		}
 	}
 

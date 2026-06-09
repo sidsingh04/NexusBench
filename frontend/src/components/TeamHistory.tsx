@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
-import type { Submission } from '../types';
+import type { Submission, DryRunResult } from '../types';
 
 interface TeamHistoryProps {
   teamName: string | null;
@@ -159,7 +159,10 @@ export function TeamHistory({ teamName, activeContestId }: TeamHistoryProps) {
             <tbody>
               {submissions.map((sub, idx) => {
                 const isExpanded = expandedId === sub.id;
-                const hasResults = sub.all_results && sub.all_results.length > 0;
+                // Expand arrow appears when there are benchmark results OR a dry-run result.
+                const hasResults =
+                  (sub.all_results && sub.all_results.length > 0) ||
+                  sub.dry_run_result !== null;
                 return (
                   <>
                     <tr
@@ -186,7 +189,11 @@ export function TeamHistory({ teamName, activeContestId }: TeamHistoryProps) {
                     {isExpanded && hasResults && (
                       <tr key={`${sub.id}-detail`} style={{ background: 'rgba(0,0,0,0.18)' }}>
                         <td colSpan={6} style={{ padding: '0.75rem 1rem 1rem 1rem' }}>
-                          <ProfileBreakdown results={sub.all_results!} />
+                          {sub.all_results && sub.all_results.length > 0
+                            ? <ProfileBreakdown results={sub.all_results} />
+                            : sub.dry_run_result
+                            ? <DryRunBreakdown result={sub.dry_run_result} />
+                            : null}
                         </td>
                       </tr>
                     )}
@@ -248,6 +255,115 @@ function ProfileBreakdown({ results }: ProfileBreakdownProps) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ── DryRunBreakdown: compact pre-flight result for team history ───────────────
+// Shows failed scenarios first, then passed. When all_passed, a single header
+// line is sufficient — no need to list 21 green checkmarks.
+
+interface DryRunBreakdownProps {
+  result: DryRunResult;
+}
+
+function DryRunBreakdown({ result }: DryRunBreakdownProps) {
+  if (result.all_passed) {
+    return (
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.5rem',
+        padding: '0.5rem 0.25rem',
+        color: 'var(--accent-success)',
+        fontSize: '0.82rem',
+        fontWeight: 600,
+      }}>
+        <span>✓</span>
+        <span>Pre-flight Validation — {result.scenarios.length}/{result.scenarios.length} passed</span>
+      </div>
+    );
+  }
+
+  const passedCount = result.scenarios.filter(s => s.passed).length;
+  const totalCount = result.scenarios.length;
+
+  // Show failed scenarios first, then passed, sorted by name within each group.
+  const failed = result.scenarios.filter(s => !s.passed).sort((a, b) => a.name.localeCompare(b.name));
+  const passed = result.scenarios.filter(s => s.passed).sort((a, b) => a.name.localeCompare(b.name));
+  const ordered = [...failed, ...passed];
+
+  return (
+    <div>
+      {/* One-line header */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '0.5rem',
+        paddingBottom: '0.4rem',
+        borderBottom: '1px solid rgba(255,255,255,0.07)',
+      }}>
+        <span style={{ color: 'var(--accent-error)', fontSize: '0.82rem', fontWeight: 600 }}>
+          ✗ Pre-flight Validation
+        </span>
+        <span style={{ color: 'var(--accent-error)', fontSize: '0.78rem' }}>
+          {totalCount - passedCount}/{totalCount} failed
+        </span>
+      </div>
+
+      {/* Summary line from backend */}
+      {result.fail_summary && (
+        <div style={{
+          fontSize: '0.75rem',
+          color: 'var(--text-muted)',
+          fontFamily: 'monospace',
+          marginBottom: '0.5rem',
+          wordBreak: 'break-word',
+        }}>
+          {result.fail_summary}
+        </div>
+      )}
+
+      {/* Scenario list: failed first, then passed */}
+      <div style={{ maxHeight: '220px', overflowY: 'auto' }}>
+        {ordered.map((sc, i) => (
+          <div key={i} style={{
+            padding: '0.3rem 0',
+            borderBottom: i < ordered.length - 1 ? '1px solid rgba(255,255,255,0.04)' : 'none',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <span style={{ color: sc.passed ? 'var(--accent-success)' : 'var(--accent-error)', fontSize: '0.78rem', flexShrink: 0 }}>
+                {sc.passed ? '✓' : '✗'}
+              </span>
+              <span style={{
+                color: sc.passed ? 'var(--text-muted)' : 'var(--text-secondary)',
+                fontSize: '0.78rem',
+                fontWeight: sc.passed ? 400 : 500,
+              }}>
+                {sc.name}
+              </span>
+            </div>
+            {!sc.passed && sc.reason && (
+              <pre style={{
+                marginTop: '0.25rem',
+                marginLeft: '1.1rem',
+                fontSize: '0.68rem',
+                color: 'rgba(252,165,165,0.85)',
+                background: 'rgba(0,0,0,0.12)',
+                borderRadius: 'var(--radius-sm)',
+                padding: '0.3rem 0.5rem',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                border: '1px solid rgba(239,68,68,0.12)',
+              }}>
+                {sc.reason}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

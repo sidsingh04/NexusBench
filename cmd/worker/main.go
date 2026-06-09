@@ -158,7 +158,9 @@ func main() {
 	executor := worker.NewSandboxExecutor(dockerMgr, store,
 		worker.WithJobCallbacks(jobStarted, jobFinished),
 		worker.WithSandboxHost(cfg.SandboxHost),
-		worker.WithJobQueue(jobQueue))
+		worker.WithJobQueue(jobQueue),
+		worker.WithPreflightValidator(worker.PreflightValidatorFactory),
+	)
 
 	// ── Worker ────────────────────────────────────────────────────────────────
 	w, err := worker.NewWorker(jobQueue, store, executor, worker.Config{

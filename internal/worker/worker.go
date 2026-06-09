@@ -240,6 +240,12 @@ func (w *Worker) processJob(ctx context.Context, j queue.Job) {
 	// ── Write outcome ─────────────────────────────────────────────────────────
 	if execErr != nil {
 		log.Error("worker: job execution failed", "err", execErr)
+		// Re-read the submission so we preserve any fields Execute wrote before
+		// failing (e.g. DryRunResult written by runPreflightValidator). Overwrite
+		// only Status and StatusMsg; do not touch DryRunResult or AllResults.
+		if fresh, rErr := w.store.Get(j.SubmissionID); rErr == nil {
+			sub = fresh
+		}
 		w.setStatus(log, sub, models.StatusFailed, fmt.Sprintf("execution error: %v", execErr))
 		// Commit: a failed benchmark is terminal, not retriable.
 		w.commitOrLog(ctx, log)

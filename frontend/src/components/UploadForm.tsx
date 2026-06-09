@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import { api, ApiError } from '../api/client';
-import type { Submission, ValidationResult } from '../types';
+import type { Submission, DryRunResult } from '../types';
 
 const PIPELINE_STEPS = ['pending', 'benchmarking', 'completed'];
 
@@ -13,9 +13,6 @@ export function UploadForm() {
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   const [activeSubmission, setActiveSubmission] = useState<Submission | null>(null);
-  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
-  const [isValidating, setIsValidating] = useState(false);
-  const [hasAttemptedValidation, setHasAttemptedValidation] = useState(false);
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -30,8 +27,6 @@ export function UploadForm() {
     setLoading(true);
     setError(null);
     setActiveSubmission(null);
-    setValidationResult(null);
-    setHasAttemptedValidation(false);
     setUploadProgress(0);
 
     const form = e.currentTarget;
@@ -81,32 +76,10 @@ export function UploadForm() {
     }
   };
 
-  // Auto-validate once the submission is pending and deployed
-  useEffect(() => {
-    if (activeSubmission && activeSubmission.status === 'pending' && !validationResult && !isValidating && !hasAttemptedValidation) {
-      setHasAttemptedValidation(true);
-
-      const attemptValidation = async () => {
-        setIsValidating(true);
-        try {
-          await new Promise(r => setTimeout(r, 5000));
-          const currentData = await api.get<Submission>(`/submissions/${activeSubmission.id}`);
-          if (currentData.status === 'pending') {
-            const data = await api.post<ValidationResult>(`/submissions/${activeSubmission.id}/validate`);
-            setValidationResult(data);
-          }
-        } catch (err) {
-          console.error('Auto-validation failed:', err);
-        } finally {
-          setIsValidating(false);
-        }
-      };
-
-      attemptValidation();
-    }
-  }, [activeSubmission, validationResult, isValidating, hasAttemptedValidation]);
-
-  // Poll submission status until terminal
+  // Poll submission status until terminal.
+  // The worker automatically runs the pre-flight validator and populates
+  // dry_run_result before starting the bot fleet, so no client-side
+  // HTTP trigger is needed.
   useEffect(() => {
     if (!activeSubmission) return;
     if (activeSubmission.status === 'completed' || activeSubmission.status === 'failed') return;
@@ -165,14 +138,123 @@ export function UploadForm() {
             );
           })}
         </div>
-        {currentStatus === 'failed' && (
+        {/* Status message when failed but no dry_run_result (bot-fleet crash etc.) */}
+        {currentStatus === 'failed' && !activeSubmission.dry_run_result && (
           <div style={{ marginTop: '0.5rem', color: 'var(--accent-error)', fontSize: '0.875rem' }}>
-            Submission failed during execution.
+            {activeSubmission.status_message || 'Submission failed during execution.'}
           </div>
         )}
       </div>
     );
   };
+
+  // ── Pre-flight result cards ──────────────────────────────────────────────────
+
+  // Shown when status=failed AND dry_run_result is present.
+  // Replaces the generic "submission failed" message with per-scenario detail.
+  const renderDryRunFailureCard = (dryRun: DryRunResult) => {
+    const passedCount = dryRun.scenarios.filter(s => s.passed).length;
+    const totalCount = dryRun.scenarios.length;
+    const failedCount = totalCount - passedCount;
+
+    return (
+      <div style={{
+        marginTop: '1.25rem',
+        border: '1px solid var(--accent-error)',
+        borderRadius: 'var(--radius-md)',
+        overflow: 'hidden',
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: '0.875rem 1rem',
+          background: 'rgba(239,68,68,0.1)',
+          borderBottom: '1px solid rgba(239,68,68,0.2)',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: 'var(--accent-error)', fontWeight: 700, fontSize: '0.9rem' }}>
+              ✗ Pre-flight Validation Failed
+            </span>
+            <span style={{ color: 'var(--accent-error)', fontSize: '0.82rem', fontWeight: 600 }}>
+              {failedCount} / {totalCount} scenarios failed
+            </span>
+          </div>
+          {dryRun.fail_summary && (
+            <div style={{ marginTop: '0.3rem', color: 'rgba(252,165,165,0.85)', fontSize: '0.78rem', fontFamily: 'monospace' }}>
+              {dryRun.fail_summary}
+            </div>
+          )}
+        </div>
+
+        {/* Scrollable scenario list */}
+        <div style={{ maxHeight: '280px', overflowY: 'auto', padding: '0.5rem 0' }}>
+          {dryRun.scenarios.map((sc, i) => (
+            <div key={i} style={{
+              padding: '0.45rem 1rem',
+              borderBottom: i < dryRun.scenarios.length - 1 ? '1px solid rgba(255,255,255,0.04)' : 'none',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ color: sc.passed ? 'var(--accent-success)' : 'var(--accent-error)', fontSize: '0.85rem', flexShrink: 0 }}>
+                  {sc.passed ? '✓' : '✗'}
+                </span>
+                <span style={{ color: sc.passed ? 'var(--text-secondary)' : 'var(--text-primary)', fontSize: '0.82rem', fontWeight: sc.passed ? 400 : 500 }}>
+                  {sc.name}
+                </span>
+              </div>
+              {!sc.passed && sc.reason && (
+                <pre style={{
+                  marginTop: '0.35rem',
+                  marginLeft: '1.4rem',
+                  fontSize: '0.72rem',
+                  color: 'rgba(252,165,165,0.9)',
+                  background: 'rgba(0,0,0,0.15)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '0.4rem 0.6rem',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  border: '1px solid rgba(239,68,68,0.15)',
+                }}>
+                  {sc.reason}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Call to action */}
+        <div style={{
+          padding: '0.75rem 1rem',
+          background: 'rgba(239,68,68,0.05)',
+          borderTop: '1px solid rgba(239,68,68,0.15)',
+          color: 'var(--text-muted)',
+          fontSize: '0.8rem',
+        }}>
+          Fix these issues and resubmit your engine.
+        </div>
+      </div>
+    );
+  };
+
+  // Compact green card shown when validation passed and benchmarking is underway.
+  const renderDryRunPassCard = (dryRun: DryRunResult) => (
+    <div style={{
+      marginTop: '1.25rem',
+      padding: '0.75rem 1rem',
+      background: 'rgba(16,185,129,0.08)',
+      border: '1px solid rgba(16,185,129,0.3)',
+      borderRadius: 'var(--radius-md)',
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    }}>
+      <span style={{ color: 'var(--accent-success)', fontWeight: 600, fontSize: '0.875rem' }}>
+        ✓ Pre-flight Validation Passed ({dryRun.scenarios.length} / {dryRun.scenarios.length})
+      </span>
+      <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+        Benchmarking is now running…
+      </span>
+    </div>
+  );
 
   const renderResultsCard = () => {
     if (!activeSubmission || activeSubmission.status !== 'completed' || !activeSubmission.all_results || activeSubmission.all_results.length === 0) return null;
@@ -203,7 +285,6 @@ export function UploadForm() {
 
     return (
       <div style={{ marginTop: '1.75rem' }}>
-        {/* Header row with final score */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
           <h4 style={{ color: 'var(--text-primary)', fontSize: '0.95rem', fontWeight: 600, letterSpacing: '-0.01em' }}>
             Benchmark Breakdown
@@ -221,7 +302,6 @@ export function UploadForm() {
           </div>
         </div>
 
-        {/* Per-profile cards: Low / Medium / High */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
           {sorted.map(res => {
             const color = profileColor[res.volatility_label] ?? 'var(--accent-primary)';
@@ -236,19 +316,12 @@ export function UploadForm() {
                 position: 'relative',
                 overflow: 'hidden',
               }}>
-                {/* Colour accent stripe at top */}
                 <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '2px', background: color, borderRadius: 'var(--radius-md) var(--radius-md) 0 0' }} />
-
-                {/* Profile name + run score */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.75rem' }}>
                   <span style={{ color, fontWeight: 700, fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
                   <span style={{ color: 'var(--text-primary)', fontWeight: 700, fontSize: '1rem' }}>{(res.run_score || 0).toFixed(2)}</span>
                 </div>
-
-                {/* Score bar */}
                 <div title={`Run score: ${(res.run_score || 0).toFixed(2)}`} style={scoreBarStyle(Math.min((res.run_score || 0) / 100, 1), color)} />
-
-                {/* Metrics */}
                 <div style={{ marginTop: '0.75rem' }}>
                   {metricRow('P50 Latency', res.p50_latency_ms > 0 ? `${res.p50_latency_ms.toFixed(2)} ms` : '—')}
                   {metricRow('P90 Latency', res.p90_latency_ms > 0 ? `${res.p90_latency_ms.toFixed(2)} ms` : '—')}
@@ -266,6 +339,36 @@ export function UploadForm() {
         </div>
       </div>
     );
+  };
+
+  // Dispatch: which post-stepper card to show.
+  //
+  // Priority:
+  //  1. Pre-flight failure card — status=failed AND dry_run_result present
+  //  2. Generic failed message  — status=failed AND no dry_run_result (bot-fleet crash)
+  //  3. Pre-flight pass card    — dry_run_result.all_passed AND not completed yet
+  //  4. Benchmark results card  — status=completed AND all_results present
+  //  5. Nothing                 — in-progress without results yet
+  const renderPostStepperContent = () => {
+    if (!activeSubmission) return null;
+    const dryRun = activeSubmission.dry_run_result;
+
+    if (activeSubmission.status === 'failed') {
+      if (dryRun) {
+        return renderDryRunFailureCard(dryRun);
+      }
+      return (
+        <div style={{ marginTop: '0.5rem', color: 'var(--accent-error)', fontSize: '0.875rem' }}>
+          {activeSubmission.status_message || 'Submission failed during execution.'}
+        </div>
+      );
+    }
+
+    if (dryRun?.all_passed && activeSubmission.status !== 'completed') {
+      return renderDryRunPassCard(dryRun);
+    }
+
+    return renderResultsCard();
   };
 
   return (
@@ -286,38 +389,10 @@ export function UploadForm() {
               <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>ID: {activeSubmission.id}</div>
               <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Team: {activeSubmission.team_name}</div>
             </div>
-            {isValidating && (
-              <div style={{ fontSize: '0.875rem', color: 'var(--accent-primary)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <span style={{ display: 'inline-block', width: '12px', height: '12px', border: '2px solid', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }}></span>
-                Auto-validating...
-              </div>
-            )}
           </div>
 
           {renderStepper()}
-
-          {validationResult && (
-            <div style={{ marginTop: '1.5rem', padding: '1rem', borderRadius: 'var(--radius-md)', background: validationResult.all_passed ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)', border: `1px solid ${validationResult.all_passed ? 'var(--accent-success)' : 'var(--accent-error)'}` }}>
-              <h5 style={{ color: validationResult.all_passed ? 'var(--accent-success)' : 'var(--accent-error)', marginBottom: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                {validationResult.all_passed ? '✓ Validation Passed' : '✗ Validation Failed'}
-                <span style={{ fontSize: '0.875rem', fontWeight: 'normal', color: 'var(--text-secondary)' }}>
-                  ({validationResult.scenarios.filter(s => s.passed).length} / {validationResult.scenarios.length} passed)
-                </span>
-              </h5>
-              <div style={{ maxHeight: '200px', overflowY: 'auto', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
-                {validationResult.scenarios.map((sc, i) => (
-                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem 0', borderBottom: i < validationResult.scenarios.length - 1 ? '1px solid rgba(255,255,255,0.05)' : 'none' }}>
-                    <span>{sc.name}</span>
-                    <span style={{ color: sc.passed ? 'var(--accent-success)' : 'var(--accent-error)', textAlign: 'right' }}>
-                      {sc.passed ? 'Passed' : sc.reason || 'Failed'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {renderResultsCard()}
+          {renderPostStepperContent()}
         </div>
       )}
 
