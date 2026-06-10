@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/nexusbench/nexusbench/internal/consumer"
+	"github.com/nexusbench/nexusbench/internal/metrics"
 )
 
 func main() {
@@ -65,6 +67,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ── Metrics Server ────────────────────────────────────────────────────────
+	reg := metrics.New()
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", reg.Handler())
+		srv := &http.Server{
+			Addr:              ":9090",
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		slog.Info("consumer: metrics server listening on :9090")
+		if srvErr := srv.ListenAndServe(); srvErr != nil {
+			slog.Error("consumer: metrics server failed", "err", srvErr)
+		}
+	}()
+
 	// ── Consumer ──────────────────────────────────────────────────────────────
 	cfg := consumer.Config{
 		Brokers:        brokerList,
@@ -72,7 +90,7 @@ func main() {
 		CommitInterval: 5 * time.Second,
 	}
 
-	c, err := consumer.NewConsumer(cfg, store)
+	c, err := consumer.NewConsumer(cfg, store, reg)
 	if err != nil {
 		slog.Error("consumer: create consumer", "err", err)
 		os.Exit(1)

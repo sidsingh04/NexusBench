@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -28,9 +29,11 @@ import (
 	"time"
 
 	"github.com/nexusbench/nexusbench/internal/config"
+	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/nexusbench/nexusbench/internal/queue"
 	"github.com/nexusbench/nexusbench/internal/sandbox"
 	"github.com/nexusbench/nexusbench/internal/submission"
+	"github.com/nexusbench/nexusbench/internal/telemetry"
 	"github.com/nexusbench/nexusbench/internal/worker"
 )
 
@@ -92,6 +95,45 @@ func main() {
 
 	if err = jobQueue.Bootstrap(ctx); err != nil {
 		slog.Error("worker: bootstrap job queue topic", "err", err)
+		os.Exit(1)
+	}
+
+	// ── Metrics Server ────────────────────────────────────────────────────────
+	reg := metrics.New()
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", reg.Handler())
+		srv := &http.Server{
+			Addr:              ":9090",
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		slog.Info("worker: metrics server listening on :9090")
+		if srvErr := srv.ListenAndServe(); srvErr != nil {
+			slog.Error("worker: metrics server failed", "err", srvErr)
+		}
+	}()
+
+	// ── Telemetry Emitter ─────────────────────────────────────────────────────
+	rcfg := telemetry.RedpandaConfig{
+		Brokers:                cfg.RedpandaBrokers,
+		TopicPartitions:        3,
+		TopicReplicationFactor: 1,
+		ProducerBatchMaxBytes:  1 << 20,
+		ProducerLingerDuration: 5 * time.Millisecond,
+	}
+	emitter, err := telemetry.NewRedpandaEmitter(rcfg, reg)
+	if err != nil {
+		slog.Error("worker: create telemetry emitter", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if errClose := emitter.Close(); errClose != nil {
+			slog.Warn("worker: close telemetry emitter error", "err", errClose)
+		}
+	}()
+	if bootErr := emitter.Bootstrap(ctx); bootErr != nil {
+		slog.Error("worker: bootstrap telemetry topics", "err", bootErr)
 		os.Exit(1)
 	}
 
@@ -160,6 +202,7 @@ func main() {
 		worker.WithSandboxHost(cfg.SandboxHost),
 		worker.WithJobQueue(jobQueue),
 		worker.WithPreflightValidator(worker.PreflightValidatorFactory),
+		worker.WithEmitter(emitter),
 	)
 
 	// ── Worker ────────────────────────────────────────────────────────────────

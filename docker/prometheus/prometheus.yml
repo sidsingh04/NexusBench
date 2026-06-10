@@ -26,6 +26,20 @@ scrape_configs:
         labels:
           service: "control-plane"
 
+  # ── NexusBench worker ──────────────────────────────────────────────────────
+  - job_name: "nexusbench-worker"
+    static_configs:
+      - targets: ["worker:9090"]
+        labels:
+          service: "worker"
+
+  # ── NexusBench metrics consumer ────────────────────────────────────────────
+  - job_name: "nexusbench-consumer"
+    static_configs:
+      - targets: ["metrics-consumer:9090"]
+        labels:
+          service: "metrics-consumer"
+
   # ── cAdvisor — per-container resource metrics ──────────────────────────────
   # NO drop rules here — we want metrics for ALL containers so the admin
   # dashboard container-health panels always have data.

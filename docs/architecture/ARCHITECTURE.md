@@ -534,7 +534,7 @@ The control plane and all workers must share a Docker volume. In the current Doc
 
 Workers deploy containers via the host Docker socket mounted into the worker container. This gives workers full Docker API access — they could in principle inspect or interfere with each other's containers or system containers. In production, this is mitigated by running workers on a dedicated GKE node pool with NetworkPolicies that restrict egress to only the Docker socket and the control plane.
 
-The correct long-term fix is to use the containerd gRPC API with per-tenant namespacing, which provides hardware-level isolation. Firecracker microVMs would provide even stronger isolation at the cost of higher startup latency.
+**Why gVisor or Firecracker were not used:** While syscall-interception layers (like gVisor) or microVMs (like Firecracker) provide significantly stronger hardware-level isolation, they introduce unavoidable network and syscall jitter. In a benchmarking platform where the core value proposition is measuring sub-millisecond P99 latencies and 50,000+ TPS throughput for high-frequency trading engines, this virtualization overhead would artificially degrade the performance metrics. Prioritizing raw container performance over hypervisor isolation is an intentional tradeoff, mitigated by treating the worker nodes as ephemeral, hostile environments with strict NetworkPolicies.
 
 ### No contestant authentication
 

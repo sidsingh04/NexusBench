@@ -9,6 +9,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/nexusbench/nexusbench/internal/telemetry"
 )
 
@@ -41,8 +42,9 @@ import (
 //
 // The zero value is NOT valid. Use NewConsumer.
 type Consumer struct {
-	client *kgo.Client
-	store  Store
+	client  *kgo.Client
+	store   Store
+	metrics *metrics.Registry
 
 	// windows holds the in-progress Accumulator for each submission.
 	// key: submissionID
@@ -82,7 +84,7 @@ func DefaultConfig() Config {
 
 // NewConsumer creates a Consumer connected to Redpanda, subscribed to the
 // metrics.latency topic. Call Run() to start processing.
-func NewConsumer(cfg Config, store Store) (*Consumer, error) {
+func NewConsumer(cfg Config, store Store, reg *metrics.Registry) (*Consumer, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("consumer: Config.Brokers must not be empty")
 	}
@@ -111,6 +113,7 @@ func NewConsumer(cfg Config, store Store) (*Consumer, error) {
 	return &Consumer{
 		client:  client,
 		store:   store,
+		metrics: reg,
 		windows: make(map[string]*windowState),
 	}, nil
 }
@@ -235,6 +238,12 @@ func (c *Consumer) flushWindow(ctx context.Context, submissionID string, state *
 	if err := c.store.WriteWindow(ctx, w); err != nil {
 		return err
 	}
+
+	if c.metrics != nil {
+		lagSecs := time.Since(state.bucketStart).Seconds()
+		c.metrics.RecordConsumerWindow(submissionID, lagSecs)
+	}
+
 	delete(c.windows, submissionID)
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nexusbench/nexusbench/internal/metrics"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -44,6 +45,7 @@ type RedpandaEmitter struct {
 	client  *kgo.Client
 	adminCl *kadm.Client
 	cfg     RedpandaConfig // stored so Bootstrap() can use partition/replication values
+	metrics *metrics.Registry
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -94,16 +96,16 @@ func DefaultRedpandaConfig() RedpandaConfig {
 //
 // Typical usage:
 //
-//	emitter, err := telemetry.NewRedpandaEmitter(telemetry.DefaultRedpandaConfig())
+//	emitter, err := telemetry.NewRedpandaEmitter(telemetry.DefaultRedpandaConfig(), reg)
 //	if err != nil { log.Fatal(err) }
 //	defer emitter.Close()
 //	if err := emitter.Bootstrap(ctx); err != nil { log.Fatal(err) }
-func NewRedpandaEmitter(cfg RedpandaConfig) (*RedpandaEmitter, error) {
+func NewRedpandaEmitter(cfg RedpandaConfig, reg *metrics.Registry) (*RedpandaEmitter, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("telemetry: RedpandaConfig.Brokers must not be empty")
 	}
 
-	hook := &deliveryHook{}
+	hook := &deliveryHook{metrics: reg}
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
@@ -133,6 +135,7 @@ func NewRedpandaEmitter(cfg RedpandaConfig) (*RedpandaEmitter, error) {
 		client:  client,
 		adminCl: kadm.NewClient(client),
 		cfg:     cfg,
+		metrics: reg,
 		closed:  make(chan struct{}),
 	}, nil
 }
@@ -254,6 +257,10 @@ func (r *RedpandaEmitter) Emit(ctx context.Context, e Event) error {
 	// deliveryHook asynchronously.
 	r.client.Produce(ctx, record, nil)
 
+	if r.metrics != nil {
+		r.metrics.RecordTelemetryEvent(string(e.Kind))
+	}
+
 	return nil
 }
 
@@ -302,8 +309,11 @@ func (r *RedpandaEmitter) BatchEmit(ctx context.Context, events []Event) error {
 	}
 
 	if len(records) > 0 {
-		for _, record := range records {
+		for i, record := range records {
 			r.client.Produce(ctx, record, nil)
+			if r.metrics != nil {
+				r.metrics.RecordTelemetryEvent(string(events[i].Kind))
+			}
 		}
 	}
 
@@ -345,7 +355,9 @@ func (r *RedpandaEmitter) ping(ctx context.Context) error {
 // persisted to the broker or permanently failed after all retries.
 //
 // Implements kgo.HookProduceRecordUnbuffered.
-type deliveryHook struct{}
+type deliveryHook struct {
+	metrics *metrics.Registry
+}
 
 // OnProduceRecordUnbuffered logs permanently-failed records.
 // We intentionally do NOT write to the DLQ topic here because that write
@@ -358,5 +370,8 @@ func (h *deliveryHook) OnProduceRecordUnbuffered(r *kgo.Record, err error) {
 			"submission_id", string(r.Key),
 			"err", err,
 		)
+		if h.metrics != nil {
+			h.metrics.RecordTelemetryEmitError()
+		}
 	}
 }

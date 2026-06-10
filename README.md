@@ -19,6 +19,12 @@ It is, in short, a Wall Street-grade stress-testing pipeline with a competitive 
 </p>
 
 <p align="center">
+  <img src="./docs/assets/container-health.png" width="800" alt="Grafana Telemetry Dashboard(2)">
+  <br>
+  <em>Real-time container health metrics showing CPU and memory utilization across the NexusBench distributed architecture</em>
+</p>
+
+<p align="center">
   <img src="./docs/assets/live-leaderboard.png" width="800" alt="Live Leaderboard showing Final Scores and P99 Latency">
   <br>
   <em>Real-time streaming leaderboard ranking matching engines by correctness and speed</em>
