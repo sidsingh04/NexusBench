@@ -2,6 +2,8 @@
 
 **A distributed benchmarking platform for high-frequency trading infrastructure — built from scratch for the IICPC Summer Hackathon 2026.**
 
+🏆 **Finalist — IICPC Summer Trading Hackathon 2026** 
+
 NexusBench takes an untrusted CLOB (Central Limit Order Book) matching engine submitted by a contestant, sandboxes it in an isolated container, bombards it with thousands of synthetic trading bots across three volatility regimes, measures p50/p90/p99 latency and throughput under each regime, verifies price-time priority correctness against a golden reference orderbook, and streams a live ranked leaderboard to all connected clients in real time.
 
 It is, in short, a Wall Street-grade stress-testing pipeline with a competitive contest layer on top.
